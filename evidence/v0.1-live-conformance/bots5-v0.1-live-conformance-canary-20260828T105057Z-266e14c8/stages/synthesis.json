@@ -1,0 +1,21 @@
+{
+  "cost_known": true,
+  "cost_usd": "0.001963125",
+  "duration_seconds": 9.23435333603993,
+  "ended_at": "2026-08-28T10:51:17.146Z",
+  "failure": null,
+  "output_path": "stages/synthesis.md",
+  "provider": "openrouter",
+  "provider_request_id": "gen-1787914267-hayli6aJp4itXkhaQTTg",
+  "requested_model": "google/gemini-3.7-flash",
+  "returned_model": "google/gemini-3.7-flash",
+  "stage_id": "synthesis",
+  "started_at": "2026-08-28T10:51:07.902Z",
+  "state": "succeeded",
+  "usage": {
+    "completion_tokens": 896,
+    "prompt_tokens": 755,
+    "reasoning_tokens": 795,
+    "total_tokens": 1651
+  }
+}
