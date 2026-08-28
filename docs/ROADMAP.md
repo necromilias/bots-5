@@ -1,31 +1,33 @@
 # Roadmap
 
-## Implemented V0
+## Implemented in this V0 candidate
 
-- strict JSON manifests;
-- OpenRouter provider boundary;
-- bounded parallel independent workers;
+- strict JSON manifest;
+- explicit UTF-8 inputs/prompts;
+- bounded parallel worker phase;
 - optional synthesis;
-- durable per-stage outputs and run telemetry;
-- known/unknown cost semantics;
-- disk-only status/inspect;
-- human-controlled real execution.
+- OpenRouter provider boundary;
+- per-stage and overall timeout handling;
+- durable run/stage/event/usage artifacts;
+- disk-only status and inspect;
+- exact-known/unknown cost semantics;
+- zero-spend unit tests.
 
 ## Likely next steps
 
-Only after V0 is reviewed against observed use:
+Only after V0 is reviewed:
 
 - local OpenAI-compatible provider;
-- planner-generated job manifests;
-- richer but still explicit DAG dependencies;
-- stronger per-stage filesystem/tool permissions where tools become necessary;
-- selective, documented retry policy if observed failures justify it.
+- planner-generated manifests;
+- richer but still explicit DAG semantics;
+- more deliberate retry policy where idempotence is understood;
+- stronger filesystem/tool capability model.
 
 ## Speculative
 
+- OMC authority packaging;
 - gated patch application;
-- live terminal or graphical status UI;
-- OMC integration for authority/context packaging;
+- live terminal/graphical status UI;
 - distributed execution.
 
-Nothing in the latter sections is implemented merely because it is listed here.
+None of the speculative items exist in V0.
