@@ -1,18 +1,16 @@
-# ADR 0001: Manifest-driven deterministic execution
+# Manifest-driven deterministic execution
 
-Status: Accepted for V0 candidate
+Status: Draft candidate decision.
 
 ## Context
 
-Visual/manual orchestration is difficult to reproduce and gives models too much opportunity to
-invent execution shape.
+B.O.T.S. 5 exists to replace ad-hoc visual orchestration with a small deterministic shell around
+nondeterministic model workers.
 
 ## Decision
 
-V0 executes a strict versioned JSON manifest. The harness owns validation, ordering, concurrency,
-persistence, and stop conditions.
+V0 execution topology and limits are declared in a strict, versioned JSON manifest validated before work starts.
 
 ## Consequences
 
-Jobs are reviewable and repeatable around nondeterministic model calls. Richer DAGs require an
-explicit later schema change rather than worker invention.
+The harness is predictable and reviewable; schema changes become explicit compatibility decisions.
