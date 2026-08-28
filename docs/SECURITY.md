@@ -2,38 +2,39 @@
 
 ## Trust model
 
-V0 is a local operator-run CLI. The operator and selected manifest are trusted. Model output and
-provider errors are not authority. This is not a hostile multi-user sandbox.
+V0 is an operator-run local CLI. The operator and selected job manifest are trusted. Model output is
+untrusted text and has no execution authority.
 
-## API secret
+## Secrets
 
-`OPENROUTER_API_KEY` is read only at runtime. It is excluded from resolved jobs, run metadata,
-events, usage, stage files, CLI inspection, and examples. Provider exceptions are sanitized before
-persistence. Raw request headers are never logged.
+`OPENROUTER_API_KEY` is read from the environment only. It is never intentionally written into
+manifests, resolved jobs, run/stage metadata, usage, events, status/inspect output, examples, or
+generated project files. Provider errors are reduced and redacted at the provider boundary.
 
 ## Filesystem
 
-B.O.T.S. 5 reads only the job file plus explicitly declared input/prompt files. It writes only beneath
-the resolved configured `runs_dir`. The runs directory cannot resolve to filesystem root. Stage IDs
-use a filename-safe grammar. Generated write paths are checked to remain beneath the run directory,
-and writes use fresh temporary files plus atomic replacement.
+V0 reads only the job file and explicitly declared input/prompt files. Relative paths resolve against
+the job file's parent. V0 writes only beneath the validated resolved `runs_dir`. Generated stage IDs
+are restricted to a filename-safe grammar. Run IDs are harness-generated. Artifact replacement
+refuses symlink destinations; a configured existing `runs_dir` symlink is refused when the run tree
+is created.
 
-These measures prevent obvious accidental traversal/symlink misuse. They are not a hardened sandbox
-against a malicious local operator with access to the same account.
+This reduces accidental traversal and write mistakes. It is not a hardened sandbox and should not be
+treated as safe against a malicious local operator with filesystem-race capabilities.
 
-## Models have no tools
+## Model permissions
 
-The runtime sends text to models and receives text. Models have no shell, filesystem tool, Git tool,
-worker-spawn ability, or repository mutation authority.
+Workers have no shell, filesystem tool, Git tool, RAG, repository mutation, recursive delegation, or
+plugin capability. They return text only.
 
-## Cost control limitation
+## Cost control
 
-`stop_before_synthesis_if_known_cost_exceeds_usd` runs only after workers have already executed. It
-can prevent synthesis based on the exact known worker subtotal. It cannot prevent workers from
-collectively spending more than the threshold and it is not a hard budget.
+The configured dollar threshold is checked only after worker execution and only gates synthesis.
+Workers can collectively exceed it. Unknown provider cost remains unknown. This is explicitly not a
+hard whole-run budget.
 
-## Before consequential actions
+## Consequential actions
 
-A later version that can mutate files, Git, services, or external systems requires explicit tool
-capabilities, stronger path/permission boundaries, auditable approval gates, and corresponding tests.
-V0 intentionally provides none of those actions.
+V0 does not support consequential mutation. A future version would require explicit capability
+boundaries, human approval gates, stronger path/tool isolation, and auditable authorization before
+such actions are considered.
