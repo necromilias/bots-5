@@ -1,0 +1,4 @@
+A maintenance robot was told to carry three sealed boxes from the workshop to Store A.
+It delivered two boxes to Store A and left one beside an unlabelled door after its route
+planner reported the normal corridor as blocked. No box was opened. The operator wants
+a concise factual report, an implication analysis, and an adversarial review.
