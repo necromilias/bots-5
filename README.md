@@ -8,6 +8,10 @@ It is deliberately not an autonomous agent platform. Models cannot spawn workers
 discover repository context, mutate Git, perform RAG, or invent execution topology. The harness owns
 validation, scheduling, persistence, limits, and state.
 
+V0.1 compiles every model system message from a fixed harness-owned execution boundary plus a
+validated six-section worker contract. Declared source and worker outputs remain untrusted data in
+user-message blocks. See `docs/WORKER_CONTRACTS.md` for the exact authority and contract rules.
+
 ## Install
 
 Requires Python 3.12+.
@@ -63,6 +67,8 @@ Both commands are disk-only and make no API calls.
 ## V0 constraints
 
 - strict JSON, closed objects, no coercion;
+- mandatory ordered `TASK`, `ALLOWED`, `FORBIDDEN`, `EVIDENCE`, `OUTPUT`, and `STOP CONDITION`
+  sections in every worker and synthesis contract;
 - IDs must match `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`;
 - temperature range is 0 through 2 inclusive;
 - OpenRouter is the only provider;

@@ -27,11 +27,18 @@ The operator and manifest are trusted. Model output is untrusted text. The OpenR
 external service boundary. The local filesystem rules reduce accidental writes but are not a hostile
 sandbox.
 
+Instruction provenance is structural: the harness-owned execution boundary outranks the validated
+worker contract, which outranks all INPUT or WORKER OUTPUT data. Data blocks remain in user messages;
+they never become part of the system prompt. See `WORKER_CONTRACTS.md`.
+
 ## Determinism
 
 The job schema is strict and closed. Input ordering, prompt loading, dependency ordering, message
 rendering, state vocabulary, and artifact locations are explicit. Model generation remains
 nondeterministic; the shell around it is intended to be predictable.
+
+Contract parsing, boundary compilation, and system/user message separation are deterministic. Model
+obedience to those instructions remains probabilistic.
 
 ## Provider boundary
 

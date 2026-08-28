@@ -17,6 +17,7 @@ from .models import (
     WorkerSpec,
 )
 from .paths import resolve_job_relative, validate_runs_dir, validate_stage_id
+from .prompts import parse_worker_contract
 
 
 TOP_KEYS = {"schema_version", "name", "inputs", "execution", "workers", "synthesis", "output"}
@@ -267,7 +268,7 @@ def load_job(path: Path | str) -> Job:
     return validate_job(data, path.parent)
 
 
-def _validate_text_file(path: Path, ctx: str) -> None:
+def _validate_text_file(path: Path, ctx: str) -> str:
     if not path.exists():
         raise FileValidationError(f"{ctx}: file does not exist: {path}")
     if not path.is_file():
@@ -275,20 +276,32 @@ def _validate_text_file(path: Path, ctx: str) -> None:
     if not os.access(path, os.R_OK):
         raise FileValidationError(f"{ctx}: file is not readable: {path}")
     try:
-        path.read_bytes().decode("utf-8")
+        return path.read_bytes().decode("utf-8")
     except UnicodeDecodeError as exc:
         raise FileValidationError(f"{ctx}: file is not valid UTF-8: {path}") from exc
     except OSError as exc:
         raise FileValidationError(f"{ctx}: cannot read file: {path}: {exc.strerror or exc}") from None
 
 
+def _validate_worker_contract_file(path: Path, ctx: str) -> None:
+    text = _validate_text_file(path, ctx)
+    try:
+        parse_worker_contract(text)
+    except ValidationError as exc:
+        raise FileValidationError(f"{ctx}: {exc}") from None
+
+
 def validate_referenced_files(job: Job) -> None:
     for item in job.inputs:
         _validate_text_file(item.path, f"input {item.label!r}")
     for worker in job.workers:
-        _validate_text_file(worker.system_prompt_path, f"worker {worker.id!r} prompt")
+        _validate_worker_contract_file(
+            worker.system_prompt_path, f"worker {worker.id!r} prompt"
+        )
     if job.synthesis is not None:
-        _validate_text_file(job.synthesis.system_prompt_path, "synthesis prompt")
+        _validate_worker_contract_file(
+            job.synthesis.system_prompt_path, "synthesis prompt"
+        )
 
 
 def job_to_dict(job: Job) -> dict[str, Any]:

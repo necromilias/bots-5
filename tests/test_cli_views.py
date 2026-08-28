@@ -10,8 +10,13 @@ from bots5.runner import run_job
 from .helpers import FakeProvider, make_job_tree
 
 
-def test_validate_makes_no_run_dir(tmp_path, capsys):
+def test_validate_makes_no_api_call_or_run_dir(tmp_path, capsys, monkeypatch):
     path, _ = make_job_tree(tmp_path)
+
+    def provider_must_not_be_constructed(*args, **kwargs):
+        raise AssertionError("validation must not construct a provider")
+
+    monkeypatch.setattr("bots5.cli.OpenRouterProvider", provider_must_not_be_constructed)
     assert main(["validate", str(path)]) == 0
     assert not (tmp_path / ".bots5" / "runs").exists()
 

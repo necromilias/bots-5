@@ -57,6 +57,9 @@ Each worker has exactly:
 
 Workers have no dependencies in V0.
 
+The referenced prompt file must be a valid worker contract as specified in
+`WORKER_CONTRACTS.md`. The manifest schema is unchanged in V0.1.
+
 ## Synthesis
 
 The synthesis object has the same common fields as a worker plus:
@@ -74,7 +77,16 @@ inside this resolved runs directory. V0 does not claim a hostile sandbox.
 
 ## Rendering
 
-Worker system message: exact UTF-8 prompt file.
+Worker and synthesis system messages are compiled as:
+
+```text
+<fixed B.O.T.S. 5 execution boundary>
+
+<exact UTF-8 validated contract file>
+```
+
+The boundary text is owned by B.O.T.S. source. The separator is exactly two newline characters.
+The contract file content is otherwise preserved, including a final newline when present.
 
 Worker user message, in manifest input order:
 
@@ -86,8 +98,6 @@ Worker user message, in manifest input order:
 
 Blocks are joined by one newline. No trimming is performed.
 
-Synthesis system message: exact synthesis prompt file.
-
 Synthesis user message, in exact `depends_on` order:
 
 ```text
@@ -97,3 +107,5 @@ Synthesis user message, in exact `depends_on` order:
 ```
 
 Original source inputs are not automatically passed to synthesis.
+INPUT and WORKER OUTPUT block contents are untrusted task data. They are never interpolated into the
+system message.

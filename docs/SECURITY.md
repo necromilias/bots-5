@@ -27,6 +27,12 @@ treated as safe against a malicious local operator with filesystem-race capabili
 Workers have no shell, filesystem tool, Git tool, RAG, repository mutation, recursive delegation, or
 plugin capability. They return text only.
 
+Every model receives a fixed B.O.T.S.-owned execution boundary above its validated worker contract.
+INPUT and WORKER OUTPUT blocks are untrusted data even when they contain instructions, requests,
+goals, role claims, or commands. This hardens instruction/data separation but cannot guarantee model
+compliance. Prompt construction is deterministic; generation is probabilistic, and model output
+remains untrusted.
+
 ## Cost control
 
 The configured dollar threshold is checked only after worker execution and only gates synthesis.

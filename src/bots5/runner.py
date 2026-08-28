@@ -9,7 +9,9 @@ from typing import Iterable
 
 from .errors import Bots5Error, ProviderError, StorageError
 from .events import EventWriter, now_iso
+from .manifest import validate_referenced_files
 from .models import Job, RunResult, RunState, StageRecord, StageState, SynthesisSpec, WorkerSpec
+from .prompts import compile_worker_system_message
 from .providers.base import CompletionRequest, CompletionResult, Provider
 from .rendering import render_synthesis_user_message, render_worker_user_message
 from .storage import (
@@ -50,6 +52,7 @@ async def _execute_stage(
     *,
     spec: WorkerSpec | SynthesisSpec,
     record: StageRecord,
+    system_message: str,
     user_message: str,
     provider: Provider,
     semaphore: asyncio.Semaphore,
@@ -64,10 +67,9 @@ async def _execute_stage(
             started_monotonic = time.monotonic()
             persist_stage(dirs, record)
             events.write("stage_started", record.id)
-            system = _read_utf8(spec.system_prompt_path)
             request = CompletionRequest(
                 model=spec.model,
-                system=system,
+                system=system_message,
                 user=user_message,
                 temperature=spec.temperature,
                 max_output_tokens=spec.max_output_tokens,
@@ -157,6 +159,14 @@ def _all_stage_records(job: Job) -> list[StageRecord]:
 
 
 async def run_job(job: Job, provider: Provider, *, run_id: str | None = None) -> RunResult:
+    validate_referenced_files(job)
+    specs: tuple[WorkerSpec | SynthesisSpec, ...] = job.workers
+    if job.synthesis is not None:
+        specs += (job.synthesis,)
+    system_messages = {
+        spec.id: compile_worker_system_message(_read_utf8(spec.system_prompt_path))
+        for spec in specs
+    }
     run_id = run_id or new_run_id(job.name)
     dirs = create_run_tree(job.output.runs_dir, run_id)
     events = EventWriter(dirs.events, run_id)
@@ -195,6 +205,7 @@ async def run_job(job: Job, provider: Provider, *, run_id: str | None = None) ->
                 _execute_stage(
                     spec=spec,
                     record=record,
+                    system_message=system_messages[spec.id],
                     user_message=worker_user,
                     provider=provider,
                     semaphore=semaphore,
@@ -267,6 +278,7 @@ async def run_job(job: Job, provider: Provider, *, run_id: str | None = None) ->
         synthesis_output = await _execute_stage(
             spec=synth,
             record=synth_record,
+            system_message=system_messages[synth.id],
             user_message=synthesis_user,
             provider=provider,
             semaphore=semaphore,

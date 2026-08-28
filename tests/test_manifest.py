@@ -113,3 +113,19 @@ def test_invalid_utf8_referenced_file(tmp_path):
     job.inputs[0].path.write_bytes(b"\xff")
     with pytest.raises(FileValidationError):
         validate_referenced_files(job)
+
+
+def test_invalid_utf8_worker_contract_rejected(tmp_path):
+    path, _ = make_job_tree(tmp_path)
+    job = load_job(path)
+    job.workers[0].system_prompt_path.write_bytes(b"\xff")
+    with pytest.raises(FileValidationError, match="not valid UTF-8"):
+        validate_referenced_files(job)
+
+
+def test_invalid_worker_contract_rejected_by_file_validation(tmp_path):
+    path, _ = make_job_tree(tmp_path)
+    job = load_job(path)
+    job.workers[0].system_prompt_path.write_text("TASK\nOnly a task.\n", encoding="utf-8")
+    with pytest.raises(FileValidationError, match="missing section"):
+        validate_referenced_files(job)
