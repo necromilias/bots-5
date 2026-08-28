@@ -84,10 +84,14 @@ class OpenRouterProvider:
 
         returned_model = data.get("model") if type(data.get("model")) is str else None
         request_id = data.get("id") if type(data.get("id")) is str else None
+        finish_reason = first.get("finish_reason")
+        if type(finish_reason) is not str:
+            finish_reason = None
 
         return CompletionResult(
             output_text=content,
             requested_model=requested_model,
+            finish_reason=finish_reason,
             returned_model=returned_model,
             request_id=request_id,
             prompt_tokens=_optional_int(usage.get("prompt_tokens")),

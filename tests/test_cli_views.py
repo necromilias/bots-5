@@ -28,16 +28,20 @@ def test_missing_api_key_makes_no_run_dir(tmp_path, capsys):
 
 
 def test_status_and_inspect_from_disk_only(tmp_path, capsys):
-    path, _ = make_job_tree(tmp_path)
+    path, _ = make_job_tree(tmp_path, workers=1, synthesis=False)
     job = load_job(path)
-    result = asyncio.run(run_job(job, FakeProvider(), run_id="disk-run"))
+    provider = FakeProvider(finish_reasons={"model-w1": "length"})
+    result = asyncio.run(run_job(job, provider, run_id="disk-run"))
 
     assert main(["status", "disk-run", "--runs-dir", str(job.output.runs_dir)]) == 0
     status_text = capsys.readouterr().out
     assert "state: succeeded" in status_text
     assert "w1:" in status_text
+    assert "completion=incomplete finish_reason='length'" in status_text
 
     assert main(["inspect", "disk-run", "w1", "--runs-dir", str(job.output.runs_dir)]) == 0
     inspect_text = capsys.readouterr().out
+    assert "completion: incomplete" in inspect_text
+    assert "finish_reason: 'length'" in inspect_text
     assert "--- output ---" in inspect_text
     assert "output:model-w1" in inspect_text

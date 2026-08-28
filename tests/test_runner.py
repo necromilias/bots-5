@@ -11,6 +11,7 @@ from bots5.manifest import load_job, validate_referenced_files
 from bots5.models import StageState
 from bots5.providers.base import CompletionResult
 from bots5.runner import run_job
+from bots5.storage import load_run_view, load_stage_view
 
 from .helpers import FakeProvider, make_job_tree
 
@@ -35,6 +36,46 @@ def test_worker_and_synthesis_success_persist(tmp_path):
     assert (result.run_dir / "stages" / "w1.md").read_text() == "one"
     assert (result.run_dir / "stages" / "w2.md").read_text() == "two"
     assert (result.run_dir / "result.md").read_text() == "final"
+    assert all(stage.completion_complete is True for stage in result.stages)
+
+
+@pytest.mark.parametrize(
+    ("finish_reason", "complete"),
+    [
+        ("stop", True),
+        ("length", False),
+        (None, False),
+        ("content_filter", False),
+        ("refusal", False),
+        ("future_reason", False),
+    ],
+)
+def test_completion_semantics_are_conservative_and_persisted(
+    tmp_path, finish_reason, complete
+):
+    provider = FakeProvider(finish_reasons={"model-w1": finish_reason})
+    result = _run(tmp_path, provider, workers=1, synthesis=False)
+
+    stage = json.loads((result.run_dir / "stages" / "w1.json").read_text())
+    assert stage["state"] == "succeeded"
+    assert stage["completion"] == {
+        "finish_reason": finish_reason,
+        "complete": complete,
+    }
+    assert (result.run_dir / "stages" / "w1.md").read_text() == "output:model-w1"
+
+
+def test_completion_metadata_survives_disk_reconstruction(tmp_path):
+    provider = FakeProvider(finish_reasons={"model-w1": "length"})
+    result = _run(tmp_path, provider, workers=1, synthesis=False)
+
+    run, stages, _ = load_run_view(result.run_dir)
+    stage, output = load_stage_view(result.run_dir, "w1")
+    expected = {"finish_reason": "length", "complete": False}
+    assert run["stages"]["w1"]["completion"] == expected
+    assert stages[0]["completion"] == expected
+    assert stage["completion"] == expected
+    assert output == "output:model-w1"
 
 
 def test_requests_keep_system_contract_and_input_data_separate(tmp_path):
@@ -113,6 +154,33 @@ def test_worker_failure_preserves_sibling_and_blocks_synthesis(tmp_path):
     synth = json.loads((result.run_dir / "stages" / "synth.json").read_text())
     assert synth["state"] == "skipped"
     assert synth["failure"]["type"] == "dependency_failed"
+    run = json.loads((result.run_dir / "run.json").read_text())
+    assert run["synthesis_skipped_reason"] == "dependency_failed"
+
+
+def test_incomplete_dependency_blocks_synthesis_with_distinct_reason(tmp_path):
+    provider = FakeProvider(finish_reasons={"model-w2": "length"})
+    result = _run(tmp_path, provider)
+
+    assert result.exit_code == 1
+    assert all(
+        next(stage for stage in result.stages if stage.id == worker_id).state
+        == StageState.SUCCEEDED
+        for worker_id in ("w1", "w2")
+    )
+    assert all(call.model != "model-synth" for call in provider.calls)
+    synth = json.loads((result.run_dir / "stages" / "synth.json").read_text())
+    assert synth["state"] == "skipped"
+    assert synth["failure"]["type"] == "dependency_incomplete"
+    run = json.loads((result.run_dir / "run.json").read_text())
+    assert run["synthesis_skipped_reason"] == "dependency_incomplete"
+    events = [
+        json.loads(line)
+        for line in (result.run_dir / "events.jsonl").read_text().splitlines()
+    ]
+    blocked = next(event for event in events if event["event"] == "synthesis_blocked")
+    assert blocked["meta"]["reason"] == "dependency_incomplete"
+    assert blocked["meta"]["incomplete_dependencies"] == ["w2"]
 
 
 def test_known_cost_threshold_blocks_synthesis(tmp_path):
@@ -122,6 +190,7 @@ def test_known_cost_threshold_blocks_synthesis(tmp_path):
             return CompletionResult(
                 output_text=f"ok:{request.model}",
                 requested_model=request.model,
+                finish_reason="stop",
                 known_cost_usd=Decimal("1.50"),
                 duration_seconds=0.001,
             )
@@ -140,6 +209,7 @@ def test_unknown_partial_cost_aggregation(tmp_path):
             return CompletionResult(
                 output_text=f"ok:{request.model}",
                 requested_model=request.model,
+                finish_reason="stop",
                 known_cost_usd=cost,
                 duration_seconds=0.001,
             )
@@ -189,6 +259,7 @@ def test_workers_actually_overlap(tmp_path):
                 return CompletionResult(
                     output_text=f"ok:{request.model}",
                     requested_model=request.model,
+                    finish_reason="stop",
                     known_cost_usd=Decimal("0.01"),
                     duration_seconds=0.02,
                 )
@@ -213,7 +284,7 @@ def test_api_key_not_persisted_with_mock_openrouter(tmp_path):
             json={
                 "id": "req",
                 "model": "returned",
-                "choices": [{"message": {"content": "ok"}}],
+                "choices": [{"finish_reason": "stop", "message": {"content": "ok"}}],
                 "usage": {"cost": "0.001"},
             },
         )

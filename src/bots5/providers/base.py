@@ -19,6 +19,7 @@ class CompletionRequest:
 class CompletionResult:
     output_text: str
     requested_model: str
+    finish_reason: str | None = None
     returned_model: str | None = None
     request_id: str | None = None
     prompt_tokens: int | None = None

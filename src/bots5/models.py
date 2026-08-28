@@ -91,6 +91,8 @@ class StageRecord:
     known_cost_usd: Decimal | None = None
     request_id: str | None = None
     output_path: str | None = None
+    finish_reason: str | None = None
+    completion_complete: bool | None = None
     error_type: str | None = None
     error_message: str | None = None
     provider_side_outcome_unknown: bool = False
@@ -115,6 +117,12 @@ class StageRecord:
             "cost_known": self.known_cost_usd is not None,
             "provider_request_id": self.request_id,
             "output_path": self.output_path,
+            "completion": None
+            if self.completion_complete is None
+            else {
+                "finish_reason": self.finish_reason,
+                "complete": self.completion_complete,
+            },
             "failure": None
             if self.error_type is None
             else {

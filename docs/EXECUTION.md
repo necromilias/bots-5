@@ -15,12 +15,14 @@ After validation and key acquisition:
 5. Launch all worker coroutines. A semaphore limits in-flight worker requests.
 6. Persist each success or failure independently.
 7. After the worker phase joins, evaluate synthesis dependencies.
-8. If a dependency failed, persist synthesis as skipped and fail the run.
-9. Otherwise compare the exact known worker-cost subtotal with the configured synthesis gate. If the
+8. If a dependency failed, persist synthesis as skipped with `dependency_failed` and fail the run.
+9. If a dependency succeeded without a normal completion, persist synthesis as skipped with
+   `dependency_incomplete` and fail the run.
+10. Otherwise compare the exact known worker-cost subtotal with the configured synthesis gate. If the
    known subtotal is greater than the threshold, skip synthesis and fail the run. Unknown cost is not
    treated as zero.
-10. Otherwise run synthesis with its own compiled system message and WORKER OUTPUT data blocks.
-11. Persist final usage and run state. `result.md` exists only when synthesis succeeds.
+11. Otherwise run synthesis with its own compiled system message and WORKER OUTPUT data blocks.
+12. Persist final usage and run state. `result.md` exists only when synthesis succeeds.
 
 A run without synthesis succeeds only if every worker succeeded. With synthesis, the run succeeds
 only if every worker and synthesis succeeded.

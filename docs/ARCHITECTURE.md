@@ -15,7 +15,7 @@ validated job
   -> explicit UTF-8 inputs
   -> independent workers (asyncio, bounded by max_parallelism)
   -> complete worker phase
-  -> optional synthesis over declared successful dependencies
+  -> optional synthesis over declared succeeded-and-complete dependencies
   -> persisted result/state
 ```
 

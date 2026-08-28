@@ -29,7 +29,7 @@ def test_provider_success_normalization():
             json={
                 "id": "abc",
                 "model": "returned-x",
-                "choices": [{"message": {"content": "hello"}}],
+                "choices": [{"finish_reason": "stop", "message": {"content": "hello"}}],
                 "usage": {
                     "prompt_tokens": 1,
                     "completion_tokens": 2,
@@ -43,8 +43,39 @@ def test_provider_success_normalization():
     provider = OpenRouterProvider("secret", _transport=httpx.MockTransport(handler))
     result = asyncio.run(provider.complete(req()))
     assert result.output_text == "hello"
+    assert result.finish_reason == "stop"
     assert result.known_cost_usd == Decimal("0.0012")
     assert result.reasoning_tokens == 1
+
+
+@pytest.mark.parametrize(
+    ("provider_reason", "normalized_reason"),
+    [
+        ("length", "length"),
+        ("content_filter", "content_filter"),
+        ("refusal", "refusal"),
+        ("future_reason", "future_reason"),
+        (None, None),
+        ({"malformed": True}, None),
+    ],
+)
+def test_provider_finish_reason_normalization(provider_reason, normalized_reason):
+    async def handler(request):
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": provider_reason,
+                        "message": {"content": "hello"},
+                    }
+                ]
+            },
+        )
+
+    provider = OpenRouterProvider("secret", _transport=httpx.MockTransport(handler))
+    result = asyncio.run(provider.complete(req()))
+    assert result.finish_reason == normalized_reason
 
 
 def test_provider_non_2xx_is_sanitized():

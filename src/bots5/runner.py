@@ -40,6 +40,8 @@ def _failure_message(exc: BaseException) -> str:
 def _apply_result(record: StageRecord, result: CompletionResult) -> None:
     record.returned_model = result.returned_model
     record.request_id = result.request_id
+    record.finish_reason = result.finish_reason
+    record.completion_complete = result.finish_reason == "stop"
     record.prompt_tokens = result.prompt_tokens
     record.completion_tokens = result.completion_tokens
     record.reasoning_tokens = result.reasoning_tokens
@@ -248,6 +250,26 @@ async def run_job(job: Job, provider: Provider, *, run_id: str | None = None) ->
                 synth.id,
                 reason=synthesis_skipped_reason,
                 failed_dependencies=failed_deps,
+            )
+            return RunState.FAILED
+
+        incomplete_deps = [
+            dep for dep in synth.depends_on
+            if record_by_id[dep].completion_complete is not True
+        ]
+        if incomplete_deps:
+            synthesis_skipped_reason = "dependency_incomplete"
+            synth_record.state = StageState.SKIPPED
+            synth_record.known_cost_usd = Decimal("0")
+            synth_record.error_type = "dependency_incomplete"
+            synth_record.error_message = "synthesis dependency did not complete normally"
+            persist_stage(dirs, synth_record)
+            events.write("stage_skipped", synth.id, reason=synthesis_skipped_reason)
+            events.write(
+                "synthesis_blocked",
+                synth.id,
+                reason=synthesis_skipped_reason,
+                incomplete_dependencies=incomplete_deps,
             )
             return RunState.FAILED
 

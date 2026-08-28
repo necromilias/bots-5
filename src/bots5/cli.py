@@ -42,6 +42,14 @@ def _cost_text(stage: dict) -> str:
     return stage.get("cost_usd") if stage.get("cost_known") else "?"
 
 
+def _completion_text(stage: dict) -> str:
+    completion = stage.get("completion")
+    if completion is None:
+        return "not_available"
+    state = "complete" if completion.get("complete") is True else "incomplete"
+    return f"{state} finish_reason={completion.get('finish_reason')!r}"
+
+
 def _print_result(result: RunResult) -> None:
     print(f"run_id: {result.run_id}")
     print(f"state: {result.state.value}")
@@ -84,6 +92,7 @@ def _cmd_status(run_id: str, runs_dir: Path | None) -> int:
             f"{stage['stage_id']}: model={stage['requested_model']} state={stage['state']} "
             f"duration={stage.get('duration_seconds')} "
             f"tokens={usage_s.get('total_tokens')} cost={_cost_text(stage)} "
+            f"completion={_completion_text(stage)} "
             f"output={stage.get('output_path')}{failure_text}"
         )
     agg = usage.get("aggregate", {})
@@ -102,6 +111,14 @@ def _cmd_inspect(run_id: str, stage_id: str, runs_dir: Path | None) -> int:
     print(f"stage_id: {meta['stage_id']}")
     print(f"model: {meta['requested_model']}")
     print(f"state: {meta['state']}")
+    completion = meta.get("completion")
+    if completion is None:
+        print("completion: not_available")
+        print("finish_reason: None")
+    else:
+        completion_state = "complete" if completion.get("complete") is True else "incomplete"
+        print(f"completion: {completion_state}")
+        print(f"finish_reason: {completion.get('finish_reason')!r}")
     print(f"metadata: {meta}")
     if output is not None:
         print("--- output ---")

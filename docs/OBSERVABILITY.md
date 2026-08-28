@@ -19,9 +19,11 @@ Each run is self-contained:
 ## Stage JSON
 
 Contains stage/provider/model identity, state, timestamps, duration, token usage when known, exact
-provider-reported cost when known, request ID, relative output path, and sanitized failure metadata.
-`cost_usd: null` plus `cost_known: false` means unknown. Known costs are stored as decimal strings to
-avoid binary floating-point money arithmetic.
+provider-reported cost when known, request ID, relative output path, completion metadata, and
+sanitized failure metadata. Completion preserves the provider finish reason; only exact `stop` is
+complete, while missing, malformed, and all other reasons are conservatively incomplete.
+`cost_usd: null` plus `cost_known: false` means unknown. Known costs are stored as decimal strings
+to avoid binary floating-point money arithmetic.
 
 ## Events
 
@@ -50,3 +52,4 @@ Unknown cost is never silently converted to zero.
 `bots5 status RUN_ID` and `bots5 inspect RUN_ID STAGE_ID` use
 `./.bots5/runs` relative to the current working directory by default. For manifests configured
 elsewhere, pass `--runs-dir PATH`. These commands read disk only and make no provider calls.
+Both views display the persisted completion state and finish reason.

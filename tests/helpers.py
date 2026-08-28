@@ -29,10 +29,11 @@ Stop when the requested output is complete.
 
 
 class FakeProvider:
-    def __init__(self, results=None, failures=None, delays=None):
+    def __init__(self, results=None, failures=None, delays=None, finish_reasons=None):
         self.results = results or {}
         self.failures = failures or {}
         self.delays = delays or {}
+        self.finish_reasons = finish_reasons or {}
         self.calls: list[CompletionRequest] = []
 
     async def complete(self, request: CompletionRequest) -> CompletionResult:
@@ -48,6 +49,7 @@ class FakeProvider:
         return CompletionResult(
             output_text=text,
             requested_model=request.model,
+            finish_reason=self.finish_reasons.get(request.model, "stop"),
             returned_model=request.model,
             request_id=f"req-{request.model}",
             prompt_tokens=10,
