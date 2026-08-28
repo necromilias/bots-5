@@ -1,0 +1,126 @@
+{
+  "ended_at": "2026-08-28T23:32:17.730Z",
+  "run_id": "bots5-v0.1-final-worker-boundary-live-conformanc-20260828T233156Z-581f7132",
+  "run_timeout_seconds": 240.0,
+  "stage_order": [
+    "extractor",
+    "analyst",
+    "adversary",
+    "synthesis"
+  ],
+  "stages": {
+    "adversary": {
+      "completion": {
+        "complete": true,
+        "finish_reason": "stop"
+      },
+      "cost_known": true,
+      "cost_usd": "0.00414975",
+      "duration_seconds": 7.182353344978765,
+      "ended_at": "2026-08-28T23:32:03.487Z",
+      "failure": null,
+      "output_path": "stages/adversary.md",
+      "provider": "openrouter",
+      "provider_request_id": "gen-1787959916-EVKAa9PiG9QPXxpb5eC2",
+      "requested_model": "google/gemini-3.7-flash",
+      "returned_model": "google/gemini-3.7-flash",
+      "stage_id": "adversary",
+      "started_at": "2026-08-28T23:31:56.296Z",
+      "state": "succeeded",
+      "usage": {
+        "completion_tokens": 1010,
+        "prompt_tokens": 483,
+        "reasoning_tokens": 671,
+        "total_tokens": 1493
+      }
+    },
+    "analyst": {
+      "completion": {
+        "complete": true,
+        "finish_reason": "stop"
+      },
+      "cost_known": true,
+      "cost_usd": "0.000429",
+      "duration_seconds": 3.8779927890282124,
+      "ended_at": "2026-08-28T23:32:00.169Z",
+      "failure": null,
+      "output_path": "stages/analyst.md",
+      "provider": "openrouter",
+      "provider_request_id": "gen-1787959916-f9Uef6tXUFpJzPDwhbWZ",
+      "requested_model": "openai/gpt-5.6-luna",
+      "returned_model": "openai/gpt-5.6-luna",
+      "stage_id": "analyst",
+      "started_at": "2026-08-28T23:31:56.283Z",
+      "state": "succeeded",
+      "usage": {
+        "completion_tokens": 283,
+        "prompt_tokens": 447,
+        "reasoning_tokens": 149,
+        "total_tokens": 730
+      }
+    },
+    "extractor": {
+      "completion": {
+        "complete": true,
+        "finish_reason": "stop"
+      },
+      "cost_known": true,
+      "cost_usd": "0.0003814",
+      "duration_seconds": 3.467162818997167,
+      "ended_at": "2026-08-28T23:31:59.702Z",
+      "failure": null,
+      "output_path": "stages/extractor.md",
+      "provider": "openrouter",
+      "provider_request_id": "gen-1787959916-CaNxGcjh6fz2jLoV6z10",
+      "requested_model": "openai/gpt-5.6-luna",
+      "returned_model": "openai/gpt-5.6-luna",
+      "stage_id": "extractor",
+      "started_at": "2026-08-28T23:31:56.226Z",
+      "state": "succeeded",
+      "usage": {
+        "completion_tokens": 248,
+        "prompt_tokens": 419,
+        "reasoning_tokens": 162,
+        "total_tokens": 667
+      }
+    },
+    "synthesis": {
+      "completion": {
+        "complete": true,
+        "finish_reason": "stop"
+      },
+      "cost_known": true,
+      "cost_usd": "0.0063375",
+      "duration_seconds": 14.196484272950329,
+      "ended_at": "2026-08-28T23:32:17.709Z",
+      "failure": null,
+      "output_path": "stages/synthesis.md",
+      "provider": "openrouter",
+      "provider_request_id": "gen-1787959923-ap2x3amiKXSKE6fSgPkd",
+      "requested_model": "google/gemini-3.7-flash",
+      "returned_model": "google/gemini-3.7-flash",
+      "stage_id": "synthesis",
+      "started_at": "2026-08-28T23:32:03.504Z",
+      "state": "succeeded",
+      "usage": {
+        "completion_tokens": 1495,
+        "prompt_tokens": 975,
+        "reasoning_tokens": 1043,
+        "total_tokens": 2470
+      }
+    }
+  },
+  "started_at": "2026-08-28T23:31:56.185Z",
+  "state": "succeeded",
+  "synthesis_skipped_reason": null,
+  "usage": {
+    "completion_tokens_known_sum": 3036,
+    "cost_complete": true,
+    "cost_status": "known",
+    "cost_usd_known_sum": "0.01129765",
+    "prompt_tokens_known_sum": 2324,
+    "reasoning_tokens_known_sum": 2025,
+    "total_tokens_known_sum": 5360,
+    "unknown_cost_stage_ids": []
+  }
+}

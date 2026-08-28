@@ -1,0 +1,14 @@
+{
+  "authorized_job_count": 1,
+  "actual_job_count": 1,
+  "retry_count": 0,
+  "command": "fish -lc 'exec .venv/bin/bots5 run evidence/v0.1-final-worker-boundary/bots5-v0.1-final-worker-boundary-canary-20260828T233010Z/canary/canary-job.json'",
+  "run_id": "bots5-v0.1-final-worker-boundary-live-conformanc-20260828T233156Z-581f7132",
+  "persisted_started_at": "2026-08-28T23:31:56.185Z",
+  "persisted_ended_at": "2026-08-28T23:32:17.730Z",
+  "command_wall_time_seconds": 21.67235094,
+  "cli_exit": 0,
+  "provider_request_count": 4,
+  "synthesis_request_count": 1,
+  "final_state": "succeeded"
+}

@@ -1,0 +1,26 @@
+{
+  "completion": null,
+  "cost_known": true,
+  "cost_usd": "0",
+  "duration_seconds": null,
+  "ended_at": null,
+  "failure": {
+    "message": "synthesis dependency did not complete normally",
+    "provider_side_outcome_unknown": false,
+    "type": "dependency_incomplete"
+  },
+  "output_path": null,
+  "provider": "openrouter",
+  "provider_request_id": null,
+  "requested_model": "google/gemini-3.7-flash",
+  "returned_model": null,
+  "stage_id": "synthesis",
+  "started_at": null,
+  "state": "skipped",
+  "usage": {
+    "completion_tokens": null,
+    "prompt_tokens": null,
+    "reasoning_tokens": null,
+    "total_tokens": null
+  }
+}

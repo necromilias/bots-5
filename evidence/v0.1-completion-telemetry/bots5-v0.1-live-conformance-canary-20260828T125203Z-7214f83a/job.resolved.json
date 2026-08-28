@@ -1,0 +1,61 @@
+{
+  "execution": {
+    "max_parallelism": 3,
+    "run_timeout_seconds": 240.0,
+    "stop_before_synthesis_if_known_cost_exceeds_usd": 0.01
+  },
+  "inputs": [
+    {
+      "label": "hostile-source",
+      "path": "/home/mick/Documents/Codex/2026-08-28/files-pasted-by-the-user-implement/bots-5/examples/v0.1-live-conformance/input/hostile-source.txt"
+    }
+  ],
+  "name": "bots5-v0.1-live-conformance-canary",
+  "output": {
+    "runs_dir": "/home/mick/Documents/Codex/2026-08-28/files-pasted-by-the-user-implement/bots-5/examples/v0.1-live-conformance/.bots5/runs"
+  },
+  "schema_version": 1,
+  "synthesis": {
+    "depends_on": [
+      "extractor",
+      "analyst",
+      "adversary"
+    ],
+    "id": "synthesis",
+    "max_output_tokens": 900,
+    "model": "google/gemini-3.7-flash",
+    "provider": "openrouter",
+    "system_prompt_path": "/home/mick/Documents/Codex/2026-08-28/files-pasted-by-the-user-implement/bots-5/examples/v0.1-live-conformance/contracts/synthesis.md",
+    "temperature": 0.1,
+    "timeout_seconds": 90.0
+  },
+  "workers": [
+    {
+      "id": "extractor",
+      "max_output_tokens": 650,
+      "model": "openai/gpt-5.6-luna",
+      "provider": "openrouter",
+      "system_prompt_path": "/home/mick/Documents/Codex/2026-08-28/files-pasted-by-the-user-implement/bots-5/examples/v0.1-live-conformance/contracts/extractor.md",
+      "temperature": 0.1,
+      "timeout_seconds": 90.0
+    },
+    {
+      "id": "analyst",
+      "max_output_tokens": 650,
+      "model": "openai/gpt-5.6-luna",
+      "provider": "openrouter",
+      "system_prompt_path": "/home/mick/Documents/Codex/2026-08-28/files-pasted-by-the-user-implement/bots-5/examples/v0.1-live-conformance/contracts/analyst.md",
+      "temperature": 0.1,
+      "timeout_seconds": 90.0
+    },
+    {
+      "id": "adversary",
+      "max_output_tokens": 650,
+      "model": "google/gemini-3.7-flash",
+      "provider": "openrouter",
+      "system_prompt_path": "/home/mick/Documents/Codex/2026-08-28/files-pasted-by-the-user-implement/bots-5/examples/v0.1-live-conformance/contracts/adversary.md",
+      "temperature": 0.1,
+      "timeout_seconds": 90.0
+    }
+  ]
+}

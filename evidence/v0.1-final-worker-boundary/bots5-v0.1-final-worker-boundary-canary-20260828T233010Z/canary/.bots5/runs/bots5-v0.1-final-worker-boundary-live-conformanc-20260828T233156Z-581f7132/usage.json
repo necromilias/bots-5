@@ -1,0 +1,46 @@
+{
+  "aggregate": {
+    "completion_tokens_known_sum": 3036,
+    "cost_complete": true,
+    "cost_status": "known",
+    "cost_usd_known_sum": "0.01129765",
+    "prompt_tokens_known_sum": 2324,
+    "reasoning_tokens_known_sum": 2025,
+    "total_tokens_known_sum": 5360,
+    "unknown_cost_stage_ids": []
+  },
+  "stages": {
+    "adversary": {
+      "completion_tokens": 1010,
+      "cost_known": true,
+      "cost_usd": "0.00414975",
+      "prompt_tokens": 483,
+      "reasoning_tokens": 671,
+      "total_tokens": 1493
+    },
+    "analyst": {
+      "completion_tokens": 283,
+      "cost_known": true,
+      "cost_usd": "0.000429",
+      "prompt_tokens": 447,
+      "reasoning_tokens": 149,
+      "total_tokens": 730
+    },
+    "extractor": {
+      "completion_tokens": 248,
+      "cost_known": true,
+      "cost_usd": "0.0003814",
+      "prompt_tokens": 419,
+      "reasoning_tokens": 162,
+      "total_tokens": 667
+    },
+    "synthesis": {
+      "completion_tokens": 1495,
+      "cost_known": true,
+      "cost_usd": "0.0063375",
+      "prompt_tokens": 975,
+      "reasoning_tokens": 1043,
+      "total_tokens": 2470
+    }
+  }
+}

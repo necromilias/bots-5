@@ -1,0 +1,82 @@
+{
+  "recorded_at_utc": "2026-08-28T23:31:38.935Z",
+  "repository": {
+    "top_level": "/home/mick/Documents/Codex/2026-08-28/files-pasted-by-the-user-implement/bots-5",
+    "branch": "v0.1-worker-boundary-hardening",
+    "head": "592c1e371ee39019bc2676bc63b6cc204153041e",
+    "head_parents": [
+      "f90ee5b05550a6189635764c1a624ff824261a84"
+    ],
+    "local_main": "ccbde6bf658192e0d29ef6eef29bae6c55c7bc79",
+    "cached_origin_main": "ccbde6bf658192e0d29ef6eef29bae6c55c7bc79",
+    "live_origin_main": "ccbde6bf658192e0d29ef6eef29bae6c55c7bc79",
+    "live_origin_feature": "592c1e371ee39019bc2676bc63b6cc204153041e",
+    "tracked_diff_empty": true,
+    "index_diff_empty": true,
+    "prior_evidence_composite_sha256": "8059f1954108ea8458451cdad67da990a35959bb376bca4ec68db2dae8a4a64c"
+  },
+  "offline_validation": {
+    "pytest_command": "env -u OPENROUTER_API_KEY .venv/bin/python -m pytest",
+    "pytest_exit": 0,
+    "pytest_result": "58 passed in 0.19s",
+    "compileall_command": "env -u OPENROUTER_API_KEY .venv/bin/python -m compileall -q src tests",
+    "compileall_exit": 0,
+    "manifest_validation_command": "env -u OPENROUTER_API_KEY .venv/bin/bots5 validate evidence/v0.1-final-worker-boundary/bots5-v0.1-final-worker-boundary-canary-20260828T233010Z/canary/canary-job.json",
+    "manifest_validation_exit": 0,
+    "manifest_sha256": "fb50122b100039d0790cac551fd32b334faf3f91eb7cc327d58c65288659eb24"
+  },
+  "pricing": {
+    "source": "https://openrouter.ai/api/v1/models and model endpoint catalogues",
+    "openai/gpt-5.6-luna": {
+      "prompt_usd_per_token": "0.0000002",
+      "completion_usd_per_token": "0.0000012",
+      "long_context_override_min_prompt_tokens": 272000,
+      "long_context_prompt_usd_per_token": "0.0000004",
+      "long_context_completion_usd_per_token": "0.0000018",
+      "context_length": 1050000
+    },
+    "google/gemini-3.7-flash": {
+      "catalogue_base_prompt_usd_per_token": "0.00000075",
+      "catalogue_base_completion_usd_per_token": "0.00000375",
+      "advertised_discounted_prompt_usd_per_token": "0.000000375",
+      "advertised_discounted_completion_usd_per_token": "0.000001875",
+      "endpoint_discount": 0.5,
+      "context_length": 1048576,
+      "actual_charge_rate_inferred_from_provider_cost": "catalogue base rate"
+    }
+  },
+  "cost_bounds": {
+    "pre_execution_theoretical_loose_four_request_usd": "1.663182000",
+    "pre_execution_rate_basis": "The advertised discounted Gemini endpoint/page rate was applied; the generic model catalogue simultaneously exposed the higher base rate.",
+    "theoretical_note": "Uses a full advertised context as prompt plus 5000 output tokens for every request and therefore deliberately overcounts the usable context/output combination.",
+    "pre_execution_practical_four_request_usd": "0.037104325",
+    "practical_basis": "Prior observed worker prompt counts 419, 447, and 483; 5000 output tokens for each worker; 16000 synthesis prompt tokens; 5000 synthesis output tokens.",
+    "conservative_expected_worker_cost_range_usd": [
+      "0.002",
+      "0.022"
+    ],
+    "pre_execution_practical_worker_subtotal_usd": "0.021729325",
+    "post_execution_corrected_theoretical_loose_four_request_usd": "2.468364000",
+    "post_execution_corrected_practical_four_request_usd": "0.062035450",
+    "post_execution_corrected_practical_worker_subtotal_usd": "0.031285450",
+    "actual_worker_subtotal_usd": "0.00496015",
+    "actual_whole_run_cost_usd": "0.01129765",
+    "pricing_deviation": "Provider-reported costs reproduce at the higher generic-catalogue Gemini base rates, not the advertised discounted endpoint/page rates used in the pre-execution arithmetic.",
+    "previous_pre_synthesis_gate_usd": "0.01",
+    "canary_pre_synthesis_gate_usd": "0.05",
+    "gate_reason": "Keep the finite known-cost gate above the conservative practical worker subtotal after raising every output ceiling to 5000 tokens.",
+    "hard_whole_run_cost_control": null,
+    "hard_control_note": "There is no hard whole-run cost cap; the topology permits at most four requests and each request has a 5000-token output ceiling."
+  },
+  "timeouts": {
+    "per_stage_seconds": 90,
+    "whole_run_seconds": 240,
+    "adjusted": false,
+    "reason": "Three worker timeouts run in parallel, followed by at most one synthesis timeout; the declared maximum scheduling path remains within 240 seconds."
+  },
+  "credential": {
+    "mechanism": "established Fish login environment",
+    "present_and_nonempty": true,
+    "value_recorded": false
+  }
+}

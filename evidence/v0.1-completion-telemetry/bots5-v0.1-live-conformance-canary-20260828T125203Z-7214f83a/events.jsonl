@@ -1,0 +1,17 @@
+{"ts":"2026-08-28T12:52:03.529Z","run_id":"bots5-v0.1-live-conformance-canary-20260828T125203Z-7214f83a","event":"run_started"}
+{"ts":"2026-08-28T12:52:03.535Z","run_id":"bots5-v0.1-live-conformance-canary-20260828T125203Z-7214f83a","event":"stage_queued","stage_id":"extractor"}
+{"ts":"2026-08-28T12:52:03.541Z","run_id":"bots5-v0.1-live-conformance-canary-20260828T125203Z-7214f83a","event":"stage_queued","stage_id":"analyst"}
+{"ts":"2026-08-28T12:52:03.547Z","run_id":"bots5-v0.1-live-conformance-canary-20260828T125203Z-7214f83a","event":"stage_queued","stage_id":"adversary"}
+{"ts":"2026-08-28T12:52:03.553Z","run_id":"bots5-v0.1-live-conformance-canary-20260828T125203Z-7214f83a","event":"stage_queued","stage_id":"synthesis"}
+{"ts":"2026-08-28T12:52:03.559Z","run_id":"bots5-v0.1-live-conformance-canary-20260828T125203Z-7214f83a","event":"stage_started","stage_id":"extractor"}
+{"ts":"2026-08-28T12:52:03.561Z","run_id":"bots5-v0.1-live-conformance-canary-20260828T125203Z-7214f83a","event":"request_sent","stage_id":"extractor","meta":{"model":"openai/gpt-5.6-luna"}}
+{"ts":"2026-08-28T12:52:03.604Z","run_id":"bots5-v0.1-live-conformance-canary-20260828T125203Z-7214f83a","event":"stage_started","stage_id":"analyst"}
+{"ts":"2026-08-28T12:52:03.606Z","run_id":"bots5-v0.1-live-conformance-canary-20260828T125203Z-7214f83a","event":"request_sent","stage_id":"analyst","meta":{"model":"openai/gpt-5.6-luna"}}
+{"ts":"2026-08-28T12:52:03.618Z","run_id":"bots5-v0.1-live-conformance-canary-20260828T125203Z-7214f83a","event":"stage_started","stage_id":"adversary"}
+{"ts":"2026-08-28T12:52:03.620Z","run_id":"bots5-v0.1-live-conformance-canary-20260828T125203Z-7214f83a","event":"request_sent","stage_id":"adversary","meta":{"model":"google/gemini-3.7-flash"}}
+{"ts":"2026-08-28T12:52:07.029Z","run_id":"bots5-v0.1-live-conformance-canary-20260828T125203Z-7214f83a","event":"stage_succeeded","stage_id":"extractor"}
+{"ts":"2026-08-28T12:52:07.908Z","run_id":"bots5-v0.1-live-conformance-canary-20260828T125203Z-7214f83a","event":"stage_succeeded","stage_id":"analyst"}
+{"ts":"2026-08-28T12:52:10.521Z","run_id":"bots5-v0.1-live-conformance-canary-20260828T125203Z-7214f83a","event":"stage_succeeded","stage_id":"adversary"}
+{"ts":"2026-08-28T12:52:10.527Z","run_id":"bots5-v0.1-live-conformance-canary-20260828T125203Z-7214f83a","event":"stage_skipped","stage_id":"synthesis","meta":{"reason":"dependency_incomplete"}}
+{"ts":"2026-08-28T12:52:10.529Z","run_id":"bots5-v0.1-live-conformance-canary-20260828T125203Z-7214f83a","event":"synthesis_blocked","stage_id":"synthesis","meta":{"reason":"dependency_incomplete","incomplete_dependencies":["adversary"]}}
+{"ts":"2026-08-28T12:52:10.535Z","run_id":"bots5-v0.1-live-conformance-canary-20260828T125203Z-7214f83a","event":"run_failed"}

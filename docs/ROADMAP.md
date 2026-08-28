@@ -13,6 +13,14 @@
 - exact-known/unknown cost semantics;
 - zero-spend unit tests.
 
+## V0.1 status
+
+- worker-boundary hardening is implemented;
+- completion telemetry is implemented;
+- final live worker-boundary conformance is satisfied;
+- the next validation step is one genuinely useful low-stakes B.O.T.S. campaign before freezing
+  Operating Procedure v1.
+
 ## Likely next steps
 
 Only after V0 is reviewed:
