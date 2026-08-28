@@ -1,70 +1,75 @@
-# V0 Build Report
+# B.O.T.S. 5 V0 Candidate Build Report
 
 ## Result
 
-A complete local B.O.T.S. 5 V0 candidate was integrated from the supplied Build Brief and available
-specialist reports.
+A complete local V0 candidate was integrated from the supplied build brief and worker reports.
 
-This is a candidate implementation record, not a V0 approval, deployment record, or production
-claim.
+This is a candidate implementation only. No Git mutation, publication, deployment, persistent
+service creation, or real OpenRouter smoke run was performed.
 
 ## Source reconciliation
 
-The V0 Build Brief was treated as the primary implementation contract. Worker reports were used as
-specialist review material where consistent with it.
+The supplied V0 Build Brief was treated as the primary implementation contract. Worker reports were
+used as specialist review material where they were consistent with it.
 
-One supplied worker output, `Deepseek2.md`, was a continuity/authority-state report rather than the
-intended testing/failure specialist blueprint. The Build Brief and Luna implementation contract
-already contained a comprehensive mandatory test matrix, so the missing report did not require
-inventing new product scope.
+Notable resolutions:
 
-Key deterministic resolutions in the candidate:
+- `status` / `inspect`: deterministic default `./.bots5/runs`, plus explicit `--runs-dir` for jobs
+  configured elsewhere.
+- empty or whitespace-only model completion: stage failure (`empty_model_response`).
+- money: `Decimal` internally; exact known costs persisted as decimal strings; unknown stays null.
+- events: append-only JSONL with a process-local write lock and fsync.
+- artifacts: atomic temp-file + `os.replace` writes.
+- stage IDs: filename-safe grammar to prevent model/manifest IDs becoming traversal paths.
+- `runs_dir`: explicit job-relative or absolute path is allowed, but filesystem root is rejected;
+  writes are confined beneath the resolved configured runs directory. This remains an operator-run
+  trust model, not a hostile sandbox.
+- skipped synthesis has known zero cost because no provider request was launched.
 
-- `status` / `inspect`: default `./.bots5/runs` with explicit `--runs-dir` override.
-- Empty or whitespace-only model completion: stage failure (`empty_model_response`).
-- Money: `Decimal` internally; exact known cost persisted as decimal strings; unknown remains null.
-- Events: append-only JSONL with serialized writes and fsync.
-- Files: atomic temporary-file + `os.replace` writes.
-- Stage IDs: filename-safe grammar to prevent IDs becoming traversal paths.
-- `runs_dir`: job-relative or absolute operator-selected path is accepted, but filesystem root is
-  rejected and generated writes remain beneath the resolved configured directory. This is not a
-  hostile sandbox.
-- Skipped synthesis has known zero cost because no provider request was launched.
+One supplied file, `Deepseek2.md`, is a continuity/authority-state report rather than the expected
+testing specialist blueprint. The mandatory test matrix in the Build Brief and Luna implementation
+contract was sufficient to build the test suite.
 
-## Validation performed
+## Candidate contents
 
-The candidate was exercised locally without making a real provider request:
+- Python 3.12+ `src/` package
+- strict JSON manifest parser and closed-schema validation
+- OpenRouter non-streaming provider boundary
+- bounded asyncio worker execution
+- optional synthesis stage
+- per-stage and overall timeouts
+- independent stage persistence
+- events, run state, usage/cost, status, and inspect
+- example three-worker smoke job
+- required README, architecture/security/execution/etc. docs
+- four ADRs
+- unit tests with live-network blocking
+- standard-library-only `bootstrap_bots5.py`
 
-- `pytest`: **32 passed**.
-- `bots5 validate examples/example-job.json`: **passed** (`OK: bots5-smoke-example`).
-- `python -m compileall`: **passed**.
-- generated bootstrap syntax check: **passed**.
-- bootstrap reconstruction: **44/44 project files byte-identical** to the pre-bootstrap candidate.
-- package installation: **passed** in an isolated target under available Python **3.13.5** without
-  dependency download.
-- installed package import: **passed**, version `0.1.0`.
+Project file count: **44**
 
-The runtime environment did not contain Python 3.12, so 3.12-specific execution was not independently
-verified. The project metadata requires Python 3.12+ and the implementation deliberately avoids
-3.13-only syntax.
+## Validation actually performed
+
+- `pytest`: **32 passed**
+- example validation: `OK: bots5-smoke-example`
+- `python -m compileall`: passed
+- bootstrap syntax check: passed
+- bootstrap reconstruction: **44/44 files byte-identical**
+- package installation: succeeded under the available Python **3.13.5** environment using an
+  isolated target and no dependency download
+- imported installed package version: `0.1.0`
+
+A Python 3.12 interpreter was not available in the execution environment, so 3.12-specific runtime
+verification was not performed.
 
 ## Deliberately not performed
 
-- no real OpenRouter request;
-- no API spend;
-- no deployment;
-- no persistent service;
-- no Git mutation as part of runtime behavior;
-- no claim that V0 is accepted or production-ready.
+- no real OpenRouter request
+- no API spend
+- no Git init/commit/push/merge
+- no deployment
+- no V0 approval claim
 
-## Test boundary
+## Bootstrap SHA-256
 
-Ordinary unit tests use fake or `httpx.MockTransport` providers. `tests/conftest.py` removes
-`OPENROUTER_API_KEY` and blocks live socket connections. A real smoke call remains an explicit
-operator action after review.
-
-## Campaign context
-
-See `BUILD_CAMPAIGN.md` for the Langflow/OpenRouter fan-out experiment, timeout failures, worker
-checkpointing lessons, giant-integrator failure shape, and the method findings carried forward into
-B.O.T.S. 5.
+`50193994e1063039da08389b459784446c60c296f34b6d652a106e4ec90a2eaf`
