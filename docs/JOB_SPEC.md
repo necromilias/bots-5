@@ -41,7 +41,8 @@ regular file, and decode as UTF-8.
 - `run_timeout_seconds`: finite number > 0.
 - `stop_before_synthesis_if_known_cost_exceeds_usd`: finite non-negative number or `null`.
 
-The cost field is a pre-synthesis gate only. It is not a hard run budget.
+The cost field is a pre-synthesis gate only. It is not a hard run budget. The gate compares only the
+known worker-cost subtotal. Unknown or partial worker cost does not itself block synthesis.
 
 ## Worker
 
@@ -67,13 +68,20 @@ The synthesis object has the same common fields as a worker plus:
 - `depends_on`: non-empty list of unique worker IDs.
 
 Every dependency must name an existing worker. Synthesis runs only after the entire worker phase and
-only when every declared dependency succeeded.
+only when every declared dependency succeeded and completed normally.
+
+`depends_on` controls which worker outputs are supplied to synthesis and which workers gate synthesis.
+It does not remove any other declared worker from the final whole-run success condition: every
+declared worker must still succeed and complete normally for the overall run to succeed.
 
 ## Output
 
 `runs_dir` is a non-empty string. Relative values resolve against the job file's parent. The resolved
 path may not be filesystem root and, if it already exists, must be a directory. V0 may write only
 inside this resolved runs directory. V0 does not claim a hostile sandbox.
+
+This job-relative path rule differs from CLI `status --runs-dir` and `inspect --runs-dir`, where a
+relative path is interpreted from the operator's current working directory.
 
 ## Rendering
 
