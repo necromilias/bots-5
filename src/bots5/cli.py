@@ -55,7 +55,17 @@ def _print_result(result: RunResult) -> None:
     print(f"state: {result.state.value}")
     for stage in result.stages:
         cost = "?" if stage.known_cost_usd is None else str(stage.known_cost_usd)
-        print(f"{stage.id}: {stage.state.value} cost={cost}")
+        completion = (
+            "not_available"
+            if stage.completion_complete is None
+            else (
+                f"{'complete' if stage.completion_complete else 'incomplete'} "
+                f"finish_reason={stage.finish_reason!r}"
+            )
+        )
+        print(
+            f"{stage.id}: state={stage.state.value} completion={completion} cost={cost}"
+        )
 
 
 def _cmd_validate(path: Path) -> int:
@@ -102,7 +112,7 @@ def _cmd_status(run_id: str, runs_dir: Path | None) -> int:
         f"status={agg.get('cost_status')} "
         f"complete={agg.get('cost_complete')}"
     )
-    return 0
+    return 0 if run.get("state") == "succeeded" else 1
 
 
 def _cmd_inspect(run_id: str, stage_id: str, runs_dir: Path | None) -> int:
