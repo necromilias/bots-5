@@ -46,6 +46,10 @@ bots5 run examples/example-job.json
 
 The example writes beneath `examples/.bots5/runs/` because its `runs_dir` is job-relative.
 
+For normal paid-operation preflight, completion review, evidence retention, and human acceptance,
+see `docs/OPERATING_PROCEDURE_V1_CANDIDATE.md`. It is the current candidate baseline and is not yet
+frozen Operating Procedure v1.
+
 ## Inspect
 
 With the default run location (`./.bots5/runs`):
@@ -62,7 +66,9 @@ bots5 status RUN_ID --runs-dir PATH
 bots5 inspect RUN_ID STAGE_ID --runs-dir PATH
 ```
 
-Both commands are disk-only and make no API calls.
+A relative CLI `--runs-dir` is interpreted from the current working directory, unlike manifest
+`output.runs_dir`, which is resolved relative to the job file. Both inspection commands are disk-only
+and make no API calls.
 
 ## V0 constraints
 
@@ -74,8 +80,10 @@ Both commands are disk-only and make no API calls.
 - OpenRouter is the only provider;
 - non-streaming chat completions;
 - no retries;
-- exact provider-reported cost only; unknown stays unknown;
-- the cost threshold is only a pre-synthesis gate, not a hard whole-run budget;
+- exact provider-reported cost when supplied; a stage skipped before any request may carry a
+  harness-known zero because no provider cost was incurred;
+- the cost threshold is only a pre-synthesis gate over the known worker subtotal, not a hard
+  whole-run budget or fail-closed unknown-cost control;
 - local operator trust model, not a hostile sandbox;
 - no database, daemon, web UI, container requirement, RAG, OMC, model tools, or repo mutation.
 
@@ -92,5 +100,7 @@ then integrated and verified locally. See:
 - `docs/V0_1_LIVE_CONFORMANCE_REPORT.md` for the first live conformance canary and truncation
   finding;
 - `docs/V0_1_FINAL_CONFORMANCE_REPORT.md` for final completion-aware live conformance closure;
-- `docs/FIRST_USEFUL_CAMPAIGN_REPORT.md` for the first ordinary useful-work campaign, its failed
-  synthesis completion, human usefulness review, and observations awaiting adjudication.
+- `docs/FIRST_USEFUL_CAMPAIGN_REPORT.md` for the first ordinary useful-work campaign and the human
+  adjudication of its findings;
+- `docs/OPERATING_PROCEDURE_V1_CANDIDATE.md` for the candidate normal operating procedure that must
+  still be validated by the revised useful campaign and controlled failure-path campaign.
