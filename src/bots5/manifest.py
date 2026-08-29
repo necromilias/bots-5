@@ -16,7 +16,7 @@ from .models import (
     SynthesisSpec,
     WorkerSpec,
 )
-from .paths import resolve_job_relative, validate_runs_dir, validate_stage_id
+from .paths import resolve_job_relative, resolve_runs_dir, validate_stage_id
 from .prompts import parse_worker_contract
 
 
@@ -247,9 +247,7 @@ def validate_job(data: dict[str, Any], base_dir: Path) -> Job:
             )
 
     raw_output = _closed(data["output"], OUTPUT_KEYS, OUTPUT_KEYS, "output")
-    runs_dir = validate_runs_dir(
-        resolve_job_relative(_str(raw_output, "runs_dir", "output"), base_dir)
-    )
+    runs_dir = resolve_runs_dir(_str(raw_output, "runs_dir", "output"), base_dir)
 
     return Job(
         schema_version=1,
