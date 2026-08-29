@@ -91,4 +91,6 @@ then integrated and verified locally. See:
 - `docs/V0_1_HARDENING_REPORT.md` for deterministic V0.1 worker-boundary hardening;
 - `docs/V0_1_LIVE_CONFORMANCE_REPORT.md` for the first live conformance canary and truncation
   finding;
-- `docs/V0_1_FINAL_CONFORMANCE_REPORT.md` for final completion-aware live conformance closure.
+- `docs/V0_1_FINAL_CONFORMANCE_REPORT.md` for final completion-aware live conformance closure;
+- `docs/FIRST_USEFUL_CAMPAIGN_REPORT.md` for the first ordinary useful-work campaign, its failed
+  synthesis completion, human usefulness review, and observations awaiting adjudication.
