@@ -19,15 +19,33 @@ After validation and key acquisition:
 9. If a dependency succeeded without a normal completion, persist synthesis as skipped with
    `dependency_incomplete` and fail the run.
 10. Otherwise compare the exact known worker-cost subtotal with the configured synthesis gate. If the
-   known subtotal is greater than the threshold, skip synthesis and fail the run. Unknown cost is not
-   treated as zero.
+    known subtotal is greater than the threshold, skip synthesis and fail the run. Unknown or partial
+    worker cost does not itself block synthesis; the gate evaluates only the known subtotal and must
+    not be treated as a hard budget or a fail-closed unknown-cost control.
 11. Otherwise run synthesis with its own compiled system message and WORKER OUTPUT data blocks.
 12. Persist final usage and run state. `result.md` is written when synthesis returns usable output
     and its stage is persisted as succeeded, including an incomplete synthesis; run success still
     requires every worker and synthesis stage to have completed normally.
 
 A run without synthesis succeeds only if every worker is succeeded and completed normally. With
-synthesis, the run succeeds only if every worker and synthesis is succeeded and completed normally.
+synthesis, the run succeeds only if every declared worker and synthesis is succeeded and completed
+normally. `synthesis.depends_on` controls synthesis input and dependency gating; it does not remove
+other declared workers from the final whole-run success condition.
+
+## Operator preflight and review
+
+The candidate normal operating procedure is in `OPERATING_PROCEDURE_V1_CANDIDATE.md`. Until it is
+frozen, operators should at minimum:
+
+- validate before a paid run;
+- review output-token ceilings against the required contract output rather than treating them as
+  harmless targets;
+- calculate a conservative paid-run estimate from the highest applicable currently advertised
+  pricing surface available at preflight time;
+- treat provider-reported persisted cost as final accounting truth after the run;
+- require exact `finish_reason == "stop"` and complete status for every stage counted as normally
+  completed evidence;
+- preserve the authoritative run directory and record a separate human usefulness decision.
 
 ## Timeouts and cancellation
 
