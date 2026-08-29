@@ -66,7 +66,6 @@ def test_bool_not_accepted_as_integer(tmp_path):
         load_job(path)
 
 
-
 def test_unsupported_provider(tmp_path):
     path, job = make_job_tree(tmp_path)
     job["workers"][0]["provider"] = "mystery"
@@ -96,6 +95,19 @@ def test_unsafe_stage_id_rejected(tmp_path):
     job["workers"][0]["id"] = "../oops"
     path.write_text(json.dumps(job))
     with pytest.raises(ValidationError):
+        load_job(path)
+
+
+def test_configured_runs_dir_symlink_rejected_before_resolution(tmp_path):
+    path, job = make_job_tree(tmp_path)
+    target = tmp_path / "actual-runs"
+    target.mkdir()
+    link = tmp_path / "linked-runs"
+    link.symlink_to(target, target_is_directory=True)
+    job["output"]["runs_dir"] = "./linked-runs"
+    path.write_text(json.dumps(job))
+
+    with pytest.raises(ValidationError, match="must not be a symlink"):
         load_job(path)
 
 
