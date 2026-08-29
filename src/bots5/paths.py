@@ -30,6 +30,15 @@ def resolve_job_relative(raw: str, base_dir: Path) -> Path:
     return path.resolve(strict=False)
 
 
+def resolve_runs_dir(raw: str, base_dir: Path) -> Path:
+    path = Path(raw)
+    if not path.is_absolute():
+        path = base_dir / path
+    if path.is_symlink():
+        raise ValidationError(f"output.runs_dir must not be a symlink: {path}")
+    return validate_runs_dir(path)
+
+
 def validate_runs_dir(path: Path) -> Path:
     resolved = path.resolve(strict=False)
     anchor = Path(resolved.anchor)
