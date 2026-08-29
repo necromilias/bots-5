@@ -10,8 +10,7 @@ workers plus synthesis. It also exercised the ordinary human-operated validate -
 inspect workflow rather than another conformance-specific canary.
 
 This document is a human review of the observed campaign. Worker and synthesis findings remain
-evidence until separately adjudicated; this report does not convert model output into project
-policy or implementation authority.
+evidence until separately adjudicated; model output does not become project policy automatically.
 
 ## Tested identity
 
@@ -28,13 +27,12 @@ and 9/9 campaign asset hashes at the tested revision.
 
 **FAIL - HIGH SUBSTANTIVE VALUE**
 
-The campaign is mechanically failed because the required synthesis stage did not complete
-normally.
+The campaign is mechanically failed because the required synthesis stage did not complete normally.
 
-All three root workers completed with exact provider `finish_reason: stop`. Synthesis returned
-usable output but terminated with `finish_reason: length` at 4,996 completion tokens against its
-5,000-token ceiling. Persisted synthesis completion was therefore incomplete and the overall run
-correctly became `failed`.
+All three root workers completed with exact provider `finish_reason: stop`. Synthesis returned usable
+output but terminated with `finish_reason: length` at 4,996 completion tokens against its 5,000-token
+ceiling. Persisted synthesis completion was therefore incomplete and the overall run correctly became
+`failed`.
 
 This is the intended V0.1 distinction between provider execution success and semantic completion.
 The useful-work run therefore provided live evidence that the final completion-semantics fix at
@@ -57,16 +55,16 @@ Aggregate cost status was known and complete.
 
 The campaign was worth the provider cost despite failing its declared completion gate.
 
-The three complete root workers produced evidence-backed repository and operator findings rather
-than generic redesign suggestions. The adversary also rejected several plausible false positives,
-which materially improved the audit signal.
+The three complete root workers produced evidence-backed repository and operator findings rather than
+generic redesign suggestions. The adversary also rejected several plausible false positives, which
+materially improved the audit signal.
 
 The visible synthesis output successfully deduplicated and ranked much of the worker material, but
-attempted to retain too much detail for its configured ceiling. Its truncation is therefore treated
-as a campaign-design failure, not a B.O.T.S. infrastructure failure.
+attempted to retain too much detail for its configured ceiling. Its truncation is therefore treated as
+a campaign-design failure, not a B.O.T.S. infrastructure failure.
 
-The normal operator workflow was also understandable without another orchestrator. `bots5 status`
-and `bots5 inspect` exposed the exact failure cause directly:
+The normal operator workflow was understandable without another orchestrator. `bots5 status` and
+`bots5 inspect` exposed the exact failure cause directly:
 
 ```text
 synthesis: state=succeeded completion=incomplete finish_reason='length'
@@ -75,34 +73,44 @@ run: state=failed
 
 No conformance-era forensic reconstruction was required to determine what happened.
 
-## Observations requiring adjudication
+## Adjudication of campaign observations
 
-The following are observations from the completed worker outputs and partial synthesis. They are not
-accepted fixes or policy.
+The campaign observations were subsequently checked against current implementation and normative
+documentation. The accepted disposition is:
 
-1. **Unknown or partial worker cost at the synthesis gate.** The current gate compares the known
-   worker subtotal; unknown components do not themselves block synthesis. The intended operator
-   policy requires explicit adjudication.
-2. **Paid-run pricing preflight.** The prior OpenRouter pricing-surface discrepancy still leaves a
-   procedure gap for conservative preflight estimates.
-3. **Token ceilings and completion review.** Normal operation should make ceiling adequacy and exact
-   `finish_reason == "stop"` review explicit. This campaign demonstrated the consequence directly.
-4. **`result.md` semantics.** Usable incomplete synthesis output may exist while the overall run is
-   failed. File existence alone therefore cannot mean accepted final result.
-5. **Skipped-stage zero-cost provenance.** A skipped provider stage incurs zero provider cost, but
-   current metadata does not distinguish synthetic skip-zero from provider-reported zero. Whether
-   that distinction is worth implementing remains open.
-6. **Synthesis dependencies versus whole-run success.** `depends_on` controls synthesis input and
-   gating, while all declared workers still participate in final run success. Operator wording can
-   make that distinction clearer.
-7. **Relative run-directory semantics.** Manifest-relative `output.runs_dir` and CLI-relative
-   `--runs-dir` use different reference points and can surprise an operator changing directories.
-8. **Routine evidence retention.** Ordinary useful runs need a smaller explicit retention procedure
-   rather than repeating conformance-era evidence ceremony.
-9. **Human usefulness acceptance.** Technical run state and substantive human acceptance should be
-   explicit separate checkpoints in Operating Procedure v1.
-10. **Extreme manifest numeric values.** A worker identified a plausible low-risk overflow path in
-    numeric validation. This can wait pending direct verification.
+1. **Unknown or partial worker cost at the synthesis gate:** documentation/procedure gap, not an
+   implementation defect. The gate intentionally compares only the known worker subtotal. Unknown or
+   partial worker cost does not itself block synthesis. Documentation must state this explicitly.
+2. **Paid-run pricing preflight:** accepted procedure gap. Operating procedure should record the
+   highest applicable currently advertised pricing used for conservative planning, while persisted
+   provider-reported cost remains final accounting truth after execution.
+3. **Token ceilings and completion review:** accepted procedure gap. Output ceilings must be chosen
+   deliberately and exact `finish_reason == "stop"` checked after execution.
+4. **`result.md` semantics:** accepted documentation defect. `result.md` may exist for usable but
+   incomplete synthesis output while the overall run is failed; file presence alone does not prove
+   normal completion or acceptance.
+5. **Skipped-stage zero-cost provenance:** accepted narrow documentation issue, not a schema change.
+   A skipped stage can have harness-known zero cost because no provider request was sent; this must be
+   distinguished in wording from provider-reported cost.
+6. **Synthesis dependencies versus whole-run success:** accepted documentation clarity issue.
+   `depends_on` controls synthesis input and gating, while every declared worker still participates in
+   whole-run success.
+7. **Relative run-directory semantics:** accepted operator-documentation gap. Manifest `runs_dir` is
+   job-relative; CLI `--runs-dir` is CWD-relative.
+8. **Routine evidence retention:** accepted procedure gap. Ordinary campaigns should preserve the
+   reviewed campaign assets, pinned revision, campaign-defined checksum verification, authoritative run
+   tree, usage/cost, and human review without automatically repeating conformance-era ceremony.
+9. **Human usefulness acceptance:** accepted procedure gap. Mechanical run state and substantive human
+   acceptance are separate checkpoints.
+10. **Extreme manifest numeric values:** accepted as a plausible real implementation defect but
+    explicitly deferred because its operational consequence is low and it does not block the revised
+    useful campaign or Operating Procedure work.
+
+No implementation change is required before the revised useful campaign as a result of findings 1-9.
+Finding 10 remains deferred implementation work.
+
+The accepted procedure corrections are captured in
+`OPERATING_PROCEDURE_V1_CANDIDATE.md` and supporting normative documentation.
 
 ## Campaign-design finding
 
@@ -112,22 +120,24 @@ The immediate correction is to tighten the synthesis contract so it must priorit
 more aggressively. Increasing the synthesis token ceiling should not be the first response when the
 existing output already contained enough information but attempted to write too much of it.
 
+The first-useful campaign package used for the observed run is not currently tracked in this repository,
+so its synthesis contract is not modified by this adjudication patch. It must be refreshed in the
+reviewed campaign package before the next paid execution.
+
 ## Evidence ownership
 
 The authoritative raw execution evidence is the persisted B.O.T.S. run tree for:
 
 `bots5-first-useful-repository-audit-20260829T202248Z-1325dcb1`
 
-This report is the durable human interpretation of that run. It intentionally does not duplicate
-the complete raw stage outputs or claim a separate byte-for-byte forensic package.
+This report is the durable human interpretation of that run. It intentionally does not duplicate the
+complete raw stage outputs or claim a separate byte-for-byte forensic package.
 
 ## Next action
 
-1. preserve this run and report;
-2. adjudicate the observations individually;
-3. convert only accepted observations into implementation, documentation, or procedure changes;
-4. tighten the synthesis contract;
-5. execute one revised useful campaign;
-6. decide whether Operating Procedure v1 is ready to freeze only after that campaign.
-
-No implementation change is justified solely because this synthesis reached its output ceiling.
+1. use `OPERATING_PROCEDURE_V1_CANDIDATE.md` as the candidate normal operating baseline;
+2. tighten the external first-useful campaign synthesis contract;
+3. execute one revised useful campaign once;
+4. inspect both mechanical completion and substantive usefulness;
+5. run the planned controlled failure-path campaign;
+6. freeze Operating Procedure v1 only if those campaigns expose no blocking procedure or harness defect.
