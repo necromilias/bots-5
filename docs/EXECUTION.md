@@ -22,10 +22,12 @@ After validation and key acquisition:
    known subtotal is greater than the threshold, skip synthesis and fail the run. Unknown cost is not
    treated as zero.
 11. Otherwise run synthesis with its own compiled system message and WORKER OUTPUT data blocks.
-12. Persist final usage and run state. `result.md` exists only when synthesis succeeds.
+12. Persist final usage and run state. `result.md` is written when synthesis returns usable output
+    and its stage is persisted as succeeded, including an incomplete synthesis; run success still
+    requires every worker and synthesis stage to have completed normally.
 
-A run without synthesis succeeds only if every worker succeeded. With synthesis, the run succeeds
-only if every worker and synthesis succeeded.
+A run without synthesis succeeds only if every worker is succeeded and completed normally. With
+synthesis, the run succeeds only if every worker and synthesis is succeeded and completed normally.
 
 ## Timeouts and cancellation
 

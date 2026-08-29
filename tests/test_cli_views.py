@@ -35,7 +35,7 @@ def test_status_and_inspect_from_disk_only(tmp_path, capsys):
 
     assert main(["status", "disk-run", "--runs-dir", str(job.output.runs_dir)]) == 0
     status_text = capsys.readouterr().out
-    assert "state: succeeded" in status_text
+    assert "state: failed" in status_text
     assert "w1:" in status_text
     assert "completion=incomplete finish_reason='length'" in status_text
 

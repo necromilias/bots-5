@@ -8,7 +8,7 @@ import pytest
 
 from bots5.errors import FileValidationError, ProviderError
 from bots5.manifest import load_job, validate_referenced_files
-from bots5.models import StageState
+from bots5.models import RunState, StageState
 from bots5.providers.base import CompletionResult
 from bots5.runner import run_job
 from bots5.storage import load_run_view, load_stage_view
@@ -56,6 +56,8 @@ def test_completion_semantics_are_conservative_and_persisted(
     provider = FakeProvider(finish_reasons={"model-w1": finish_reason})
     result = _run(tmp_path, provider, workers=1, synthesis=False)
 
+    assert result.state == (RunState.SUCCEEDED if complete else RunState.FAILED)
+    assert result.exit_code == (0 if complete else 1)
     stage = json.loads((result.run_dir / "stages" / "w1.json").read_text())
     assert stage["state"] == "succeeded"
     assert stage["completion"] == {
@@ -63,6 +65,40 @@ def test_completion_semantics_are_conservative_and_persisted(
         "complete": complete,
     }
     assert (result.run_dir / "stages" / "w1.md").read_text() == "output:model-w1"
+
+
+def test_incomplete_synthesis_fails_run_but_retains_output(tmp_path):
+    provider = FakeProvider(finish_reasons={"model-synth": "length"})
+
+    result = _run(tmp_path, provider)
+
+    assert result.state == RunState.FAILED
+    assert result.exit_code == 1
+    synthesis = next(stage for stage in result.stages if stage.id == "synth")
+    assert synthesis.state == StageState.SUCCEEDED
+    assert synthesis.finish_reason == "length"
+    assert synthesis.completion_complete is False
+    assert (result.run_dir / "stages" / "synth.md").read_text() == "output:model-synth"
+    assert (result.run_dir / "result.md").read_text() == "output:model-synth"
+    assert len(provider.calls) == 3
+    assert [call.model for call in provider.calls].count("model-synth") == 1
+
+
+@pytest.mark.parametrize("finish_reason", [None, "future_reason"])
+def test_missing_or_unknown_synthesis_completion_fails_run(tmp_path, finish_reason):
+    provider = FakeProvider(finish_reasons={"model-synth": finish_reason})
+
+    result = _run(tmp_path, provider)
+
+    assert result.state == RunState.FAILED
+    assert result.exit_code == 1
+    synthesis = next(stage for stage in result.stages if stage.id == "synth")
+    assert synthesis.state == StageState.SUCCEEDED
+    assert synthesis.finish_reason == finish_reason
+    assert synthesis.completion_complete is False
+    assert (result.run_dir / "result.md").read_text() == "output:model-synth"
+    assert len(provider.calls) == 3
+    assert [call.model for call in provider.calls].count("model-synth") == 1
 
 
 def test_completion_metadata_survives_disk_reconstruction(tmp_path):

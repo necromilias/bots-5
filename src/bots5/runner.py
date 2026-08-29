@@ -50,6 +50,13 @@ def _apply_result(record: StageRecord, result: CompletionResult) -> None:
     record.duration_seconds = result.duration_seconds
 
 
+def _stage_completed_successfully(record: StageRecord) -> bool:
+    return (
+        record.state == StageState.SUCCEEDED
+        and record.completion_complete is True
+    )
+
+
 async def _execute_stage(
     *,
     spec: WorkerSpec | SynthesisSpec,
@@ -227,7 +234,10 @@ async def run_job(job: Job, provider: Provider, *, run_id: str | None = None) ->
         if job.synthesis is None:
             return (
                 RunState.SUCCEEDED
-                if all(record_by_id[w.id].state == StageState.SUCCEEDED for w in job.workers)
+                if all(
+                    _stage_completed_successfully(record_by_id[w.id])
+                    for w in job.workers
+                )
                 else RunState.FAILED
             )
 
@@ -311,11 +321,12 @@ async def run_job(job: Job, provider: Provider, *, run_id: str | None = None) ->
             persist_result(dirs, synthesis_output)
 
         all_workers_ok = all(
-            record_by_id[w.id].state == StageState.SUCCEEDED for w in job.workers
+            _stage_completed_successfully(record_by_id[w.id])
+            for w in job.workers
         )
         return (
             RunState.SUCCEEDED
-            if all_workers_ok and synth_record.state == StageState.SUCCEEDED
+            if all_workers_ok and _stage_completed_successfully(synth_record)
             else RunState.FAILED
         )
 
