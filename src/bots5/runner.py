@@ -57,6 +57,52 @@ def _stage_completed_successfully(record: StageRecord) -> bool:
     )
 
 
+def _best_effort_internal_failure(
+    *,
+    dirs: RunDirs,
+    events: EventWriter,
+    run_id: str,
+    started_at: str,
+    records: list[StageRecord],
+    run_timeout_seconds: float,
+    exc: BaseException,
+    synthesis_skipped_reason: str | None,
+) -> None:
+    message = _failure_message(exc)
+    for record in records:
+        if record.state in (StageState.QUEUED, StageState.RUNNING):
+            record.state = StageState.FAILED
+            record.error_type = "internal_error"
+            record.error_message = message
+            record.ended_at = now_iso()
+            try:
+                persist_stage(dirs, record)
+            except StorageError:
+                pass
+    try:
+        events.write("run_failed", error_type="internal_error", message=message)
+    except (OSError, StorageError):
+        pass
+    ended_at = now_iso()
+    try:
+        persist_usage(dirs, records)
+    except StorageError:
+        pass
+    try:
+        persist_run(
+            dirs,
+            run_id=run_id,
+            state=RunState.FAILED,
+            started_at=started_at,
+            ended_at=ended_at,
+            stages=records,
+            run_timeout_seconds=run_timeout_seconds,
+            synthesis_skipped_reason=synthesis_skipped_reason,
+        )
+    except StorageError:
+        pass
+
+
 async def _execute_stage(
     *,
     spec: WorkerSpec | SynthesisSpec,
@@ -176,6 +222,9 @@ async def run_job(job: Job, provider: Provider, *, run_id: str | None = None) ->
         spec.id: compile_worker_system_message(_read_utf8(spec.system_prompt_path))
         for spec in specs
     }
+    input_texts = [(item.label, _read_utf8(item.path)) for item in job.inputs]
+    worker_user = render_worker_user_message(input_texts)
+
     run_id = run_id or new_run_id(job.name)
     dirs = create_run_tree(job.output.runs_dir, run_id)
     events = EventWriter(dirs.events, run_id)
@@ -200,8 +249,6 @@ async def run_job(job: Job, provider: Provider, *, run_id: str | None = None) ->
         persist_stage(dirs, record)
         events.write("stage_queued", record.id)
 
-    input_texts = [(item.label, _read_utf8(item.path)) for item in job.inputs]
-    worker_user = render_worker_user_message(input_texts)
     semaphore = asyncio.Semaphore(job.execution.max_parallelism)
     outputs: dict[str, str] = {}
     worker_tasks: list[asyncio.Task[str | None]] = []
@@ -372,6 +419,25 @@ async def run_job(job: Job, provider: Provider, *, run_id: str | None = None) ->
 
         final_state = RunState.TIMED_OUT
         events.write("run_timed_out")
+    except Exception as exc:
+        for task in worker_tasks:
+            if not task.done():
+                task.cancel()
+        if worker_tasks:
+            await asyncio.gather(*worker_tasks, return_exceptions=True)
+        _best_effort_internal_failure(
+            dirs=dirs,
+            events=events,
+            run_id=run_id,
+            started_at=started_at,
+            records=records,
+            run_timeout_seconds=job.execution.run_timeout_seconds,
+            exc=exc,
+            synthesis_skipped_reason=synthesis_skipped_reason,
+        )
+        if isinstance(exc, Bots5Error):
+            raise
+        raise Bots5Error(f"run failed with internal error: {_failure_message(exc)}") from exc
 
     ended_at = now_iso()
     persist_usage(dirs, records)
