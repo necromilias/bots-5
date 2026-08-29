@@ -6,7 +6,7 @@ import json
 import pytest
 
 from bots5.errors import Bots5Error
-from bots5.manifest import load_job
+from bots5.manifest import load_job, validate_referenced_files
 from bots5.runner import run_job
 
 from .helpers import FakeProvider, make_job_tree
@@ -36,7 +36,10 @@ def test_input_reread_failure_does_not_create_running_run_tree(tmp_path, monkeyp
     path, _ = make_job_tree(tmp_path, workers=1, synthesis=False)
     job = load_job(path)
     provider = FakeProvider()
+    validate_referenced_files(job)
     original_read_bytes = type(job.inputs[0].path).read_bytes
+
+    monkeypatch.setattr("bots5.runner.validate_referenced_files", lambda _job: None)
 
     def fail_input_read(path_obj):
         if path_obj == job.inputs[0].path:
