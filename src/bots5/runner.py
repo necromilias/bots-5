@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
-from typing import Iterable
 
 from .errors import Bots5Error, ProviderError, StorageError
 from .events import EventWriter, now_iso
@@ -51,10 +49,7 @@ def _apply_result(record: StageRecord, result: CompletionResult) -> None:
 
 
 def _stage_completed_successfully(record: StageRecord) -> bool:
-    return (
-        record.state == StageState.SUCCEEDED
-        and record.completion_complete is True
-    )
+    return record.state == StageState.SUCCEEDED and record.completion_complete is True
 
 
 def _best_effort_internal_failure(
@@ -81,9 +76,8 @@ def _best_effort_internal_failure(
                 pass
     try:
         events.write("run_failed", error_type="internal_error", message=message)
-    except (OSError, StorageError):
+    except StorageError:
         pass
-    ended_at = now_iso()
     try:
         persist_usage(dirs, records)
     except StorageError:
@@ -94,13 +88,39 @@ def _best_effort_internal_failure(
             run_id=run_id,
             state=RunState.FAILED,
             started_at=started_at,
-            ended_at=ended_at,
+            ended_at=now_iso(),
             stages=records,
             run_timeout_seconds=run_timeout_seconds,
             synthesis_skipped_reason=synthesis_skipped_reason,
         )
     except StorageError:
         pass
+
+
+def _raise_after_best_effort_failure(
+    *,
+    dirs: RunDirs,
+    events: EventWriter,
+    run_id: str,
+    started_at: str,
+    records: list[StageRecord],
+    run_timeout_seconds: float,
+    exc: BaseException,
+    synthesis_skipped_reason: str | None,
+) -> None:
+    _best_effort_internal_failure(
+        dirs=dirs,
+        events=events,
+        run_id=run_id,
+        started_at=started_at,
+        records=records,
+        run_timeout_seconds=run_timeout_seconds,
+        exc=exc,
+        synthesis_skipped_reason=synthesis_skipped_reason,
+    )
+    if isinstance(exc, Bots5Error):
+        raise exc
+    raise Bots5Error(f"run failed with internal error: {_failure_message(exc)}") from exc
 
 
 async def _execute_stage(
@@ -132,10 +152,7 @@ async def _execute_stage(
             )
             events.write("request_sent", record.id, model=spec.model)
             try:
-                result = await asyncio.wait_for(
-                    provider.complete(request),
-                    timeout=spec.timeout_seconds,
-                )
+                result = await asyncio.wait_for(provider.complete(request), timeout=spec.timeout_seconds)
             except TimeoutError:
                 record.state = StageState.FAILED
                 record.error_type = "request_timeout"
@@ -198,10 +215,7 @@ async def _execute_stage(
 
 
 def _all_stage_records(job: Job) -> list[StageRecord]:
-    records = [
-        StageRecord(id=w.id, provider=w.provider, requested_model=w.model)
-        for w in job.workers
-    ]
+    records = [StageRecord(id=w.id, provider=w.provider, requested_model=w.model) for w in job.workers]
     if job.synthesis is not None:
         records.append(
             StageRecord(
@@ -219,8 +233,7 @@ async def run_job(job: Job, provider: Provider, *, run_id: str | None = None) ->
     if job.synthesis is not None:
         specs += (job.synthesis,)
     system_messages = {
-        spec.id: compile_worker_system_message(_read_utf8(spec.system_prompt_path))
-        for spec in specs
+        spec.id: compile_worker_system_message(_read_utf8(spec.system_prompt_path)) for spec in specs
     }
     input_texts = [(item.label, _read_utf8(item.path)) for item in job.inputs]
     worker_user = render_worker_user_message(input_texts)
@@ -233,21 +246,33 @@ async def run_job(job: Job, provider: Provider, *, run_id: str | None = None) ->
     record_by_id = {record.id: record for record in records}
     synthesis_skipped_reason: str | None = None
 
-    persist_resolved_job(dirs, job)
-    persist_usage(dirs, records)
-    persist_run(
-        dirs,
-        run_id=run_id,
-        state=RunState.RUNNING,
-        started_at=started_at,
-        ended_at=None,
-        stages=records,
-        run_timeout_seconds=job.execution.run_timeout_seconds,
-    )
-    events.write("run_started")
-    for record in records:
-        persist_stage(dirs, record)
-        events.write("stage_queued", record.id)
+    try:
+        persist_resolved_job(dirs, job)
+        persist_usage(dirs, records)
+        persist_run(
+            dirs,
+            run_id=run_id,
+            state=RunState.RUNNING,
+            started_at=started_at,
+            ended_at=None,
+            stages=records,
+            run_timeout_seconds=job.execution.run_timeout_seconds,
+        )
+        events.write("run_started")
+        for record in records:
+            persist_stage(dirs, record)
+            events.write("stage_queued", record.id)
+    except Exception as exc:
+        _raise_after_best_effort_failure(
+            dirs=dirs,
+            events=events,
+            run_id=run_id,
+            started_at=started_at,
+            records=records,
+            run_timeout_seconds=job.execution.run_timeout_seconds,
+            exc=exc,
+            synthesis_skipped_reason=synthesis_skipped_reason,
+        )
 
     semaphore = asyncio.Semaphore(job.execution.max_parallelism)
     outputs: dict[str, str] = {}
@@ -281,18 +306,14 @@ async def run_job(job: Job, provider: Provider, *, run_id: str | None = None) ->
         if job.synthesis is None:
             return (
                 RunState.SUCCEEDED
-                if all(
-                    _stage_completed_successfully(record_by_id[w.id])
-                    for w in job.workers
-                )
+                if all(_stage_completed_successfully(record_by_id[w.id]) for w in job.workers)
                 else RunState.FAILED
             )
 
         synth = job.synthesis
         synth_record = record_by_id[synth.id]
         failed_deps = [
-            dep for dep in synth.depends_on
-            if record_by_id[dep].state != StageState.SUCCEEDED
+            dep for dep in synth.depends_on if record_by_id[dep].state != StageState.SUCCEEDED
         ]
         if failed_deps:
             synthesis_skipped_reason = "dependency_failed"
@@ -311,8 +332,7 @@ async def run_job(job: Job, provider: Provider, *, run_id: str | None = None) ->
             return RunState.FAILED
 
         incomplete_deps = [
-            dep for dep in synth.depends_on
-            if record_by_id[dep].completion_complete is not True
+            dep for dep in synth.depends_on if record_by_id[dep].completion_complete is not True
         ]
         if incomplete_deps:
             synthesis_skipped_reason = "dependency_incomplete"
@@ -368,8 +388,7 @@ async def run_job(job: Job, provider: Provider, *, run_id: str | None = None) ->
             persist_result(dirs, synthesis_output)
 
         all_workers_ok = all(
-            _stage_completed_successfully(record_by_id[w.id])
-            for w in job.workers
+            _stage_completed_successfully(record_by_id[w.id]) for w in job.workers
         )
         return (
             RunState.SUCCEEDED
@@ -378,10 +397,7 @@ async def run_job(job: Job, provider: Provider, *, run_id: str | None = None) ->
         )
 
     try:
-        final_state = await asyncio.wait_for(
-            pipeline(),
-            timeout=job.execution.run_timeout_seconds,
-        )
+        final_state = await asyncio.wait_for(pipeline(), timeout=job.execution.run_timeout_seconds)
     except TimeoutError:
         for task in worker_tasks:
             if not task.done():
@@ -425,7 +441,7 @@ async def run_job(job: Job, provider: Provider, *, run_id: str | None = None) ->
                 task.cancel()
         if worker_tasks:
             await asyncio.gather(*worker_tasks, return_exceptions=True)
-        _best_effort_internal_failure(
+        _raise_after_best_effort_failure(
             dirs=dirs,
             events=events,
             run_id=run_id,
@@ -435,9 +451,6 @@ async def run_job(job: Job, provider: Provider, *, run_id: str | None = None) ->
             exc=exc,
             synthesis_skipped_reason=synthesis_skipped_reason,
         )
-        if isinstance(exc, Bots5Error):
-            raise
-        raise Bots5Error(f"run failed with internal error: {_failure_message(exc)}") from exc
 
     ended_at = now_iso()
     persist_usage(dirs, records)
