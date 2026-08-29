@@ -387,9 +387,7 @@ async def run_job(job: Job, provider: Provider, *, run_id: str | None = None) ->
         if synthesis_output is not None and synth_record.state == StageState.SUCCEEDED:
             persist_result(dirs, synthesis_output)
 
-        all_workers_ok = all(
-            _stage_completed_successfully(record_by_id[w.id]) for w in job.workers
-        )
+        all_workers_ok = all(_stage_completed_successfully(record_by_id[w.id]) for w in job.workers)
         return (
             RunState.SUCCEEDED
             if all_workers_ok and _stage_completed_successfully(synth_record)
@@ -452,22 +450,34 @@ async def run_job(job: Job, provider: Provider, *, run_id: str | None = None) ->
             synthesis_skipped_reason=synthesis_skipped_reason,
         )
 
-    ended_at = now_iso()
-    persist_usage(dirs, records)
-    if final_state == RunState.SUCCEEDED:
-        events.write("run_succeeded")
-    elif final_state == RunState.FAILED:
-        events.write("run_failed")
-    persist_run(
-        dirs,
-        run_id=run_id,
-        state=final_state,
-        started_at=started_at,
-        ended_at=ended_at,
-        stages=records,
-        run_timeout_seconds=job.execution.run_timeout_seconds,
-        synthesis_skipped_reason=synthesis_skipped_reason,
-    )
+    try:
+        ended_at = now_iso()
+        persist_usage(dirs, records)
+        if final_state == RunState.SUCCEEDED:
+            events.write("run_succeeded")
+        elif final_state == RunState.FAILED:
+            events.write("run_failed")
+        persist_run(
+            dirs,
+            run_id=run_id,
+            state=final_state,
+            started_at=started_at,
+            ended_at=ended_at,
+            stages=records,
+            run_timeout_seconds=job.execution.run_timeout_seconds,
+            synthesis_skipped_reason=synthesis_skipped_reason,
+        )
+    except Exception as exc:
+        _raise_after_best_effort_failure(
+            dirs=dirs,
+            events=events,
+            run_id=run_id,
+            started_at=started_at,
+            records=records,
+            run_timeout_seconds=job.execution.run_timeout_seconds,
+            exc=exc,
+            synthesis_skipped_reason=synthesis_skipped_reason,
+        )
 
     return RunResult(
         run_id=run_id,
