@@ -27,13 +27,27 @@ def test_missing_api_key_makes_no_run_dir(tmp_path, capsys):
     assert not (tmp_path / ".bots5" / "runs").exists()
 
 
+def test_run_summary_exposes_incomplete_completion(tmp_path, capsys, monkeypatch):
+    path, _ = make_job_tree(tmp_path, workers=1, synthesis=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "bots5.cli.OpenRouterProvider",
+        lambda api_key: FakeProvider(finish_reasons={"model-w1": "length"}),
+    )
+
+    assert main(["run", str(path)]) == 1
+    text = capsys.readouterr().out
+    assert "state: failed" in text
+    assert "w1: state=succeeded completion=incomplete finish_reason='length'" in text
+
+
 def test_status_and_inspect_from_disk_only(tmp_path, capsys):
     path, _ = make_job_tree(tmp_path, workers=1, synthesis=False)
     job = load_job(path)
     provider = FakeProvider(finish_reasons={"model-w1": "length"})
     result = asyncio.run(run_job(job, provider, run_id="disk-run"))
 
-    assert main(["status", "disk-run", "--runs-dir", str(job.output.runs_dir)]) == 0
+    assert main(["status", "disk-run", "--runs-dir", str(job.output.runs_dir)]) == 1
     status_text = capsys.readouterr().out
     assert "state: failed" in status_text
     assert "w1:" in status_text
