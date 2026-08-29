@@ -65,4 +65,10 @@ working directory, unlike manifest `output.runs_dir`, which is resolved relative
 Use an absolute `--runs-dir` when changing directories between execution and inspection.
 
 These commands read disk only and make no provider calls. Both views display the persisted
-completion state and finish reason.
+completion state and finish reason. `bots5 status` exits zero only when the persisted run state is
+`succeeded`; persisted `failed` or `timed_out` runs produce a nonzero status exit. `bots5 inspect`
+continues to report whether the requested persisted stage artifact was read successfully.
+
+The immediate `bots5 run` summary also displays each stage's completion state and exact finish reason,
+so a provider response persisted as stage state `succeeded` but completion `incomplete` is visible
+without requiring a separate status command.
