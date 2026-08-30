@@ -110,7 +110,10 @@ def _number(obj: dict[str, Any], key: str, ctx: str, minimum: float | None = Non
     value = obj[key]
     if type(value) not in (int, float) or isinstance(value, bool):
         raise ValidationError(f"{ctx}.{key}: expected number")
-    value = float(value)
+    try:
+        value = float(value)
+    except OverflowError:
+        raise ValidationError(f"{ctx}.{key}: expected finite number") from None
     if not math.isfinite(value):
         raise ValidationError(f"{ctx}.{key}: expected finite number")
     if minimum is not None and value < minimum:
