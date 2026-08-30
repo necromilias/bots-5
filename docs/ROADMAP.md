@@ -20,16 +20,16 @@
 - final live worker-boundary conformance is satisfied;
 - the first genuinely useful low-stakes repository-audit campaign is recorded in
   `docs/FIRST_USEFUL_CAMPAIGN_REPORT.md`;
-- that campaign is classified `FAIL - HIGH SUBSTANTIVE VALUE`: all root workers completed normally,
-  but required synthesis terminated `length`/incomplete at its 5,000-token ceiling;
-- its findings have now been human-adjudicated: accepted pre-OPv1 work is documentation/procedure
-  clarification, with the extreme-number validator edge case deferred;
-- `docs/OPERATING_PROCEDURE_V1_CANDIDATE.md` is the candidate normal operating baseline, not yet
-  frozen OPv1;
-- the next execution step is to tighten the external first-useful campaign synthesis contract and run
-  one revised useful campaign once;
-- after a useful normal-completion run, execute the planned controlled failure-path campaign before
-  deciding whether to freeze Operating Procedure v1.
+- the revised useful campaign completed normally and was judged substantively useful;
+- its accepted findings were adjudicated and the blocking CLI, terminal-persistence, and runs-dir
+  symlink defects were corrected and locally validated;
+- the controlled failure-path campaign is preserved under `examples/opv1-controlled-failure/` and
+  exercised terminal provider-response failure, dependency blocking, skipped-stage zero-cost
+  accounting, partial aggregate cost, and durable inspection without exposing a blocking defect;
+- the exact `dependency_incomplete` semantics are additionally covered by deterministic tests and
+  prior real truncation evidence;
+- `docs/OPERATING_PROCEDURE_V1.md` is the frozen normal operating procedure;
+- the OPv1 freeze decision and evidence are recorded in `docs/OPV1_FREEZE_REPORT.md`.
 
 ## Likely next steps
 
