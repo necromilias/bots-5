@@ -28,6 +28,8 @@
   accounting, partial aggregate cost, and durable inspection without exposing a blocking defect;
 - the exact `dependency_incomplete` semantics are additionally covered by deterministic tests and
   prior real truncation evidence;
+- extremely large JSON numeric values now fail cleanly through manifest validation instead of
+  escaping through `float()` overflow;
 - `docs/OPERATING_PROCEDURE_V1.md` is the frozen normal operating procedure;
 - the OPv1 freeze decision and evidence are recorded in `docs/OPV1_FREEZE_REPORT.md`.
 
@@ -40,11 +42,6 @@ Only after V0 is reviewed:
 - richer but still explicit DAG semantics;
 - more deliberate retry policy where idempotence is understood;
 - stronger filesystem/tool capability model.
-
-## Deferred defect
-
-- extremely large JSON integers can escape `_number()` through `float()` overflow instead of a clean
-  validation error; low operational consequence, deferred until after the OPv1 campaign sequence.
 
 ## Speculative
 
