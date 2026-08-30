@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "name": "bots5-opv1-controlled-failure",
+  "inputs": [
+    {
+      "label": "source",
+      "path": "./input/source.txt"
+    }
+  ],
+  "execution": {
+    "max_parallelism": 1,
+    "run_timeout_seconds": 300,
+    "stop_before_synthesis_if_known_cost_exceeds_usd": 1.0
+  },
+  "workers": [
+    {
+      "id": "bounded-worker",
+      "provider": "openrouter",
+      "model": "openai/gpt-5.6-luna",
+      "system_prompt_path": "./contracts/worker.md",
+      "temperature": 0.0,
+      "max_output_tokens": 1,
+      "timeout_seconds": 120
+    }
+  ],
+  "synthesis": {
+    "id": "synthesis",
+    "provider": "openrouter",
+    "model": "openai/gpt-5.6-luna",
+    "system_prompt_path": "./contracts/synthesis.md",
+    "temperature": 0.0,
+    "max_output_tokens": 256,
+    "timeout_seconds": 120,
+    "depends_on": [
+      "bounded-worker"
+    ]
+  },
+  "output": {
+    "runs_dir": "./.bots5/runs/opv1-controlled-failure"
+  }
+}
