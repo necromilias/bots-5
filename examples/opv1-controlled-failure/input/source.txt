@@ -1,0 +1,8 @@
+This controlled failure campaign intentionally asks the worker to return more material than its configured output ceiling can carry.
+
+Facts to report:
+- alpha
+- beta
+- gamma
+- delta
+- epsilon
