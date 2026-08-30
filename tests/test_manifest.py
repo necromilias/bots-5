@@ -42,6 +42,18 @@ def test_non_finite_json_rejected(tmp_path):
         load_job(path)
 
 
+def test_huge_numeric_value_rejected_cleanly(tmp_path):
+    path, job = make_job_tree(tmp_path)
+    job["workers"][0]["timeout_seconds"] = 10**4000
+    path.write_text(json.dumps(job))
+
+    with pytest.raises(
+        ValidationError,
+        match=r"workers\[0\]\.timeout_seconds: expected finite number",
+    ):
+        load_job(path)
+
+
 def test_unsupported_schema(tmp_path):
     path, job = make_job_tree(tmp_path)
     job["schema_version"] = 2
