@@ -36,14 +36,34 @@ The closed baseline includes:
 - `docs/OPERATING_PROCEDURE_V1.md` is the frozen normal operating procedure;
 - the OPv1 freeze decision and evidence are recorded in `docs/OPV1_FREEZE_REPORT.md`.
 
-## Post-V0 work
+## V0.2 — local OpenAI-compatible provider
 
-Likely next steps:
+Active design adjudication.
 
-- local OpenAI-compatible provider;
+The V0.2 objective is a narrow generic local OpenAI-compatible provider that coexists with OpenRouter
+while preserving the closed V0 execution model, existing `CompletionRequest -> CompletionResult`
+seam, non-streaming operation, completion semantics, persistence, timeouts, cost accounting,
+synthesis gating, and failure behavior.
+
+The V0.2 design swarm produced six normally completed specialist worker outputs. Synthesis recovery
+then exposed and repaired an OpenRouter normalization defect for reasoning-only incomplete responses
+where `message.content` is null with a trustworthy non-stop finish reason. That repair is implemented
+at `2fbb2a591c95f84247888a050a8af4086acaac29`, covered by deterministic tests, and live-proven by a
+24-token reasoning-exhaustion canary.
+
+A final Kimi K3 synthesis completed normally, but human review identified blocking design
+contradictions that must be corrected before implementation. The provider feature itself is therefore
+not yet implemented.
+
+See `docs/V0_2_DESIGN_CAMPAIGN_REPORT.md` for the campaign evidence and current design status.
+
+## Later candidates
+
+- campaign stage-output reuse/resume after partial campaign failure, now supported by observed
+  operational pain but explicitly outside V0.2;
 - planner-generated manifests;
 - richer but still explicit DAG semantics;
-- more deliberate retry policy where idempotence is understood;
+- deliberate retry policy where idempotence is understood;
 - stronger filesystem/tool capability model.
 
 ## Deferred defect
