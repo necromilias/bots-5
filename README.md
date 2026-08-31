@@ -110,4 +110,6 @@ then integrated and verified locally. See:
   outcome;
 - `docs/OPV1_FREEZE_REPORT.md` for the freeze decision and supporting evidence;
 - `docs/OPERATING_PROCEDURE_V1.md` for the frozen normal operating procedure;
-- `docs/V0_CLOSURE_REPORT.md` for the final V0 closure validation and decision.
+- `docs/V0_CLOSURE_REPORT.md` for the final V0 closure validation and decision;
+- `docs/V0_2_DESIGN_CAMPAIGN_REPORT.md` for the V0.2 provider-design swarm, synthesis recovery,
+  reasoning-response normalization defect, live repair proof, and current design-adjudication status.
