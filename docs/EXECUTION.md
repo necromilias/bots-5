@@ -9,9 +9,9 @@ fails before run-directory creation.
 After validation and key acquisition:
 
 1. Compile each system message from the harness-owned execution boundary and validated contract.
-2. Create a unique run directory and `stages/`.
-3. Persist `job.resolved.json`, queued stage records, initial usage/run state, and events.
-4. Read declared inputs and render one deterministic worker user message containing INPUT data.
+2. Read declared inputs and render one deterministic worker user message containing INPUT data.
+3. Create a unique run directory and `stages/`.
+4. Persist `job.resolved.json`, queued stage records, initial usage/run state, and events.
 5. Launch all worker coroutines. A semaphore limits in-flight worker requests.
 6. Persist each success or failure independently.
 7. After the worker phase joins, evaluate synthesis dependencies.
@@ -34,8 +34,7 @@ other declared workers from the final whole-run success condition.
 
 ## Operator preflight and review
 
-The candidate normal operating procedure is in `OPERATING_PROCEDURE_V1_CANDIDATE.md`. Until it is
-frozen, operators should at minimum:
+The frozen normal operating procedure is in `OPERATING_PROCEDURE_V1.md`. Operators should at minimum:
 
 - validate before a paid run;
 - review output-token ceilings against the required contract output rather than treating them as
