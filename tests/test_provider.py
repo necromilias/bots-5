@@ -105,3 +105,103 @@ def test_provider_empty_response():
     provider = OpenRouterProvider("secret", _transport=httpx.MockTransport(handler))
     with pytest.raises(ProviderResponseError, match="empty"):
         asyncio.run(provider.complete(req()))
+
+
+@pytest.mark.parametrize("finish_reason", ["length", "content_filter"])
+def test_provider_null_content_with_incomplete_finish_reason_preserves_metadata(
+    finish_reason,
+):
+    async def handler(request):
+        return httpx.Response(
+            200,
+            json={
+                "id": "req-null",
+                "model": "returned-model",
+                "choices": [
+                    {
+                        "finish_reason": finish_reason,
+                        "message": {
+                            "content": None,
+                            "reasoning": "must not become output",
+                            "reasoning_details": [{"type": "reasoning"}],
+                        },
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 22,
+                    "total_tokens": 33,
+                    "completion_tokens_details": {"reasoning_tokens": 17},
+                    "cost": "0.0042",
+                },
+            },
+        )
+
+    provider = OpenRouterProvider("secret", _transport=httpx.MockTransport(handler))
+    result = asyncio.run(provider.complete(req()))
+
+    assert result.output_text == ""
+    assert result.finish_reason == finish_reason
+    assert result.returned_model == "returned-model"
+    assert result.request_id == "req-null"
+    assert result.prompt_tokens == 11
+    assert result.completion_tokens == 22
+    assert result.reasoning_tokens == 17
+    assert result.total_tokens == 33
+    assert result.known_cost_usd == Decimal("0.0042")
+    assert not hasattr(result, "reasoning")
+    assert not hasattr(result, "reasoning_details")
+
+
+def test_provider_null_content_with_stop_is_empty_response():
+    async def handler(request):
+        return httpx.Response(
+            200,
+            json={"choices": [{"finish_reason": "stop", "message": {"content": None}}]},
+        )
+
+    provider = OpenRouterProvider("secret", _transport=httpx.MockTransport(handler))
+    with pytest.raises(ProviderResponseError, match="empty"):
+        asyncio.run(provider.complete(req()))
+
+
+@pytest.mark.parametrize(
+    "choice",
+    [
+        {"message": {"content": None}},
+        {"finish_reason": None, "message": {"content": None}},
+        {"finish_reason": {"unexpected": True}, "message": {"content": None}},
+    ],
+)
+def test_provider_null_content_without_string_finish_reason_is_malformed(choice):
+    async def handler(request):
+        return httpx.Response(200, json={"choices": [choice]})
+
+    provider = OpenRouterProvider("secret", _transport=httpx.MockTransport(handler))
+    with pytest.raises(ProviderResponseError, match="malformed"):
+        asyncio.run(provider.complete(req()))
+
+
+def test_provider_missing_content_key_is_malformed_even_with_incomplete_finish():
+    async def handler(request):
+        return httpx.Response(
+            200,
+            json={"choices": [{"finish_reason": "length", "message": {}}]},
+        )
+
+    provider = OpenRouterProvider("secret", _transport=httpx.MockTransport(handler))
+    with pytest.raises(ProviderResponseError, match="malformed"):
+        asyncio.run(provider.complete(req()))
+
+
+@pytest.mark.parametrize("content", [[{"type": "text", "text": "ok"}], {"text": "ok"}, 3, 3.5, True])
+def test_provider_unsupported_non_string_content_is_malformed(content):
+    async def handler(request):
+        return httpx.Response(
+            200,
+            json={"choices": [{"finish_reason": "length", "message": {"content": content}}]},
+        )
+
+    provider = OpenRouterProvider("secret", _transport=httpx.MockTransport(handler))
+    with pytest.raises(ProviderResponseError, match="malformed"):
+        asyncio.run(provider.complete(req()))

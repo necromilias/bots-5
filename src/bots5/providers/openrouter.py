@@ -69,10 +69,23 @@ class OpenRouterProvider:
         message = first.get("message")
         if type(message) is not dict:
             raise ProviderResponseError("malformed_provider_response")
-        content = message.get("content")
-        if type(content) is not str:
+
+        finish_reason = first.get("finish_reason")
+        if type(finish_reason) is not str:
+            finish_reason = None
+
+        if "content" not in message:
             raise ProviderResponseError("malformed_provider_response")
-        if not content.strip():
+        content = message["content"]
+        if content is None:
+            if finish_reason is None:
+                raise ProviderResponseError("malformed_provider_response")
+            if finish_reason == "stop":
+                raise ProviderResponseError("empty_model_response")
+            content = ""
+        elif type(content) is not str:
+            raise ProviderResponseError("malformed_provider_response")
+        elif not content.strip():
             raise ProviderResponseError("empty_model_response")
 
         usage = data.get("usage")
@@ -84,9 +97,6 @@ class OpenRouterProvider:
 
         returned_model = data.get("model") if type(data.get("model")) is str else None
         request_id = data.get("id") if type(data.get("id")) is str else None
-        finish_reason = first.get("finish_reason")
-        if type(finish_reason) is not str:
-            finish_reason = None
 
         return CompletionResult(
             output_text=content,

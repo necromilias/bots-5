@@ -78,6 +78,11 @@ provider supplied cost telemetry.
 
 `max_output_tokens` is a hard capacity boundary, not an output target.
 
+For reasoning-capable models, the configured generation/completion ceiling may be consumed by both
+reasoning tokens and visible answer tokens. Operators must size the ceiling with sufficient room for
+both, or explicitly constrain reasoning when the selected provider/model and campaign contract
+support doing so.
+
 Choose each ceiling with enough margin for the required contract output. A stage that returns usable
 text with any finish reason other than exact `stop` is incomplete and cannot count as normally
 completed evidence.
