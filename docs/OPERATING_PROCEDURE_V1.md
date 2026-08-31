@@ -40,6 +40,14 @@ Prefer evidence from relevant prior runs when available. A model that produces h
 repeatedly exhausts its output allowance, violates required output shape, or incurs disproportionate
 reasoning cost may be a poor operational choice for a bounded worker role.
 
+Observed campaign behavior overrides prior model-selection rationale. If a model/provider route
+repeatedly fails mechanically in a role through truncation, malformed responses, routing instability,
+timeouts, or other abnormal completion, remove it from critical-path roles in subsequent campaign
+revisions unless there is specific evidence that the failure condition has been eliminated. Do not
+preserve model diversity for its own sake. Diversity is subordinate to reliable normal completion and
+useful output. Previously selected or previously successful models are not defaults; re-evaluate
+alternatives using the newest relevant evidence.
+
 Record the selected model for each role and the reason it was chosen. The reviewed manifest remains
 the authority for the exact models used during execution.
 
