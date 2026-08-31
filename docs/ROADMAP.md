@@ -1,6 +1,11 @@
 # Roadmap
 
-## Implemented in this V0 candidate
+## Closed V0 baseline
+
+B.O.T.S. 5 V0 is closed. Final zero-spend closure validation passed against
+`13e3ac463c44d66e57d4443027f0cc9dfe9b93a5`; see `docs/V0_CLOSURE_REPORT.md`.
+
+The closed baseline includes:
 
 - strict JSON manifest;
 - explicit UTF-8 inputs/prompts;
@@ -31,9 +36,9 @@
 - `docs/OPERATING_PROCEDURE_V1.md` is the frozen normal operating procedure;
 - the OPv1 freeze decision and evidence are recorded in `docs/OPV1_FREEZE_REPORT.md`.
 
-## Likely next steps
+## Post-V0 work
 
-Only after V0 is reviewed:
+Likely next steps:
 
 - local OpenAI-compatible provider;
 - planner-generated manifests;
@@ -44,7 +49,7 @@ Only after V0 is reviewed:
 ## Deferred defect
 
 - extremely large JSON integers can escape `_number()` through `float()` overflow instead of a clean
-  validation error; low operational consequence, deferred until after the OPv1 campaign sequence.
+  validation error; low operational consequence and explicitly carried forward beyond V0 closure.
 
 ## Speculative
 

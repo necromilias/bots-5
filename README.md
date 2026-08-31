@@ -1,5 +1,10 @@
 # B.O.T.S. 5
 
+**V0 CLOSED.** Final zero-spend closure validation passed against baseline
+`13e3ac463c44d66e57d4443027f0cc9dfe9b93a5`: 65 tests passed, compileall passed, all three
+checked-in example manifests validated, and `git diff --check` passed with `OPENROUTER_API_KEY`
+unset and no provider/API calls. See `docs/V0_CLOSURE_REPORT.md`.
+
 B.O.T.S. 5 V0 is a small local Python CLI that executes a fixed, reviewable multi-model job:
 strict JSON manifest -> explicit text inputs -> bounded parallel workers -> optional synthesis ->
 durable run artifacts.
@@ -104,4 +109,5 @@ then integrated and verified locally. See:
 - `examples/opv1-controlled-failure/` for the controlled failure-path campaign assets and observed
   outcome;
 - `docs/OPV1_FREEZE_REPORT.md` for the freeze decision and supporting evidence;
-- `docs/OPERATING_PROCEDURE_V1.md` for the frozen normal operating procedure.
+- `docs/OPERATING_PROCEDURE_V1.md` for the frozen normal operating procedure;
+- `docs/V0_CLOSURE_REPORT.md` for the final V0 closure validation and decision.
