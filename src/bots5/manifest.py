@@ -427,9 +427,6 @@ def job_to_dict(job: Job) -> dict[str, Any]:
         if job.providers.local_openai is not None:
             result["providers"]["local_openai"] = {
                 "base_url": job.providers.local_openai.base_url,
+                "api_key_env": job.providers.local_openai.api_key_env,
             }
-            if job.providers.local_openai.api_key_env is not None:
-                result["providers"]["local_openai"]["api_key_env"] = (
-                    job.providers.local_openai.api_key_env
-                )
     return result

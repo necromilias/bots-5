@@ -392,6 +392,8 @@ def test_api_key_not_persisted_with_mock_openrouter(tmp_path):
     provider = OpenRouterProvider(secret, _transport=httpx.MockTransport(handler))
     result = asyncio.run(run_job(job, {"openrouter": provider}, run_id="secret-run"))
     assert result.exit_code == 0
+    resolved = json.loads((result.run_dir / "job.resolved.json").read_text(encoding="utf-8"))
+    assert "providers" not in resolved
     for artifact in result.run_dir.rglob("*"):
         if artifact.is_file():
             assert secret not in artifact.read_text(encoding="utf-8")
@@ -477,3 +479,29 @@ def test_v2_resolved_job_persists_only_non_secret_provider_config(tmp_path, monk
     for artifact in result.run_dir.rglob("*"):
         if artifact.is_file():
             assert secret not in artifact.read_text(encoding="utf-8")
+
+
+def test_v2_resolved_job_persists_explicit_null_api_key_env(tmp_path):
+    path, job_dict = make_job_tree(tmp_path, workers=1, synthesis=False)
+    job_dict["schema_version"] = 2
+    job_dict["workers"][0]["provider"] = "local_openai"
+    job_dict["providers"] = {
+        "local_openai": {
+            "base_url": "http://127.0.0.1:8000/v1",
+            "api_key_env": None,
+        }
+    }
+    path.write_text(json.dumps(job_dict), encoding="utf-8")
+    job = load_job(path)
+
+    result = asyncio.run(
+        run_job(job, {"local_openai": FakeProvider()}, run_id="resolved-null-v2-run")
+    )
+
+    resolved = json.loads((result.run_dir / "job.resolved.json").read_text(encoding="utf-8"))
+    assert resolved["providers"] == {
+        "local_openai": {
+            "base_url": "http://127.0.0.1:8000/v1",
+            "api_key_env": None,
+        }
+    }
