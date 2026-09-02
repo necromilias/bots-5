@@ -38,9 +38,9 @@ The closed baseline includes:
 
 ## V0.2 — local OpenAI-compatible provider
 
-Implemented, deterministically validated, and live-proven against a local OpenAI-compatible endpoint
-on the published `v0.2-local-openai-provider` candidate branch; pending final human review and landing
-on `main`.
+Implemented, deterministically validated, and live-proven against a local OpenAI-compatible endpoint.
+The reviewed implementation candidate was fast-forwarded onto `main`; the reviewed implementation
+landing tree is `96673dd0bfc28a89a74ee0745bdab05eb1163da1`, and V0.2 is now the landed repository state.
 
 The V0.2 objective is a narrow generic local OpenAI-compatible provider that coexists with OpenRouter
 while preserving the closed V0 execution model, existing `CompletionRequest -> CompletionResult`

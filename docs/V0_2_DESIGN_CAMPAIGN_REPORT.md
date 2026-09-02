@@ -534,5 +534,18 @@ controlled local-only canary used `local_openai` at `http://192.168.50.223:11434
 `bots5-v0.2-local-provider-canary-20260902T090637Z-fe3bd6dd` reached terminal state `succeeded` with
 exit code `0`, stage state `succeeded`, exact `finish_reason: "stop"`, and
 `completion_complete: true`; `bots5 status` and `bots5 inspect` confirmed the persisted result. No
-OpenRouter or other remote-provider call was made. The candidate remains published but unmerged to
-`main`, and no Organisational Memory update has occurred.
+OpenRouter or other remote-provider call was made during that validation. At that point, the candidate
+remained published but unmerged to `main`, and no Organisational Memory update had occurred.
+
+## Post-landing B.O.T.S. repository closure
+
+The final aggregate landing review returned `PASS`. Before landing, `origin/main` was
+`8e4683f8caf42412d430ead5f81fea05c8f31372`; the reviewed V0.2 landing tree was
+`96673dd0bfc28a89a74ee0745bdab05eb1163da1`. The reviewed candidate was applied to `main` as a pure
+non-force fast-forward. No merge commit or new implementation commit was created by the landing, and
+`main` and the candidate branch pointed to the same reviewed tree immediately afterward. No provider/API
+call or canary rerun occurred during landing. Organisational Memory had not yet been updated at that
+moment.
+
+This note records post-landing documentation bookkeeping and is distinct from the implementation
+landing; it does not claim a later documentation change is an implementation landing commit.
