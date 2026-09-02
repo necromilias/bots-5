@@ -508,10 +508,30 @@ Bearer credential, preserves unknown local cost, and uses independent provider-l
 OpenRouter retains its authoritative classifier while the local provider matches it, including
 reasoning-only incomplete responses. No retries, streaming, discovery, plugins, planner, tools, RAG,
 richer DAG, stage reuse/resume, UI, daemon, or Organisational Memory update is part of this closure;
-no live V0.2 provider canary has been performed.
+at the time of this implementation-closure review, no live V0.2 provider canary had been performed.
 
-Deterministic offline implementation validation is the current implementation evidence. It covered the
-full deterministic test suite, schema-v1 and
+At the time of this implementation-closure review, deterministic offline implementation validation was
+the current implementation evidence. It covered the full deterministic test suite, schema-v1 and
 schema-v2 examples, compileall, diff whitespace, secret absence, and byte-preservation of the frozen
-`docs/OPERATING_PROCEDURE_V1.md`. The implementation candidate remains uncommitted and unmerged to
+`docs/OPERATING_PROCEDURE_V1.md`. The implementation candidate was then uncommitted and unmerged to
 `main` for human review.
+
+## Post-closure implementation-validation addendum
+
+The implementation was published on the candidate branch in commit
+`17c195fd989cba3977d82f824367e1a3419c009e` (`Add local OpenAI-compatible provider support`). The first
+controlled local-provider canary targeted `http://localhost:11434/v1` and failed with a transport error
+because the service was bound to `192.168.50.223:11434`. That failed run exposed a schema-v2 persistence
+defect: validated `api_key_env: null` was omitted from `job.resolved.json`. The defect was corrected in
+`38046d99bc98c6906f5175dae9494c62060109f5` (`Preserve null local provider credential config`), with
+schema-v1 persistence unchanged.
+
+Deterministic revalidation after the correction passed 113 tests, compileall, all checked-in manifest
+validation, whitespace and secret checks, and the OPv1/OpenRouter byte-preservation checks. A subsequent
+controlled local-only canary used `local_openai` at `http://192.168.50.223:11434/v1` with model
+`rocinante:64k`, one worker, no synthesis, no retry, and exactly one generation request. Run
+`bots5-v0.2-local-provider-canary-20260902T090637Z-fe3bd6dd` reached terminal state `succeeded` with
+exit code `0`, stage state `succeeded`, exact `finish_reason: "stop"`, and
+`completion_complete: true`; `bots5 status` and `bots5 inspect` confirmed the persisted result. No
+OpenRouter or other remote-provider call was made. The candidate remains published but unmerged to
+`main`, and no Organisational Memory update has occurred.
