@@ -2,7 +2,7 @@
 
 Date: 2026-08-31
 
-Classification: **COMPLETE WITH DESIGN CORRECTIONS REQUIRED**.
+Classification at design-campaign closure: **COMPLETE WITH DESIGN CORRECTIONS REQUIRED**.
 
 ## Purpose and conclusion
 
@@ -10,7 +10,8 @@ This report records the V0.2 local OpenAI-compatible provider design campaign, t
 normalization defect discovered during synthesis recovery, the accepted repair and operating-procedure
 lessons, and the final Kimi K3 synthesis result.
 
-The campaign objective was design only. V0.2 implementation has not begun.
+At the time of that design-campaign closure, the campaign objective was design only and V0.2
+implementation had not begun.
 
 The six-worker R3 design swarm completed normally, and the final Kimi K3 synthesis also completed
 normally with exact provider `finish_reason: "stop"`. The synthesis is useful and converges on the
@@ -24,8 +25,8 @@ must be corrected before implementation:
 3. it proposes a generic single-provider runner compatibility adapter that cannot reliably detect
    provider identity because the current `Provider` protocol has no provider-identity field.
 
-No further paid synthesis run is required. The next action is human adjudication and correction of the
-completed synthesis into the accepted V0.2 implementation specification.
+At that point, no further paid synthesis run was required; the next action was human adjudication and
+correction of the completed synthesis into the accepted V0.2 implementation specification.
 
 ## Scope
 
@@ -475,22 +476,22 @@ complete model outputs or create a competing raw-evidence store.
 
 Historical failed and incomplete runs remain immutable evidence and were not rewritten after diagnosis.
 
-## Current status and next action
+## Status and next action at design-campaign closure
 
-V0.2 design campaign execution is complete.
+At design-campaign closure, V0.2 design campaign execution was complete.
 
-Status:
+Status at that point:
 
 **COMPLETE WITH DESIGN CORRECTIONS REQUIRED**
 
-The next action is zero-spend human design adjudication:
+The next action at that point was zero-spend human design adjudication:
 
 1. correct the three blocking contradictions;
 2. resolve the remaining human design choices;
 3. produce the accepted V0.2 implementation specification;
 4. only then authorize implementation.
 
-No additional provider run is required at this stage.
+No additional provider run was required at that stage.
 
 ## V0.2 implementation closure
 
