@@ -61,6 +61,32 @@ document remain unchanged.
 
 See `docs/V0_2_DESIGN_CAMPAIGN_REPORT.md` for the campaign evidence and implementation closure.
 
+## Linux v0.1 — native desktop scope/design
+
+Linux v0.1 product/scope/design is the next active milestone.
+
+Before framework, architecture, widget, or implementation choices, define and human-adjudicate the
+first useful native Linux product.
+
+Current hard constraints:
+
+- the application is a real native Linux desktop application;
+- web UI, PWA, Electron, and browser-wrapper substitutes are excluded;
+- Chat is an early real workload;
+- multiple persistent chats and chat switching matter;
+- OpenAI API/provider capability required by the accepted workload is foundational;
+- any provider/API implementation identified as a prerequisite remains separately scoped and approved;
+- future Code/Git tooling is intended but deferred from Linux v0.1;
+- a native Android application is intended but deferred from Linux v0.1.
+
+Campaign desktop capability remains available according to concrete workflow need, but a complete
+campaign UI is not a prerequisite to beginning useful Chat work.
+
+Code/Git, Android, daemon/remote-client architecture, tool frameworks, and other speculative future
+capability must not be designed into existence merely because they are intended later.
+
+Discussion and product/scope/design work do not authorize implementation.
+
 ## Later candidates
 
 - campaign stage-output reuse/resume after partial campaign failure, now supported by observed
@@ -79,7 +105,6 @@ See `docs/V0_2_DESIGN_CAMPAIGN_REPORT.md` for the campaign evidence and implemen
 
 - OMC authority packaging;
 - gated patch application;
-- live terminal/graphical status UI;
 - distributed execution.
 
 None of the speculative items exist in V0.
