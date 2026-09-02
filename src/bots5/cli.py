@@ -9,8 +9,10 @@ from typing import Sequence
 
 from .errors import Bots5Error
 from .manifest import load_job, validate_referenced_files
-from .models import RunResult
+from .models import Job, RunResult
 from .paths import locate_run_dir
+from .providers.base import Provider
+from .providers.openai_compatible import OpenAICompatibleProvider
 from .providers.openrouter import OpenRouterProvider
 from .runner import run_job
 from .storage import load_run_view, load_stage_view
@@ -75,14 +77,37 @@ def _cmd_validate(path: Path) -> int:
     return 0
 
 
+def _declared_provider_ids(job: Job) -> set[str]:
+    ids = {worker.provider for worker in job.workers}
+    if job.synthesis is not None:
+        ids.add(job.synthesis.provider)
+    return ids
+
+
+def _build_providers(job: Job) -> dict[str, Provider]:
+    provider_ids = _declared_provider_ids(job)
+    providers: dict[str, Provider] = {}
+    if "openrouter" in provider_ids:
+        api_key = os.environ.get("OPENROUTER_API_KEY")
+        if not api_key:
+            raise Bots5Error("OPENROUTER_API_KEY is not set")
+        providers["openrouter"] = OpenRouterProvider(api_key)
+    if "local_openai" in provider_ids:
+        config = job.providers.local_openai
+        if config is None:
+            raise Bots5Error("local_openai provider configuration is missing")
+        providers["local_openai"] = OpenAICompatibleProvider(
+            config.base_url,
+            api_key_env=config.api_key_env,
+        )
+    return providers
+
+
 def _cmd_run(path: Path) -> int:
     job = load_job(path)
     validate_referenced_files(job)
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        raise Bots5Error("OPENROUTER_API_KEY is not set")
-    provider = OpenRouterProvider(api_key)
-    result = asyncio.run(run_job(job, provider))
+    providers = _build_providers(job)
+    result = asyncio.run(run_job(job, providers))
     _print_result(result)
     return result.exit_code
 

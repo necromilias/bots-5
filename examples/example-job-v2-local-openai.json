@@ -1,0 +1,36 @@
+{
+  "schema_version": 2,
+  "name": "bots5-local-openai-example",
+  "inputs": [
+    {
+      "label": "source",
+      "path": "./input/source.txt"
+    }
+  ],
+  "execution": {
+    "max_parallelism": 1,
+    "run_timeout_seconds": 300,
+    "stop_before_synthesis_if_known_cost_exceeds_usd": null
+  },
+  "workers": [
+    {
+      "id": "worker",
+      "provider": "local_openai",
+      "model": "local-model",
+      "system_prompt_path": "./prompts/extractor.md",
+      "temperature": 0.1,
+      "max_output_tokens": 1000,
+      "timeout_seconds": 120
+    }
+  ],
+  "synthesis": null,
+  "output": {
+    "runs_dir": "./.bots5/runs"
+  },
+  "providers": {
+    "local_openai": {
+      "base_url": "http://127.0.0.1:8000/v1",
+      "api_key_env": "LOCAL_OPENAI_API_KEY"
+    }
+  }
+}

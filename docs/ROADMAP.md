@@ -38,7 +38,8 @@ The closed baseline includes:
 
 ## V0.2 — local OpenAI-compatible provider
 
-Active design adjudication.
+Implemented and offline-validated on the uncommitted V0.2 candidate branch; pending human review,
+commit, and landing on `main`.
 
 The V0.2 objective is a narrow generic local OpenAI-compatible provider that coexists with OpenRouter
 while preserving the closed V0 execution model, existing `CompletionRequest -> CompletionResult`
@@ -51,11 +52,13 @@ where `message.content` is null with a trustworthy non-stop finish reason. That 
 at `2fbb2a591c95f84247888a050a8af4086acaac29`, covered by deterministic tests, and live-proven by a
 24-token reasoning-exhaustion canary.
 
-A final Kimi K3 synthesis completed normally, but human review identified blocking design
-contradictions that must be corrected before implementation. The provider feature itself is therefore
-not yet implemented.
+A final Kimi K3 synthesis completed normally, after which the accepted implementation specification
+corrected its response-normalization, validated-provider-config, and runner-API contradictions. The
+implementation adds schema v2, explicit per-stage provider mapping, one built-in non-streaming local
+OpenAI-compatible provider, and zero-network deterministic coverage. Schema v1 and the frozen OPv1
+document remain unchanged.
 
-See `docs/V0_2_DESIGN_CAMPAIGN_REPORT.md` for the campaign evidence and current design status.
+See `docs/V0_2_DESIGN_CAMPAIGN_REPORT.md` for the campaign evidence and implementation closure.
 
 ## Later candidates
 

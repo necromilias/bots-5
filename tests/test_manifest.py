@@ -18,6 +18,77 @@ def test_valid_manifest(tmp_path):
     assert job.workers[0].id == "w1"
 
 
+def test_schema_v2_validates_local_provider_config(tmp_path):
+    path, job = make_job_tree(tmp_path, workers=1, synthesis=False)
+    job["schema_version"] = 2
+    job["workers"][0]["provider"] = "local_openai"
+    job["providers"] = {
+        "local_openai": {
+            "base_url": "http://127.0.0.1:8000/v1/",
+            "api_key_env": "LOCAL_OPENAI_API_KEY",
+        }
+    }
+    path.write_text(json.dumps(job), encoding="utf-8")
+
+    parsed = load_job(path)
+
+    assert parsed.schema_version == 2
+    assert parsed.providers.local_openai is not None
+    assert parsed.providers.local_openai.base_url == "http://127.0.0.1:8000/v1"
+    assert parsed.providers.local_openai.api_key_env == "LOCAL_OPENAI_API_KEY"
+
+
+def test_schema_v2_requires_providers_top_level(tmp_path):
+    path, job = make_job_tree(tmp_path)
+    job["schema_version"] = 2
+    path.write_text(json.dumps(job), encoding="utf-8")
+    with pytest.raises(ValidationError, match="missing field.*providers"):
+        load_job(path)
+
+
+def test_schema_v1_rejects_providers_and_local_openai(tmp_path):
+    path, job = make_job_tree(tmp_path, workers=1, synthesis=False)
+    job["providers"] = {}
+    path.write_text(json.dumps(job), encoding="utf-8")
+    with pytest.raises(ValidationError, match="unknown field.*providers"):
+        load_job(path)
+
+    job.pop("providers")
+    job["workers"][0]["provider"] = "local_openai"
+    path.write_text(json.dumps(job), encoding="utf-8")
+    with pytest.raises(ValidationError, match="unsupported provider"):
+        load_job(path)
+
+
+@pytest.mark.parametrize(
+    "providers",
+    [
+        {"local_openai": {"base_url": "ftp://127.0.0.1:8000/v1"}},
+        {"local_openai": {"base_url": "http://127.0.0.1:8000/v1?token=secret"}},
+        {"local_openai": {"base_url": "http://127.0.0.1:8000/v1", "extra": True}},
+        {"mystery": {"base_url": "http://127.0.0.1:8000/v1"}},
+    ],
+)
+def test_schema_v2_rejects_invalid_provider_config(tmp_path, providers):
+    path, job = make_job_tree(tmp_path, workers=1, synthesis=False)
+    job["schema_version"] = 2
+    job["workers"][0]["provider"] = "local_openai"
+    job["providers"] = providers
+    path.write_text(json.dumps(job), encoding="utf-8")
+    with pytest.raises(ValidationError):
+        load_job(path)
+
+
+def test_schema_v2_requires_local_config_when_declared(tmp_path):
+    path, job = make_job_tree(tmp_path, workers=1, synthesis=False)
+    job["schema_version"] = 2
+    job["workers"][0]["provider"] = "local_openai"
+    job["providers"] = {}
+    path.write_text(json.dumps(job), encoding="utf-8")
+    with pytest.raises(ValidationError, match="required.*local_openai"):
+        load_job(path)
+
+
 def test_malformed_json(tmp_path):
     path = tmp_path / "job.json"
     path.write_text("{", encoding="utf-8")

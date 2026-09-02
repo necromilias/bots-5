@@ -6,7 +6,7 @@ from decimal import Decimal
 
 import pytest
 
-from bots5.errors import FileValidationError, ProviderError
+from bots5.errors import Bots5Error, FileValidationError, ProviderError
 from bots5.manifest import load_job, validate_referenced_files
 from bots5.models import RunState, StageState
 from bots5.providers.base import CompletionResult
@@ -20,7 +20,30 @@ def _run(tmp_path, provider, **kwargs):
     path, job_dict = make_job_tree(tmp_path, **kwargs)
     job = load_job(path)
     validate_referenced_files(job)
-    return asyncio.run(run_job(job, provider, run_id="test-run"))
+    return asyncio.run(run_job(job, {"openrouter": provider}, run_id="test-run"))
+
+
+def _load_v2_job(tmp_path, *, worker_providers, synthesis_provider=None, api_key_env=None):
+    path, job_dict = make_job_tree(
+        tmp_path,
+        workers=len(worker_providers),
+        synthesis=synthesis_provider is not None,
+    )
+    job_dict["schema_version"] = 2
+    for worker, provider in zip(job_dict["workers"], worker_providers):
+        worker["provider"] = provider
+    if synthesis_provider is not None:
+        job_dict["synthesis"]["provider"] = synthesis_provider
+    job_dict["providers"] = {
+        "local_openai": {
+            "base_url": "http://127.0.0.1:8000/v1",
+            **({"api_key_env": api_key_env} if api_key_env is not None else {}),
+        }
+    }
+    path.write_text(json.dumps(job_dict), encoding="utf-8")
+    job = load_job(path)
+    validate_referenced_files(job)
+    return job
 
 
 def test_worker_and_synthesis_success_persist(tmp_path):
@@ -167,7 +190,7 @@ def test_requests_keep_system_contract_and_input_data_separate(tmp_path):
     job = load_job(path)
     provider = FakeProvider()
 
-    result = asyncio.run(run_job(job, provider, run_id="separation-run"))
+    result = asyncio.run(run_job(job, {"openrouter": provider}, run_id="separation-run"))
 
     assert result.exit_code == 0
     assert len(provider.calls) == 1
@@ -188,7 +211,7 @@ def test_invalid_contract_fails_before_provider_call_and_run_directory(tmp_path)
     provider = FakeProvider()
 
     with pytest.raises(FileValidationError, match="missing section"):
-        asyncio.run(run_job(job, provider, run_id="must-not-exist"))
+        asyncio.run(run_job(job, {"openrouter": provider}, run_id="must-not-exist"))
 
     assert provider.calls == []
     assert not job.output.runs_dir.exists()
@@ -301,7 +324,7 @@ def test_per_stage_request_timeout(tmp_path):
     job_dict["workers"][0]["timeout_seconds"] = 0.001
     path.write_text(json.dumps(job_dict))
     job = load_job(path)
-    result = asyncio.run(run_job(job, provider, run_id="test-run"))
+    result = asyncio.run(run_job(job, {"openrouter": provider}, run_id="test-run"))
     meta = json.loads((result.run_dir / "stages" / "w1.json").read_text())
     assert meta["state"] == "failed"
     assert meta["failure"]["type"] == "request_timeout"
@@ -367,8 +390,90 @@ def test_api_key_not_persisted_with_mock_openrouter(tmp_path):
     path, job_dict = make_job_tree(tmp_path, workers=1, synthesis=False)
     job = load_job(path)
     provider = OpenRouterProvider(secret, _transport=httpx.MockTransport(handler))
-    result = asyncio.run(run_job(job, provider, run_id="secret-run"))
+    result = asyncio.run(run_job(job, {"openrouter": provider}, run_id="secret-run"))
     assert result.exit_code == 0
+    for artifact in result.run_dir.rglob("*"):
+        if artifact.is_file():
+            assert secret not in artifact.read_text(encoding="utf-8")
+
+
+def test_runner_routes_local_only_job_to_local_mapping(tmp_path):
+    local = FakeProvider()
+    job = _load_v2_job(tmp_path, worker_providers=("local_openai",), synthesis_provider=None)
+
+    result = asyncio.run(run_job(job, {"local_openai": local}, run_id="local-only-run"))
+
+    assert result.exit_code == 0
+    assert [call.model for call in local.calls] == ["model-w1"]
+
+
+def test_runner_routes_mixed_job_by_declared_provider(tmp_path):
+    local = FakeProvider()
+    remote = FakeProvider()
+    job = _load_v2_job(
+        tmp_path,
+        worker_providers=("local_openai", "openrouter"),
+        synthesis_provider="local_openai",
+    )
+
+    result = asyncio.run(
+        run_job(
+            job,
+            {"local_openai": local, "openrouter": remote},
+            run_id="mixed-routing-run",
+        )
+    )
+
+    assert result.exit_code == 0
+    assert [call.model for call in local.calls] == ["model-w1", "model-synth"]
+    assert [call.model for call in remote.calls] == ["model-w2"]
+    assert [stage.provider for stage in result.stages] == [
+        "local_openai",
+        "openrouter",
+        "local_openai",
+    ]
+
+
+def test_missing_provider_mapping_fails_before_run_creation(tmp_path):
+    job = _load_v2_job(tmp_path, worker_providers=("local_openai",), synthesis_provider=None)
+
+    with pytest.raises(Bots5Error, match="missing provider mapping.*local_openai"):
+        asyncio.run(run_job(job, {"openrouter": FakeProvider()}, run_id="missing-provider-run"))
+
+    assert not (job.output.runs_dir / "missing-provider-run").exists()
+
+
+def test_generic_single_provider_runner_form_is_removed(tmp_path):
+    job = _load_v2_job(tmp_path, worker_providers=("local_openai",), synthesis_provider=None)
+
+    with pytest.raises(Bots5Error, match="mapping"):
+        asyncio.run(run_job(job, FakeProvider(), run_id="single-provider-run"))
+
+    assert not (job.output.runs_dir / "single-provider-run").exists()
+
+
+def test_v2_resolved_job_persists_only_non_secret_provider_config(tmp_path, monkeypatch):
+    secret = "do-not-persist-this"
+    monkeypatch.setenv("BOTS5_LOCAL_KEY", secret)
+    job = _load_v2_job(
+        tmp_path,
+        worker_providers=("local_openai",),
+        synthesis_provider=None,
+        api_key_env="BOTS5_LOCAL_KEY",
+    )
+
+    result = asyncio.run(
+        run_job(job, {"local_openai": FakeProvider()}, run_id="resolved-v2-run")
+    )
+
+    resolved = json.loads((result.run_dir / "job.resolved.json").read_text(encoding="utf-8"))
+    assert resolved["schema_version"] == 2
+    assert resolved["providers"] == {
+        "local_openai": {
+            "base_url": "http://127.0.0.1:8000/v1",
+            "api_key_env": "BOTS5_LOCAL_KEY",
+        }
+    }
     for artifact in result.run_dir.rglob("*"):
         if artifact.is_file():
             assert secret not in artifact.read_text(encoding="utf-8")

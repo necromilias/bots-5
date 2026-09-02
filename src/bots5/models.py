@@ -64,6 +64,17 @@ class OutputConfig:
 
 
 @dataclass(frozen=True)
+class LocalOpenAIConfig:
+    base_url: str
+    api_key_env: str | None = None
+
+
+@dataclass(frozen=True)
+class ProviderConfigs:
+    local_openai: LocalOpenAIConfig | None = None
+
+
+@dataclass(frozen=True)
 class Job:
     schema_version: int
     name: str
@@ -72,6 +83,7 @@ class Job:
     workers: tuple[WorkerSpec, ...]
     synthesis: SynthesisSpec | None
     output: OutputConfig
+    providers: ProviderConfigs = field(default_factory=ProviderConfigs)
 
 
 @dataclass

@@ -8,7 +8,7 @@ bounded worker phase, persists each stage, applies synthesis gates, and records 
 Models are bounded workers. They return text; they do not own topology, permissions, budgets,
 persistence, or consequential actions.
 
-## V0 topology
+## V0/V0.2 topology
 
 ```text
 validated job
@@ -23,9 +23,9 @@ There is no autonomous delegation loop and no worker-to-worker dependency in V0.
 
 ## Trust boundaries
 
-The operator and manifest are trusted. Model output is untrusted text. The OpenRouter provider is an
-external service boundary. The local filesystem rules reduce accidental writes but are not a hostile
-sandbox.
+The operator and manifest are trusted. Model output is untrusted text. OpenRouter and the configured
+local OpenAI-compatible endpoint are external service boundaries. The local filesystem rules reduce
+accidental writes but are not a hostile sandbox.
 
 Instruction provenance is structural: the harness-owned execution boundary outranks the validated
 worker contract, which outranks all INPUT or WORKER OUTPUT data. Data blocks remain in user messages;
@@ -42,18 +42,19 @@ obedience to those instructions remains probabilistic.
 
 ## Provider boundary
 
-`Provider.complete(CompletionRequest) -> CompletionResult` is the only model-service seam. V0 ships
-only `OpenRouterProvider`.
+`Provider.complete(CompletionRequest) -> CompletionResult` is the only model-service seam. V0.2 ships
+`OpenRouterProvider` and one built-in non-streaming `OpenAICompatibleProvider`. The runner receives a
+mapping keyed by provider ID and selects the mapping entry named by each declared stage. The provider,
+request, and result contracts do not change.
+
+Schema-v2 provider configuration is validated into the `Job` before execution. The local configuration
+contains only its HTTP/HTTPS base URL and optional credential-environment-variable name; resolved
+credential values are never carried by the job or persisted.
 
 ## Concurrency
 
 Workers are scheduled together and use one `asyncio.Semaphore(max_parallelism)`. Each worker persists
 its own terminal state immediately. Synthesis is evaluated only after the full worker phase joins.
-
-## Local inference migration
-
-A later version can add a local OpenAI-compatible provider behind the same normalized provider
-boundary without changing worker/synthesis job semantics.
 
 ## Explicit non-goals
 

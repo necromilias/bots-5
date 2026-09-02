@@ -1,17 +1,19 @@
-# V0 Job Specification
+# Job Specification
 
 V0 uses UTF-8 strict JSON. Every object is closed: unknown fields are rejected. All listed fields are
-required. To omit synthesis, set `"synthesis": null`.
+required. To omit synthesis, set `"synthesis": null`. Schema v1 is frozen and remains unchanged.
+Schema v2 adds the required top-level `providers` object described below.
 
 ## Top level
 
-- `schema_version`: integer, exactly `1`.
+- `schema_version`: integer, exactly `1` or `2`.
 - `name`: non-empty string.
 - `inputs`: list, may be empty.
 - `execution`: object.
 - `workers`: list, may be empty.
 - `synthesis`: object or `null`.
 - `output`: object.
+- `providers`: required only for schema v2; a closed provider-configuration object.
 
 No type coercion is performed. JSON `NaN`, `Infinity`, and `-Infinity` are rejected.
 
@@ -49,7 +51,7 @@ known worker-cost subtotal. Unknown or partial worker cost does not itself block
 Each worker has exactly:
 
 - `id`: safe ID.
-- `provider`: `"openrouter"`.
+- `provider`: `"openrouter"` in schema v1; `"openrouter"` or `"local_openai"` in schema v2.
 - `model`: non-empty string; never hard-coded in core code.
 - `system_prompt_path`: non-empty path string, job-relative when relative.
 - `temperature`: finite number from 0 through 2 inclusive.
@@ -59,7 +61,26 @@ Each worker has exactly:
 Workers have no dependencies in V0.
 
 The referenced prompt file must be a valid worker contract as specified in
-`WORKER_CONTRACTS.md`. The manifest schema is unchanged in V0.1.
+`WORKER_CONTRACTS.md`.
+
+## Schema-v2 providers
+
+Schema v2 has a required top-level `providers` object. It may contain only the optional
+`local_openai` object. OpenRouter has no manifest credentials or endpoint configuration; its
+credential remains the fixed `OPENROUTER_API_KEY` environment variable.
+
+`providers.local_openai` has exactly:
+
+- `base_url`: required non-empty HTTP or HTTPS API-base URL, without userinfo, query, fragment, or
+  surrounding whitespace. Trailing slashes are normalized away. B.O.T.S. appends
+  `/chat/completions` to this base.
+- `api_key_env`: optional non-empty environment-variable name, or `null`. When a name is present,
+  its value is read only at runtime and used as a Bearer token. The value itself is never part of the
+  validated job or any persisted artifact.
+
+Any stage declaring `local_openai` requires `providers.local_openai`. A schema-v2 OpenRouter-only job
+may use `"providers": {}`. An explicit `providers.local_openai: null` is invalid; use omission or
+`api_key_env: null` to represent unauthenticated local access.
 
 ## Synthesis
 

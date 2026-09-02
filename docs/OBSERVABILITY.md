@@ -19,6 +19,10 @@ It may therefore exist for an incomplete synthesis whose overall run is failed. 
 is not evidence of normal completion or human acceptance; check `run.json` and synthesis completion
 metadata.
 
+For schema-v2 runs, `job.resolved.json` contains the validated non-secret provider configuration,
+including the local endpoint and configured environment-variable name when present. It never contains
+the resolved environment-variable value or an authorization header.
+
 ## Stage JSON
 
 Contains stage/provider/model identity, state, timestamps, duration, token usage when known, exact
@@ -53,7 +57,8 @@ Vocabulary:
 - `partial`: at least one known and at least one unknown cost.
 - `unknown`: all relevant stage costs are unknown.
 
-Unknown provider cost is never silently converted to zero. Harness-known skipped-stage zero is a
+Unknown provider cost, including the normal local-provider case when the response supplies no valid
+cost telemetry, is never silently converted to zero. Harness-known skipped-stage zero is a
 separate case: no provider request was sent for that stage.
 
 ## Status and inspect

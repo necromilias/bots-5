@@ -17,6 +17,10 @@ V0.1 compiles every model system message from a fixed harness-owned execution bo
 validated six-section worker contract. Declared source and worker outputs remain untrusted data in
 user-message blocks. See `docs/WORKER_CONTRACTS.md` for the exact authority and contract rules.
 
+V0.2 adds a schema-v2, built-in non-streaming `local_openai` provider. Schema v1 remains unchanged
+and OpenRouter-only; schema v2 can route each worker and synthesis stage to OpenRouter or an
+operator-supplied local OpenAI-compatible HTTP/HTTPS endpoint.
+
 ## Install
 
 Requires Python 3.12+.
@@ -35,10 +39,15 @@ export OPENROUTER_API_KEY='...'
 
 The key is read only at runtime and is not written to job or run artifacts.
 
+For a local-only schema-v2 job, set its `providers.local_openai.base_url`. Authentication is optional;
+when `api_key_env` is present, only that named environment variable is read. A local-only job does
+not require `OPENROUTER_API_KEY`.
+
 ## Validate first
 
 ```bash
 bots5 validate examples/example-job.json
+bots5 validate examples/example-job-v2-local-openai.json
 ```
 
 Validation performs no API calls and creates no run directory.
@@ -52,7 +61,8 @@ bots5 run examples/example-job.json
 The example writes beneath `examples/.bots5/runs/` because its `runs_dir` is job-relative.
 
 For normal paid-operation preflight, worker selection, completion review, evidence retention, and
-human acceptance, see `docs/OPERATING_PROCEDURE_V1.md`.
+human acceptance, see `docs/OPERATING_PROCEDURE_V1.md`. For local-provider operation, see
+`docs/OPERATING_PROCEDURE_V2.md`.
 
 ## Inspect
 
@@ -81,7 +91,11 @@ and make no API calls.
   sections in every worker and synthesis contract;
 - IDs must match `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`;
 - temperature range is 0 through 2 inclusive;
-- OpenRouter is the only provider;
+- schema v1 accepts only OpenRouter; schema v2 accepts OpenRouter and `local_openai`;
+- local provider endpoints are explicit HTTP/HTTPS API bases; B.O.T.S. appends
+  `/chat/completions` and never discovers endpoints or models;
+- local authentication is optional and environment-indirected through `api_key_env`; resolved
+  secret values are never persisted;
 - non-streaming chat completions;
 - no retries;
 - exact provider-reported cost when supplied; a stage skipped before any request may carry a
@@ -112,4 +126,5 @@ then integrated and verified locally. See:
 - `docs/OPERATING_PROCEDURE_V1.md` for the frozen normal operating procedure;
 - `docs/V0_CLOSURE_REPORT.md` for the final V0 closure validation and decision;
 - `docs/V0_2_DESIGN_CAMPAIGN_REPORT.md` for the V0.2 provider-design swarm, synthesis recovery,
-  reasoning-response normalization defect, live repair proof, and current design-adjudication status.
+  reasoning-response normalization defect, live repair proof, and implementation closure;
+- `docs/OPERATING_PROCEDURE_V2.md` for schema-v2 local-provider preflight and review.

@@ -3,8 +3,10 @@
 `bots5 validate JOB.json` parses the closed schema, validates every referenced UTF-8 text file, and
 validates every worker and synthesis contract. It makes no API request and creates no run directory.
 
-`bots5 run JOB.json` repeats validation. The CLI then requires `OPENROUTER_API_KEY`; a missing key
-fails before run-directory creation.
+`bots5 run JOB.json` repeats validation. It constructs only the providers declared by the stages in
+the job. OpenRouter stages require `OPENROUTER_API_KEY`; local stages use their validated
+`providers.local_openai` configuration and require only its optional configured `api_key_env`, if
+one is present. Missing credentials fail before run-directory creation.
 
 After validation and key acquisition:
 
@@ -22,7 +24,8 @@ After validation and key acquisition:
     known subtotal is greater than the threshold, skip synthesis and fail the run. Unknown or partial
     worker cost does not itself block synthesis; the gate evaluates only the known subtotal and must
     not be treated as a hard budget or a fail-closed unknown-cost control.
-11. Otherwise run synthesis with its own compiled system message and WORKER OUTPUT data blocks.
+11. Otherwise run synthesis with its own compiled system message and WORKER OUTPUT data blocks,
+    through the synthesis stage's declared provider.
 12. Persist final usage and run state. `result.md` is written when synthesis returns usable output
     and its stage is persisted as succeeded, including an incomplete synthesis; run success still
     requires every worker and synthesis stage to have completed normally.
@@ -31,6 +34,10 @@ A run without synthesis succeeds only if every worker is succeeded and completed
 synthesis, the run succeeds only if every declared worker and synthesis is succeeded and completed
 normally. `synthesis.depends_on` controls synthesis input and dependency gating; it does not remove
 other declared workers from the final whole-run success condition.
+
+The programmatic runner API is `run_job(job, providers, ...)`, where `providers` is a mapping from
+provider ID to a `Provider`. There is no generic single-provider compatibility form. A missing mapping
+entry is rejected before a run directory is created.
 
 ## Operator preflight and review
 

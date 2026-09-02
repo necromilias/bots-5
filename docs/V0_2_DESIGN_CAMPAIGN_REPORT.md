@@ -491,3 +491,27 @@ The next action is zero-spend human design adjudication:
 4. only then authorize implementation.
 
 No additional provider run is required at this stage.
+
+## V0.2 implementation closure
+
+The accepted implementation specification corrected the three blocking design contradictions above:
+
+- schema v2 is closed and adds required top-level `providers`, while schema v1 remains unchanged;
+- validated `LocalOpenAIConfig` data is carried by `Job` and only non-secret provider configuration is
+  persisted;
+- `run_job(job, providers, ...)` is the sole runner form, and every declared stage is routed through
+  its provider ID.
+
+The implementation adds one built-in non-streaming `OpenAICompatibleProvider`. It accepts an explicit
+HTTP/HTTPS API base, appends `/chat/completions`, optionally reads a configured environment-indirected
+Bearer credential, preserves unknown local cost, and uses independent provider-local normalization:
+OpenRouter retains its authoritative classifier while the local provider matches it, including
+reasoning-only incomplete responses. No retries, streaming, discovery, plugins, planner, tools, RAG,
+richer DAG, stage reuse/resume, UI, daemon, or Organisational Memory update is part of this closure;
+no live V0.2 provider canary has been performed.
+
+Deterministic offline implementation validation is the current implementation evidence. It covered the
+full deterministic test suite, schema-v1 and
+schema-v2 examples, compileall, diff whitespace, secret absence, and byte-preservation of the frozen
+`docs/OPERATING_PROCEDURE_V1.md`. The implementation candidate remains uncommitted and unmerged to
+`main` for human review.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Mapping
 from decimal import Decimal
 from pathlib import Path
 
@@ -227,8 +228,36 @@ def _all_stage_records(job: Job) -> list[StageRecord]:
     return records
 
 
-async def run_job(job: Job, provider: Provider, *, run_id: str | None = None) -> RunResult:
+def _validate_provider_mapping(job: Job, providers: Mapping[str, Provider]) -> None:
+    if not isinstance(providers, Mapping):
+        raise Bots5Error("providers must be a mapping of provider IDs to providers")
+    required = {worker.provider for worker in job.workers}
+    if job.synthesis is not None:
+        required.add(job.synthesis.provider)
+    missing = sorted(provider_id for provider_id in required if provider_id not in providers)
+    if missing:
+        raise Bots5Error(
+            "missing provider mapping for: " + ", ".join(repr(provider_id) for provider_id in missing)
+        )
+    invalid = sorted(
+        provider_id
+        for provider_id in required
+        if not callable(getattr(providers[provider_id], "complete", None))
+    )
+    if invalid:
+        raise Bots5Error(
+            "invalid provider mapping for: " + ", ".join(repr(provider_id) for provider_id in invalid)
+        )
+
+
+async def run_job(
+    job: Job,
+    providers: Mapping[str, Provider],
+    *,
+    run_id: str | None = None,
+) -> RunResult:
     validate_referenced_files(job)
+    _validate_provider_mapping(job, providers)
     specs: tuple[WorkerSpec | SynthesisSpec, ...] = job.workers
     if job.synthesis is not None:
         specs += (job.synthesis,)
@@ -288,7 +317,7 @@ async def run_job(job: Job, provider: Provider, *, run_id: str | None = None) ->
                     record=record,
                     system_message=system_messages[spec.id],
                     user_message=worker_user,
-                    provider=provider,
+                    provider=providers[spec.provider],
                     semaphore=semaphore,
                     dirs=dirs,
                     events=events,
@@ -379,7 +408,7 @@ async def run_job(job: Job, provider: Provider, *, run_id: str | None = None) ->
             record=synth_record,
             system_message=system_messages[synth.id],
             user_message=synthesis_user,
-            provider=provider,
+            provider=providers[synth.provider],
             semaphore=semaphore,
             dirs=dirs,
             events=events,

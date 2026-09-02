@@ -6,13 +6,16 @@ import os
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .errors import FileValidationError, InvalidJsonError, ValidationError
 from .models import (
     ExecutionLimits,
     InputSpec,
     Job,
+    LocalOpenAIConfig,
     OutputConfig,
+    ProviderConfigs,
     SynthesisSpec,
     WorkerSpec,
 )
@@ -20,7 +23,16 @@ from .paths import resolve_job_relative, resolve_runs_dir, validate_stage_id
 from .prompts import parse_worker_contract
 
 
-TOP_KEYS = {"schema_version", "name", "inputs", "execution", "workers", "synthesis", "output"}
+TOP_KEYS_V1 = {
+    "schema_version",
+    "name",
+    "inputs",
+    "execution",
+    "workers",
+    "synthesis",
+    "output",
+}
+TOP_KEYS_V2 = TOP_KEYS_V1 | {"providers"}
 INPUT_KEYS = {"label", "path"}
 EXEC_KEYS = {
     "max_parallelism",
@@ -38,7 +50,11 @@ WORKER_KEYS = {
 }
 SYNTH_KEYS = WORKER_KEYS | {"depends_on"}
 OUTPUT_KEYS = {"runs_dir"}
-PROVIDERS = {"openrouter"}
+PROVIDERS_V1 = {"openrouter"}
+PROVIDERS_V2 = {"openrouter", "local_openai"}
+PROVIDER_CONFIG_KEYS = {"local_openai"}
+LOCAL_OPENAI_KEYS = {"base_url", "api_key_env"}
+TOP_KEYS = TOP_KEYS_V1
 
 
 def _reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -142,18 +158,67 @@ def _decimal_or_none(obj: dict[str, Any], key: str, ctx: str) -> Decimal | None:
     return result
 
 
-def _provider(value: str, ctx: str) -> str:
-    if value not in PROVIDERS:
+def _provider(value: str, ctx: str, supported_providers: set[str]) -> str:
+    if value not in supported_providers:
         raise ValidationError(f"{ctx}.provider: unsupported provider {value!r}")
     return value
 
 
-def _worker(obj: Any, base: Path, index: int) -> WorkerSpec:
+def _validate_http_base_url(value: str, ctx: str) -> str:
+    if value != value.strip():
+        raise ValidationError(f"{ctx}: expected an HTTP/HTTPS URL without surrounding whitespace")
+    parsed = None
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        _ = parsed.port
+    except ValueError:
+        hostname = None
+    if (
+        parsed is None
+        or parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or "?" in value
+        or "#" in value
+    ):
+        raise ValidationError(f"{ctx}: expected an HTTP/HTTPS API base URL")
+    return value.rstrip("/")
+
+
+def _provider_configs(obj: Any) -> ProviderConfigs:
+    data = _closed(obj, PROVIDER_CONFIG_KEYS, set(), "providers")
+    if "local_openai" not in data:
+        return ProviderConfigs()
+    local = data["local_openai"]
+    ctx = "providers.local_openai"
+    local_data = _closed(local, LOCAL_OPENAI_KEYS, {"base_url"}, ctx)
+    api_key_env = None
+    if "api_key_env" in local_data and local_data["api_key_env"] is not None:
+        api_key_env = _str(local_data, "api_key_env", ctx)
+    return ProviderConfigs(
+        local_openai=LocalOpenAIConfig(
+            base_url=_validate_http_base_url(
+                _str(local_data, "base_url", ctx), f"{ctx}.base_url"
+            ),
+            api_key_env=api_key_env,
+        )
+    )
+
+
+def _worker(
+    obj: Any,
+    base: Path,
+    index: int,
+    supported_providers: set[str],
+) -> WorkerSpec:
     ctx = f"workers[{index}]"
     data = _closed(obj, WORKER_KEYS, WORKER_KEYS, ctx)
     stage_id = _str(data, "id", ctx)
     validate_stage_id(stage_id, f"{ctx}.id")
-    provider = _provider(_str(data, "provider", ctx), ctx)
+    provider = _provider(_str(data, "provider", ctx), ctx, supported_providers)
     return WorkerSpec(
         id=stage_id,
         provider=provider,
@@ -165,7 +230,11 @@ def _worker(obj: Any, base: Path, index: int) -> WorkerSpec:
     )
 
 
-def _synthesis(obj: Any, base: Path) -> SynthesisSpec | None:
+def _synthesis(
+    obj: Any,
+    base: Path,
+    supported_providers: set[str],
+) -> SynthesisSpec | None:
     if obj is None:
         return None
     ctx = "synthesis"
@@ -182,7 +251,7 @@ def _synthesis(obj: Any, base: Path) -> SynthesisSpec | None:
         if dep in parsed:
             raise ValidationError(f"synthesis.depends_on: duplicate dependency {dep!r}")
         parsed.append(dep)
-    provider = _provider(_str(data, "provider", ctx), ctx)
+    provider = _provider(_str(data, "provider", ctx), ctx, supported_providers)
     return SynthesisSpec(
         id=stage_id,
         provider=provider,
@@ -196,9 +265,14 @@ def _synthesis(obj: Any, base: Path) -> SynthesisSpec | None:
 
 
 def validate_job(data: dict[str, Any], base_dir: Path) -> Job:
-    data = _closed(data, TOP_KEYS, TOP_KEYS, "job")
-    if type(data["schema_version"]) is not int or data["schema_version"] != 1:
-        raise ValidationError("schema_version: unsupported schema version; expected 1")
+    if type(data) is not dict:
+        raise ValidationError("job: expected object")
+    schema_version = data.get("schema_version")
+    if type(schema_version) is not int or schema_version not in (1, 2):
+        raise ValidationError("schema_version: unsupported schema version; expected 1 or 2")
+    top_keys = TOP_KEYS_V1 if schema_version == 1 else TOP_KEYS_V2
+    data = _closed(data, top_keys, top_keys, "job")
+    supported_providers = PROVIDERS_V1 if schema_version == 1 else PROVIDERS_V2
     name = _str(data, "name", "job")
 
     raw_inputs = data["inputs"]
@@ -229,13 +303,15 @@ def validate_job(data: dict[str, Any], base_dir: Path) -> Job:
     raw_workers = data["workers"]
     if type(raw_workers) is not list:
         raise ValidationError("workers: expected list")
-    workers = tuple(_worker(item, base_dir, i) for i, item in enumerate(raw_workers))
+    workers = tuple(
+        _worker(item, base_dir, i, supported_providers) for i, item in enumerate(raw_workers)
+    )
     worker_ids = [worker.id for worker in workers]
     duplicates = sorted({wid for wid in worker_ids if worker_ids.count(wid) > 1})
     if duplicates:
         raise ValidationError(f"workers: duplicate worker id(s): {', '.join(duplicates)}")
 
-    synthesis = _synthesis(data["synthesis"], base_dir)
+    synthesis = _synthesis(data["synthesis"], base_dir, supported_providers)
     worker_set = set(worker_ids)
     if synthesis is not None:
         if synthesis.id in worker_set:
@@ -248,15 +324,25 @@ def validate_job(data: dict[str, Any], base_dir: Path) -> Job:
 
     raw_output = _closed(data["output"], OUTPUT_KEYS, OUTPUT_KEYS, "output")
     runs_dir = resolve_runs_dir(_str(raw_output, "runs_dir", "output"), base_dir)
+    providers = ProviderConfigs() if schema_version == 1 else _provider_configs(data["providers"])
+    declared_specs: list[WorkerSpec | SynthesisSpec] = list(workers)
+    if synthesis is not None:
+        declared_specs.append(synthesis)
+    if any(spec.provider == "local_openai" for spec in declared_specs):
+        if providers.local_openai is None:
+            raise ValidationError(
+                "providers.local_openai: required when a stage declares local_openai"
+            )
 
     return Job(
-        schema_version=1,
+        schema_version=schema_version,
         name=name,
         inputs=tuple(inputs),
         execution=execution,
         workers=workers,
         synthesis=synthesis,
         output=OutputConfig(runs_dir=runs_dir),
+        providers=providers,
     )
 
 
@@ -319,7 +405,7 @@ def job_to_dict(job: Job) -> dict[str, Any]:
         synthesis = stage_common(job.synthesis)
         synthesis["depends_on"] = list(job.synthesis.depends_on)
 
-    return {
+    result = {
         "schema_version": job.schema_version,
         "name": job.name,
         "inputs": [{"label": i.label, "path": str(i.path)} for i in job.inputs],
@@ -336,3 +422,14 @@ def job_to_dict(job: Job) -> dict[str, Any]:
         "synthesis": synthesis,
         "output": {"runs_dir": str(job.output.runs_dir)},
     }
+    if job.schema_version == 2:
+        result["providers"] = {}
+        if job.providers.local_openai is not None:
+            result["providers"]["local_openai"] = {
+                "base_url": job.providers.local_openai.base_url,
+            }
+            if job.providers.local_openai.api_key_env is not None:
+                result["providers"]["local_openai"]["api_key_env"] = (
+                    job.providers.local_openai.api_key_env
+                )
+    return result

@@ -7,13 +7,21 @@ untrusted text and has no execution authority.
 
 ## Secrets
 
-`OPENROUTER_API_KEY` is read from the environment only. It is never intentionally written into
+`OPENROUTER_API_KEY` is read from the environment only. An optional schema-v2
+`providers.local_openai.api_key_env` value is manifest configuration and may appear as a non-secret
+environment-variable name in `job.resolved.json`. The secret value named by that setting, like
+`OPENROUTER_API_KEY`, is read from the environment only and is never intentionally written into
 manifests, resolved jobs, run/stage metadata, usage, events, status/inspect output, examples, or
 generated project files. Provider errors are reduced and redacted at the provider boundary.
 
+The local provider accepts only an operator-supplied HTTP/HTTPS API base. It rejects URL userinfo,
+query strings, fragments, and surrounding whitespace, appends `/chat/completions`, sends one
+non-streaming request, and performs no endpoint or model discovery. Without `api_key_env`, no
+authorization header is sent.
+
 ## Filesystem
 
-V0 reads only the job file and explicitly declared input/prompt files. Relative paths resolve against
+V0.2 reads only the job file and explicitly declared input/prompt files. Relative paths resolve against
 the job file's parent. V0 writes only beneath the validated resolved `runs_dir`. Generated stage IDs
 are restricted to a filename-safe grammar. Run IDs are harness-generated. Artifact replacement
 refuses symlink destinations; a configured existing `runs_dir` symlink is refused when the run tree
