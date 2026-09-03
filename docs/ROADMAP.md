@@ -61,31 +61,27 @@ document remain unchanged.
 
 See `docs/V0_2_DESIGN_CAMPAIGN_REPORT.md` for the campaign evidence and implementation closure.
 
-## Linux v0.1 — native desktop scope/design
+## Linux v0.1 — native desktop design accepted
 
-Linux v0.1 product/scope/design is the next active milestone.
+Linux v0.1 product, architecture, implementation-technology, and construction-sequence decisions have
+been human-adjudicated and accepted. See `docs/LINUX_V0_1_DESIGN.md` for the build-facing contract.
 
-Before framework, architecture, widget, or implementation choices, define and human-adjudicate the
-first useful native Linux product.
+The accepted target is a real native Linux desktop application centred on persistent multi-chat with
+lossless lineage, concurrent streaming generation, deterministic context construction, reusable
+attachments, search, provenance/inspection, backup/recovery, and a thin operational campaign surface.
 
-Current hard constraints:
+The implementation is intentionally sequenced as validated vertical slices: walking skeleton,
+conversation truth, real generation, concurrency/workspace, provider/model usability,
+context/attachments, search, inspection, recovery/import-export, campaign integration, product
+finishing/packaging, and a final torture run.
 
-- the application is a real native Linux desktop application;
-- web UI, PWA, Electron, and browser-wrapper substitutes are excluded;
-- Chat is an early real workload;
-- multiple persistent chats and chat switching matter;
-- OpenAI API/provider capability required by the accepted workload is foundational;
-- any provider/API implementation identified as a prerequisite remains separately scoped and approved;
-- future Code/Git tooling is intended but deferred from Linux v0.1;
-- a native Android application is intended but deferred from Linux v0.1.
+The current repository state does not yet claim that Linux v0.1 desktop features are implemented.
+Implementation edits, dependency changes, provider/API calls, commits, and landing remain separately
+approved consequences.
 
-Campaign desktop capability remains available according to concrete workflow need, but a complete
-campaign UI is not a prerequisite to beginning useful Chat work.
-
-Code/Git, Android, daemon/remote-client architecture, tool frameworks, and other speculative future
-capability must not be designed into existence merely because they are intended later.
-
-Discussion and product/scope/design work do not authorize implementation.
+Future Code/Git, Android, persistent daemon/remote clients, MCP/tool frameworks, scheduling, RAG,
+mode-governed capability envelopes, and other Future Fuckery remain deferred unless a concrete Linux
+v0.1 blocker separately promotes a bounded requirement.
 
 ## Later candidates
 

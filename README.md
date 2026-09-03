@@ -21,6 +21,19 @@ V0.2 adds a schema-v2, built-in non-streaming `local_openai` provider. Schema v1
 and OpenRouter-only; schema v2 can route each worker and synthesis stage to OpenRouter or an
 operator-supplied local OpenAI-compatible HTTP/HTTPS endpoint.
 
+## Linux v0.1 desktop direction
+
+The Linux v0.1 native desktop product, architecture, implementation-technology baseline, and phased
+construction sequence have been accepted. See `docs/LINUX_V0_1_DESIGN.md` for the build-facing target.
+
+That document is target design, not an implementation-status claim. The current CLI/runtime behaviour
+and dependencies described below remain the implemented state until separately approved desktop changes
+land.
+
+Linux v0.1 implementation remains separately gated. Future Android, Code/Git, daemon/remote-client,
+MCP/tool frameworks, scheduling, RAG, and operating-mode capability systems remain deferred unless a
+concrete v0.1 blocker separately promotes them.
+
 ## Install
 
 Requires Python 3.12+.

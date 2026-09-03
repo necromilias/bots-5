@@ -60,3 +60,34 @@ its own terminal state immediately. Synthesis is evaluated only after the full w
 
 No rich DAG, autonomous planning, agent framework, shell/tools, repository mutation, RAG, OMC,
 database, daemon, web server, GUI, retries, or distributed execution.
+
+## Accepted Linux v0.1 target architecture
+
+The preceding sections describe currently implemented V0/V0.2 behaviour. They remain authoritative for
+what exists until separately approved Linux v0.1 changes land.
+
+The accepted Linux v0.1 target architecture is defined in `LINUX_V0_1_DESIGN.md`. In summary:
+
+- one native Qt/PySide6 desktop process hosts one authoritative, separable/headless-testable B.O.T.S.
+  core for v0.1;
+- clients use commands, queries, and events rather than mutating persistence directly;
+- mutable application state is transactional SQLite behind a core-owned store; attachment payloads and
+  campaign evidence remain filesystem-backed;
+- chats use immutable message lineage; edits/regeneration create new branches/siblings rather than
+  rewriting history;
+- generation attempts and immutable request snapshots are first-class provenance;
+- one execution manager owns concurrent chat, summary, and campaign work;
+- a B.O.T.S.-owned generation-capability contract normalizes provider/local-engine protocols without
+  making OpenAI's schema the internal domain or deleting backend-specific capabilities;
+- deterministic context construction, derived/rebuildable search, structured failure semantics,
+  explicit recovery, and single-authority ownership are core responsibilities;
+- multiple windows share one authority; future Android/remote clients may later talk to that authority,
+  but no daemon/network service is required solely for Linux v0.1.
+
+The architectural invariant is: intelligence is not capability, capability is not authority, and
+authority is not execution location. Model output remains data/proposal until B.O.T.S. authority grants
+a separately defined capability and scope.
+
+The accepted target introduces database, GUI, streaming, wider backend, and recovery concepts that are
+explicitly absent from the current V0/V0.2 implementation. Do not read this target section as evidence
+that those features have already landed.
