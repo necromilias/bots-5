@@ -16,6 +16,7 @@ from bots5.infrastructure.generation.fake import FakeStreamingBackend
 from bots5.infrastructure.generation.openai_compatible import OpenAICompatibleStreamingBackend
 from bots5.infrastructure.persistence import SQLiteAppStateStore, upgrade_database
 from bots5.providers.openai_compatible import OpenAICompatibleProvider
+from bots5.desktop.profile import DesktopSessionInfo
 
 
 @dataclass(slots=True)
@@ -23,6 +24,7 @@ class DesktopRuntime:
     paths: AppPaths
     authority: AuthorityLock
     application: BotsApplication
+    session: DesktopSessionInfo
 
     async def close(self) -> None:
         await self.application.close()
@@ -84,7 +86,16 @@ def build_runtime(
             base_url=selected_base_url,
             api_key_env=selected_api_key_env,
         )
-        return DesktopRuntime(paths, authority, application)
+        return DesktopRuntime(
+            paths,
+            authority,
+            application,
+            DesktopSessionInfo(
+                backend_id=backend_id,
+                model=selected_model,
+                provider_id=provider_id,
+            ),
+        )
     except Exception:
         authority.release()
         raise
@@ -149,7 +160,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         async def serve() -> None:
-            window = MainWindow(runtime.application)
+            window = MainWindow(runtime.application, runtime.session)
             closed = asyncio.Event()
             window.closed.connect(closed.set)
             try:
@@ -157,7 +168,7 @@ def main(argv: list[str] | None = None) -> int:
                 window.show()
                 await closed.wait()
             finally:
-                window.stop_bridge()
+                await window.stop_bridge_async()
                 await runtime.close()
 
         try:

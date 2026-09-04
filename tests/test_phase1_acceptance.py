@@ -23,8 +23,13 @@ def test_walking_skeleton_survives_close_and_restart(tmp_path):
             assert chat_id is not None
             window.composer.setPlainText("hello from the desktop")
             await window._send_message()
-            await asyncio.sleep(0.05)
-            _, messages = await runtime.application.open_chat(chat_id)
+            for _ in range(100):
+                _, messages = await runtime.application.open_chat(chat_id)
+                if messages and messages[-1].state.value == "complete":
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("desktop generation did not terminalize")
             assert messages[-1].content == "fake response to: hello from the desktop"
             assert messages[-1].state.value == "complete"
         finally:

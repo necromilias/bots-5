@@ -3,82 +3,200 @@ from __future__ import annotations
 import asyncio
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QClipboard
 from PySide6.QtWidgets import (
+    QDockWidget,
+    QFrame,
     QHBoxLayout,
     QLabel,
-    QListWidget,
     QMainWindow,
-    QPlainTextEdit,
     QPushButton,
-    QSplitter,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from bots5.core.application import BotsApplication
 from bots5.core.events import CoreEvent
-from bots5.domain.models import MessageRole
+from bots5.domain.models import AttemptState, Chat, Message, MessageRole
 
 from .bridge import CoreEventBridge
+from .profile import DesktopSessionInfo
+from .theme import apply_draft1_theme
+from .widgets import ComposerEdit, InspectorPanel, LeftRail, MessageRow, TopBar, TranscriptView
+
+
+_TERMINAL_EVENT_KINDS = frozenset(
+    {
+        "generation_completed",
+        "generation_incomplete",
+        "generation_failed",
+        "generation_aborted",
+    }
+)
 
 
 class MainWindow(QMainWindow):
     closed = Signal()
 
-    def __init__(self, application: BotsApplication):
+    def __init__(
+        self,
+        application: BotsApplication,
+        session: DesktopSessionInfo | None = None,
+    ) -> None:
         super().__init__()
         self._application = application
+        self._session = session or DesktopSessionInfo("fake", "fake-v0.1")
         self._bridge = CoreEventBridge(application)
         self._chat_ids: list[str] = []
         self._current_chat_id: str | None = None
+        self._current_chat: Chat | None = None
+        self._current_messages: tuple[Message, ...] = ()
+        self._selected_message: Message | None = None
         self._refresh_tasks: set[asyncio.Task[None]] = set()
         self._refresh_generation = 0
         self._active_attempt_id: str | None = None
+        self._generation_busy = False
+        self._editing_message_id: str | None = None
+        self._editing_chat_id: str | None = None
 
         self.setWindowTitle("B.O.T.S. 5")
-        self.resize(900, 600)
+        self.resize(1180, 760)
+        application_instance = self._qt_application()
+        if application_instance is not None:
+            apply_draft1_theme(application_instance)
         self._build_ui()
         self._bridge.event_received.connect(self._on_event)
 
+    @staticmethod
+    def _qt_application():
+        from PySide6.QtWidgets import QApplication
+
+        return QApplication.instance()
+
     def _build_ui(self) -> None:
         root = QWidget(self)
-        layout = QVBoxLayout(root)
-        splitter = QSplitter(Qt.Horizontal, root)
+        root.setObjectName("draft1Root")
+        root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
 
-        left = QWidget(splitter)
-        left_layout = QVBoxLayout(left)
-        left_layout.addWidget(QLabel("Chats", left))
-        self.chat_list = QListWidget(left)
-        self.chat_list.currentRowChanged.connect(self._on_chat_selected)
-        left_layout.addWidget(self.chat_list)
-        self.new_chat_button = QPushButton("New Chat", left)
-        self.new_chat_button.clicked.connect(self._on_new_chat)
-        left_layout.addWidget(self.new_chat_button)
+        self.top_bar = TopBar(self._session, root)
+        self.top_bar.rail_toggle_requested.connect(self._toggle_rail)
+        self.top_bar.details_toggled.connect(self._toggle_inspector)
+        root_layout.addWidget(self.top_bar)
 
-        right = QWidget(splitter)
-        right_layout = QVBoxLayout(right)
-        self.transcript = QPlainTextEdit(right)
-        self.transcript.setReadOnly(True)
-        right_layout.addWidget(self.transcript)
-        composer_row = QHBoxLayout()
-        self.composer = QPlainTextEdit(right)
+        body = QWidget(root)
+        body_layout = QHBoxLayout(body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(0)
+
+        self.rail = LeftRail(body)
+        self.rail.new_chat_requested.connect(self._on_new_chat)
+        self.rail.chat_list.currentRowChanged.connect(self._on_chat_selected)
+        body_layout.addWidget(self.rail)
+        self.chat_list = self.rail.chat_list
+        self.new_chat_button = self.rail.new_chat_button
+
+        workspace = QWidget(body)
+        workspace.setObjectName("workspace")
+        workspace_layout = QVBoxLayout(workspace)
+        workspace_layout.setContentsMargins(18, 10, 18, 12)
+        workspace_layout.setSpacing(8)
+
+        self.chat_title = QLabel("New chat", workspace)
+        self.chat_title.setObjectName("chatTitle")
+        workspace_layout.addWidget(self.chat_title)
+
+        self.transcript = TranscriptView(workspace)
+        workspace_layout.addWidget(self.transcript, 1)
+
+        self.composer_frame = QFrame(workspace)
+        self.composer_frame.setObjectName("composerFrame")
+        composer_layout = QVBoxLayout(self.composer_frame)
+        composer_layout.setContentsMargins(10, 8, 10, 8)
+        composer_layout.setSpacing(5)
+
+        editing_row = QHBoxLayout()
+        self.editing_label = QLabel("Editing message", self.composer_frame)
+        self.editing_label.setObjectName("editingLabel")
+        self.editing_label.setVisible(False)
+        editing_row.addWidget(self.editing_label)
+        self.cancel_edit_button = QToolButton(self.composer_frame)
+        self.cancel_edit_button.setText("Cancel edit")
+        self.cancel_edit_button.setToolTip("Return to composing a new message")
+        self.cancel_edit_button.setVisible(False)
+        self.cancel_edit_button.clicked.connect(self._clear_editing)
+        editing_row.addWidget(self.cancel_edit_button)
+        editing_row.addStretch(1)
+        composer_layout.addLayout(editing_row)
+
+        self.generation_indicator = QLabel("● Generating…", self.composer_frame)
+        self.generation_indicator.setObjectName("generationIndicator")
+        self.generation_indicator.setAccessibleName("Generation activity")
+        self.generation_indicator.setToolTip("A response is being generated")
+        self.generation_indicator.setVisible(False)
+        composer_layout.addWidget(self.generation_indicator)
+
+        composer_controls = QHBoxLayout()
+        composer_controls.setSpacing(6)
+        self.attachment_button = self._disabled_composer_button(
+            "Attach",
+            "Attachments are not implemented in this UI slice.",
+        )
+        composer_controls.addWidget(self.attachment_button)
+
+        self.tool_button = self._disabled_composer_button(
+            "Tools",
+            "Tool invocation is not implemented in this UI slice.",
+        )
+        composer_controls.addWidget(self.tool_button)
+
+        self.composer = ComposerEdit(self.composer_frame)
         self.composer.setPlaceholderText("Message")
-        self.composer.setFixedHeight(80)
-        composer_row.addWidget(self.composer)
-        self.send_button = QPushButton("Send", right)
-        self.send_button.clicked.connect(self._on_send)
-        composer_row.addWidget(self.send_button)
-        self.cancel_button = QPushButton("Stop", right)
-        self.cancel_button.setEnabled(False)
-        self.cancel_button.clicked.connect(self._on_cancel)
-        composer_row.addWidget(self.cancel_button)
-        right_layout.addLayout(composer_row)
+        self.composer.setMinimumHeight(56)
+        self.composer.setMaximumHeight(112)
+        self.composer.send_requested.connect(self._on_send)
+        self.composer.textChanged.connect(self._update_controls)
+        composer_controls.addWidget(self.composer, 1)
 
-        splitter.addWidget(left)
-        splitter.addWidget(right)
-        splitter.setSizes([220, 680])
-        layout.addWidget(splitter)
+        self.send_button = QPushButton("Send", self.composer_frame)
+        self.send_button.setObjectName("sendButton")
+        self.send_button.setToolTip("Send message (Enter)")
+        self.send_button.clicked.connect(self._on_send)
+        composer_controls.addWidget(self.send_button)
+
+        self.cancel_button = QPushButton("Stop", self.composer_frame)
+        self.cancel_button.setObjectName("stopButton")
+        self.cancel_button.setToolTip("Stop the active generation")
+        self.cancel_button.clicked.connect(self._on_cancel)
+        composer_controls.addWidget(self.cancel_button)
+        composer_layout.addLayout(composer_controls)
+        workspace_layout.addWidget(self.composer_frame)
+        body_layout.addWidget(workspace, 1)
+        root_layout.addWidget(body, 1)
         self.setCentralWidget(root)
+
+        self.inspector = InspectorPanel(self)
+        self.inspector_dock = QDockWidget("Details", self)
+        self.inspector_dock.setObjectName("inspectorDock")
+        self.inspector_dock.setAllowedAreas(Qt.DockWidgetArea.RightDockWidgetArea)
+        self.inspector_dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetClosable)
+        self.inspector_dock.setMinimumWidth(310)
+        self.inspector_dock.setWidget(self.inspector)
+        self.inspector_dock.visibilityChanged.connect(self._sync_inspector_button)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.inspector_dock)
+        self.inspector_dock.hide()
+        self._update_controls()
+
+    @staticmethod
+    def _disabled_composer_button(text: str, tooltip: str) -> QToolButton:
+        button = QToolButton()
+        button.setObjectName("disabledAffordance")
+        button.setText(text)
+        button.setToolTip(tooltip)
+        button.setEnabled(False)
+        return button
 
     async def initialize(self) -> None:
         self._bridge.start()
@@ -88,87 +206,227 @@ class MainWindow(QMainWindow):
             chats = await self._application.list_chats()
         self._replace_chat_list(chats)
         if chats:
-            self.chat_list.setCurrentRow(0)
+            self._current_chat_id = chats[0].id
+            self.rail.chat_list.setCurrentRow(0)
             await self._refresh_transcript(chats[0].id)
 
-    def _replace_chat_list(self, chats) -> None:
+    def _replace_chat_list(self, chats: tuple[Chat, ...] | list[Chat]) -> None:
+        chats = tuple(chats)
+        selected = self._current_chat_id
         self._chat_ids = [chat.id for chat in chats]
-        self.chat_list.blockSignals(True)
-        self.chat_list.clear()
-        self.chat_list.addItems([chat.title for chat in chats])
-        self.chat_list.blockSignals(False)
+        self.rail.set_chats(chats, selected)
+        if self._current_chat_id not in self._chat_ids:
+            self._current_chat_id = self._chat_ids[0] if self._chat_ids else None
+        self._update_controls()
+
+    def _select_chat_row(self, chat_id: str | None) -> None:
+        if chat_id is None or chat_id not in self._chat_ids:
+            return
+        self.rail.chat_list.setCurrentRow(self._chat_ids.index(chat_id))
 
     def _on_chat_selected(self, row: int) -> None:
+        if self._generation_busy:
+            self._select_chat_row(self._current_chat_id)
+            return
         if 0 <= row < len(self._chat_ids):
-            self._current_chat_id = self._chat_ids[row]
+            chat_id = self._chat_ids[row]
+            if chat_id != self._current_chat_id:
+                self._clear_editing()
+            self._current_chat_id = chat_id
+            self._selected_message = None
             self._schedule(self._refresh_transcript(self._current_chat_id))
 
+    def _toggle_rail(self) -> None:
+        self.rail.set_collapsed(not self.rail.collapsed)
+
     def _on_new_chat(self) -> None:
-        self._schedule(self._create_chat())
+        if not self._generation_busy:
+            self._clear_editing()
+            self._schedule(self._create_chat())
 
     async def _create_chat(self) -> None:
         chat = await self._application.create_chat()
         chats = await self._application.list_chats()
+        self._clear_editing()
+        self._current_chat_id = chat.id
         self._replace_chat_list(chats)
-        self.chat_list.setCurrentRow(self._chat_ids.index(chat.id))
+        self._select_chat_row(chat.id)
+        await self._refresh_transcript(chat.id)
 
     def _on_send(self) -> None:
-        self._schedule(self._send_message())
-
-    def _on_cancel(self) -> None:
-        self._schedule(self._cancel_generation())
+        if not self._generation_busy:
+            self._schedule(self._send_message())
 
     async def _send_message(self) -> None:
-        if self._current_chat_id is None:
+        if self._generation_busy or self._current_chat_id is None:
             return
         text = self.composer.toPlainText()
         if not text.strip():
             return
-        self.composer.clear()
+        chat_id = self._current_chat_id
+        editing_message_id = self._valid_edit_target(chat_id)
+        self._set_generation_busy(True)
         try:
-            attempt = await self._application.send_message(self._current_chat_id, text)
-            current_attempt = next(
-                (
-                    item
-                    for item in await self._application.list_generation_attempts(self._current_chat_id)
-                    if item.id == attempt.id
-                ),
-                attempt,
-            )
-            if current_attempt.state.value == "running":
-                self._active_attempt_id = attempt.id
-                self.cancel_button.setEnabled(True)
+            if editing_message_id is None:
+                attempt = await self._application.send_message(chat_id, text)
+            else:
+                attempt = await self._application.edit_message(chat_id, editing_message_id, text)
         except Exception as exc:
+            self._set_generation_busy(False)
             self.statusBar().showMessage(str(exc))
+            return
+        self.composer.clear()
+        self._clear_editing()
+        self._set_active_attempt(attempt.id, attempt.state)
+        await self._refresh_attempt_state(chat_id, attempt.id)
+
+    async def _refresh_attempt_state(self, chat_id: str, attempt_id: str) -> None:
+        attempts = await self._application.list_generation_attempts(chat_id)
+        current = next((attempt for attempt in attempts if attempt.id == attempt_id), None)
+        if current is None or current.state is AttemptState.RUNNING:
+            self._set_generation_busy(True)
+            self._active_attempt_id = attempt_id
+        else:
+            self._active_attempt_id = None
+            self._set_generation_busy(False)
+        await self._refresh_transcript(chat_id)
+
+    def _on_cancel(self) -> None:
+        if self._active_attempt_id is not None:
+            self._schedule(self._cancel_generation())
 
     async def _cancel_generation(self) -> None:
-        if self._active_attempt_id is None:
+        attempt_id = self._active_attempt_id
+        chat_id = self._current_chat_id
+        if attempt_id is None or chat_id is None:
             return
         try:
-            await self._application.cancel_generation(self._active_attempt_id)
+            await self._application.cancel_generation(attempt_id)
         except Exception as exc:
             self.statusBar().showMessage(str(exc))
         finally:
             self._active_attempt_id = None
-            self.cancel_button.setEnabled(False)
+            self._set_generation_busy(False)
+            await self._refresh_transcript(chat_id)
+
+    def _on_copy_message(self, message: Message) -> None:
+        application = self._qt_application()
+        if application is not None:
+            application.clipboard().setText(message.content, QClipboard.Mode.Clipboard)
+        self.statusBar().showMessage("Message copied", 2000)
+
+    def _on_edit_message(self, message: Message) -> None:
+        if (
+            self._generation_busy
+            or self._current_chat_id != message.chat_id
+            or message.role is not MessageRole.USER
+            or message.state.value != "sent"
+        ):
+            return
+        self._editing_message_id = message.id
+        self._editing_chat_id = message.chat_id
+        self.composer.setPlainText(message.content)
+        self.editing_label.setText(f"Editing revision {message.revision}")
+        self.editing_label.setVisible(True)
+        self.cancel_edit_button.setVisible(True)
+        self.composer.setFocus()
+        self._update_controls()
+
+    def _clear_editing(self) -> None:
+        self._editing_message_id = None
+        self._editing_chat_id = None
+        self.editing_label.setVisible(False)
+        self.cancel_edit_button.setVisible(False)
+        self._update_controls()
+
+    def _valid_edit_target(self, chat_id: str) -> str | None:
+        message_id = self._editing_message_id
+        if message_id is None:
+            return None
+        if self._editing_chat_id is not None and self._editing_chat_id != chat_id:
+            self._clear_editing()
+            return None
+        target = next(
+            (message for message in self._current_messages if message.id == message_id),
+            None,
+        )
+        if (
+            target is None
+            or target.chat_id != chat_id
+            or target.role is not MessageRole.USER
+            or target.state.value != "sent"
+        ):
+            self._clear_editing()
+            return None
+        return message_id
+
+    def _on_regenerate_message(self, message: Message) -> None:
+        if not self._generation_busy and self._current_chat_id is not None:
+            self._schedule(self._regenerate_message(message))
+
+    async def _regenerate_message(self, message: Message) -> None:
+        if self._current_chat_id is None:
+            return
+        chat_id = self._current_chat_id
+        self._set_generation_busy(True)
+        try:
+            attempt = await self._application.regenerate_message(chat_id, message.id)
+        except Exception as exc:
+            self._set_generation_busy(False)
+            self.statusBar().showMessage(str(exc))
+            return
+        self._set_active_attempt(attempt.id, attempt.state)
+        await self._refresh_attempt_state(chat_id, attempt.id)
+
+    def _on_inspect_message(self, message: Message) -> None:
+        self._selected_message = message
+        self.top_bar.details_button.setChecked(True)
+        self._schedule(self._refresh_inspector())
+
+    def _set_active_attempt(self, attempt_id: str, state: AttemptState) -> None:
+        if state is AttemptState.RUNNING:
+            self._active_attempt_id = attempt_id
+            self._set_generation_busy(True)
+        else:
+            self._active_attempt_id = None
+            self._set_generation_busy(False)
+
+    def _set_generation_busy(self, busy: bool) -> None:
+        self._generation_busy = busy
+        self.generation_indicator.setVisible(busy)
+        self.composer.setReadOnly(busy)
+        self.chat_list.setEnabled(not busy)
+        self.new_chat_button.setEnabled(not busy)
+        self.send_button.setEnabled(not busy and bool(self.composer.toPlainText().strip()))
+        self.cancel_button.setEnabled(busy and self._active_attempt_id is not None)
+        self.rail.chat_button.setEnabled(not busy)
+        for row in self.transcript.message_rows.values():
+            row.set_generation_busy(busy)
+
+    def _update_controls(self) -> None:
+        self.send_button.setEnabled(
+            not self._generation_busy and bool(self.composer.toPlainText().strip())
+        )
+        self.cancel_button.setEnabled(self._generation_busy and self._active_attempt_id is not None)
 
     def _on_event(self, event: CoreEvent) -> None:
         if not isinstance(event, CoreEvent):
             return
-        if event.kind in {
-            "generation_completed",
-            "generation_incomplete",
-            "generation_failed",
-            "generation_aborted",
-        } and event.payload.get("attempt_id") == self._active_attempt_id:
+        chat_id = event.payload.get("chat_id")
+        attempt_id = event.payload.get("attempt_id")
+        if event.kind == "generation_started" and chat_id == self._current_chat_id:
+            self._set_active_attempt(attempt_id, AttemptState.RUNNING)
+        elif (
+            event.kind in _TERMINAL_EVENT_KINDS
+            and chat_id == self._current_chat_id
+            and (attempt_id == self._active_attempt_id or self._generation_busy)
+        ):
             self._active_attempt_id = None
-            self.cancel_button.setEnabled(False)
+            self._set_generation_busy(False)
         self._schedule(self._handle_event(event))
 
     async def _handle_event(self, event: CoreEvent) -> None:
         chat_id = event.payload.get("chat_id")
-        if chat_id != self._current_chat_id and event.kind not in {"chat_created"}:
-            return
         if event.kind == "chat_created":
             chats = await self._application.list_chats()
             self._replace_chat_list(chats)
@@ -179,18 +437,60 @@ class MainWindow(QMainWindow):
         self._refresh_generation += 1
         generation = self._refresh_generation
         try:
-            _, messages = await self._application.open_chat(chat_id)
+            chat, messages = await self._application.open_chat(chat_id)
         except Exception:
             return
         if generation != self._refresh_generation or chat_id != self._current_chat_id:
             return
-        lines: list[str] = []
-        for message in messages:
-            label = "You" if message.role == MessageRole.USER else "B.O.T.S."
-            lines.append(f"{label} [r{message.revision} {message.state.value}]\n{message.content}")
-        self.transcript.setPlainText("\n\n".join(lines))
-        scrollbar = self.transcript.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        self._current_chat = chat
+        self._current_messages = tuple(messages)
+        if chat is not None:
+            self.chat_title.setText(chat.title)
+        self.transcript.render(messages, self._generation_busy)
+        for row in self.transcript.message_rows.values():
+            row.copy_requested.connect(self._on_copy_message)
+            row.edit_requested.connect(self._on_edit_message)
+            row.inspect_requested.connect(self._on_inspect_message)
+            row.regenerate_requested.connect(self._on_regenerate_message)
+        if self._selected_message is not None:
+            self._selected_message = next(
+                (message for message in self._current_messages if message.id == self._selected_message.id),
+                None,
+            )
+        self._update_controls()
+        if self.inspector_dock.isVisible():
+            await self._refresh_inspector()
+
+    async def _refresh_inspector(self) -> None:
+        if self._current_chat is None:
+            return
+        if self._selected_message is None:
+            self.inspector.show_chat(self._current_chat)
+            return
+        attempts = await self._application.list_generation_attempts(self._current_chat.id)
+        revisions = await self._application.list_revisions(
+            self._current_chat.id,
+            self._selected_message.lineage_id or self._selected_message.id,
+        )
+        self.inspector.show_message(
+            self._current_chat,
+            self._selected_message,
+            attempts,
+            len(revisions),
+        )
+
+    def _toggle_inspector(self, visible: bool) -> None:
+        self.inspector_dock.setVisible(visible)
+        if visible:
+            self._schedule(self._refresh_inspector())
+
+    def _sync_inspector_button(self, visible: bool) -> None:
+        if self.top_bar.details_button.isChecked() != visible:
+            self.top_bar.details_button.blockSignals(True)
+            self.top_bar.details_button.setChecked(visible)
+            self.top_bar.details_button.blockSignals(False)
+        if visible:
+            self._schedule(self._refresh_inspector())
 
     def _schedule(self, coroutine) -> None:
         task = asyncio.create_task(coroutine)
@@ -203,6 +503,13 @@ class MainWindow(QMainWindow):
             if not task.done():
                 task.cancel()
         self._refresh_tasks.clear()
+
+    async def stop_bridge_async(self) -> None:
+        tasks = tuple(self._refresh_tasks)
+        self.stop_bridge()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await self._bridge.stop_async()
 
     def closeEvent(self, event) -> None:
         self._bridge.stop()

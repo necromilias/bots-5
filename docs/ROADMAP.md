@@ -80,10 +80,17 @@ preserved partial output across restart, and used no paid or OpenRouter request.
 endpoint failures were expected operator/configuration failures and were preserved as failed attempts.
 
 This live evidence is recorded separately from automated validation and independent adversarial review;
-the final deterministic matrix was `244 passed, 1 skipped`. The retained Phase 2 recovery-artifact
-interaction remains a separate human-adjudication boundary.
+the Phase 3-specific deterministic matrix was `244 passed, 1 skipped`. The current combined candidate
+matrix, including the bounded Draft 1 UI shell, is `254 passed, 1 skipped`. The retained Phase 2
+recovery-artifact interaction remains a separate human-adjudication boundary.
 
-The candidate is prepared for independent review but is not staged, committed, pushed, or otherwise
+The bounded Draft 1 native UI shell is implemented and operator-accepted as **good enough for now** after
+fresh independent Sol/xhigh `PASS`. Its implementation and acceptance record is
+`docs/LINUX_V0_1_UI_DRAFT_1_IMPLEMENTATION_ACCEPTANCE_REPORT.md`. The provisional
+`docs/LINUX_V0_1_UI_UX_DRAFT_1.md` remains provisional/tentative first-draft authority and has not been
+promoted into final design authority.
+
+The candidate is prepared for human commit approval but is not staged, committed, pushed, or otherwise
 landed. Phase 4 remains the next future phase and has not been implemented.
 
 The accepted target is a real native Linux desktop application centred on persistent multi-chat with

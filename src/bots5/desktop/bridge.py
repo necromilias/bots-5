@@ -41,3 +41,11 @@ class CoreEventBridge(QObject):
             self._subscription.close()
         if self._task is not None and not self._task.done():
             self._task.cancel()
+
+    async def stop_async(self) -> None:
+        self.stop()
+        if self._task is not None:
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass

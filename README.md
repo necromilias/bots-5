@@ -32,10 +32,16 @@ The current candidate implements and validates Phase 1 (native walking skeleton)
 Phase 3 real-generation vertical slice. Phase 1 and Phase 2 remain closed; the Phase 3 implementation,
 deterministic validation, independent review, and supplied manual local-Qwen acceptance record are in
 `docs/LINUX_V0_1_PHASE3_IMPLEMENTATION_REPORT.md`. Human closure is approved after fresh independent
-Sol/xhigh Round 21 `PASS`; final zero-spend validation was `244 passed, 1 skipped`, with manual local
-Qwen completion/cancellation and restart persistence recorded. All Phase 3 changes remain an
-unstaged, uncommitted candidate pending separate landing approval. The retained Phase 2
-recovery-artifact interaction remains a separate human-adjudication boundary.
+Sol/xhigh Round 21 `PASS`; manual local Qwen completion/cancellation and restart persistence are recorded.
+The same candidate now also contains the bounded Draft 1 native UI shell, operator-accepted as good enough
+for now after a fresh independent Sol/xhigh `PASS`; see
+`docs/LINUX_V0_1_UI_DRAFT_1_IMPLEMENTATION_ACCEPTANCE_REPORT.md`. The combined zero-spend validation
+matrix is `254 passed, 1 skipped`. All Phase 3 and Draft 1 UI changes remain an unstaged, uncommitted
+candidate pending separate landing approval. The retained Phase 2 recovery-artifact interaction remains a
+separate human-adjudication boundary.
+
+The provisional UI authority remains `docs/LINUX_V0_1_UI_UX_DRAFT_1.md`; it has not been promoted to final
+design authority. Phase 4 remains future work and is not advanced by this candidate.
 
 The existing CLI, runner, filesystem campaign persistence, manifest semantics, and
 `Provider.complete()` seam remain preserved. Later Linux v0.1 phases remain future work and are not
