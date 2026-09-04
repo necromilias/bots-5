@@ -55,6 +55,15 @@ The frozen normal operating procedure is in `OPERATING_PROCEDURE_V1.md`. Operato
 
 ## Timeouts and cancellation
 
+Linux v0.1 Phase 3 exposes an explicit local cancellation command and desktop Stop action for an
+active generation. The owned generation task is cancelled and the HTTP stream is closed where the
+transport permits. Any already persisted partial assistant text remains authoritative; the assistant
+message and generation attempt become `aborted`. Because dispatch may already have happened,
+`remote_outcome_unknown` is persisted as true for an explicit cancellation and for restart/crash
+reconciliation only when dispatch may have occurred; a durable pre-dispatch false remains false.
+Late backend deltas are ignored after cancellation, and aborted or uncertain work is never retried
+automatically.
+
 Each request is wrapped in `asyncio.wait_for(timeout_seconds)`. A request timeout fails that stage and
 marks provider-side outcome as uncertain.
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from decimal import Decimal
 
 
 class MessageRole(StrEnum):
@@ -84,3 +85,13 @@ class GenerationAttempt:
     ended_at: datetime | None = None
     error_type: str | None = None
     error_message: str | None = None
+    provider_id: str | None = None
+    returned_model: str | None = None
+    request_id: str | None = None
+    finish_reason: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    total_tokens: int | None = None
+    known_cost_usd: Decimal | None = None
+    remote_outcome_unknown: bool | None = None

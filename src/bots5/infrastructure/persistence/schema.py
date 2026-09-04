@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import Column, ForeignKey, Index, Integer, MetaData, String, Table, Text
+from sqlalchemy import Boolean, Column, ForeignKey, Index, Integer, MetaData, String, Table, Text
 
 
 metadata = MetaData()
@@ -60,5 +60,15 @@ generation_attempts = Table(
     Column("ended_at", String(40)),
     Column("error_type", String(128)),
     Column("error_message", Text),
+    Column("provider_id", String(64)),
+    Column("returned_model", Text),
+    Column("request_id", Text),
+    Column("finish_reason", String(128)),
+    Column("prompt_tokens", Integer),
+    Column("completion_tokens", Integer),
+    Column("reasoning_tokens", Integer),
+    Column("total_tokens", Integer),
+    Column("known_cost_usd", Text),
+    Column("remote_outcome_unknown", Boolean),
     Index("ux_generation_attempts_assistant", "assistant_message_id", unique=True),
 )

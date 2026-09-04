@@ -33,6 +33,7 @@ class MainWindow(QMainWindow):
         self._current_chat_id: str | None = None
         self._refresh_tasks: set[asyncio.Task[None]] = set()
         self._refresh_generation = 0
+        self._active_attempt_id: str | None = None
 
         self.setWindowTitle("B.O.T.S. 5")
         self.resize(900, 600)
@@ -67,6 +68,10 @@ class MainWindow(QMainWindow):
         self.send_button = QPushButton("Send", right)
         self.send_button.clicked.connect(self._on_send)
         composer_row.addWidget(self.send_button)
+        self.cancel_button = QPushButton("Stop", right)
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self._on_cancel)
+        composer_row.addWidget(self.cancel_button)
         right_layout.addLayout(composer_row)
 
         splitter.addWidget(left)
@@ -110,6 +115,9 @@ class MainWindow(QMainWindow):
     def _on_send(self) -> None:
         self._schedule(self._send_message())
 
+    def _on_cancel(self) -> None:
+        self._schedule(self._cancel_generation())
+
     async def _send_message(self) -> None:
         if self._current_chat_id is None:
             return
@@ -118,13 +126,43 @@ class MainWindow(QMainWindow):
             return
         self.composer.clear()
         try:
-            await self._application.send_message(self._current_chat_id, text)
+            attempt = await self._application.send_message(self._current_chat_id, text)
+            current_attempt = next(
+                (
+                    item
+                    for item in await self._application.list_generation_attempts(self._current_chat_id)
+                    if item.id == attempt.id
+                ),
+                attempt,
+            )
+            if current_attempt.state.value == "running":
+                self._active_attempt_id = attempt.id
+                self.cancel_button.setEnabled(True)
         except Exception as exc:
             self.statusBar().showMessage(str(exc))
+
+    async def _cancel_generation(self) -> None:
+        if self._active_attempt_id is None:
+            return
+        try:
+            await self._application.cancel_generation(self._active_attempt_id)
+        except Exception as exc:
+            self.statusBar().showMessage(str(exc))
+        finally:
+            self._active_attempt_id = None
+            self.cancel_button.setEnabled(False)
 
     def _on_event(self, event: CoreEvent) -> None:
         if not isinstance(event, CoreEvent):
             return
+        if event.kind in {
+            "generation_completed",
+            "generation_incomplete",
+            "generation_failed",
+            "generation_aborted",
+        } and event.payload.get("attempt_id") == self._active_attempt_id:
+            self._active_attempt_id = None
+            self.cancel_button.setEnabled(False)
         self._schedule(self._handle_event(event))
 
     async def _handle_event(self, event: CoreEvent) -> None:

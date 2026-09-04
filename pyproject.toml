@@ -36,3 +36,6 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+  "local_qwen_acceptance: opt-in live acceptance against an operator-supplied local endpoint",
+]

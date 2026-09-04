@@ -11,11 +11,12 @@ from alembic import command
 from alembic.config import Config
 
 
-_HEAD = "0004_integrity_guard_function"
+_HEAD = "0005_generation_outcomes"
 _SUPPORTED_REVISIONS = {
     "0001_desktop_state",
     "0002_conversation_lineage",
     "0003_integrity_boundaries",
+    "0004_integrity_guard_function",
     _HEAD,
 }
 

@@ -69,13 +69,22 @@ been human-adjudicated and accepted. See `docs/LINUX_V0_1_DESIGN.md` for the bui
 
 ### Implemented candidate status
 
-Phase 1 and Phase 2 are implemented in the current uncommitted candidate and have passed the required
-deterministic, migration, persistence/restart, offscreen Qt/qasync, and independent adversarial
-validation gates. Manual operator smoke testing also verified native launch, chat creation, fake
-generation, normal close/reopen, and message persistence across restart.
+Phase 1 and Phase 2 are closed. Phase 3 is implemented in the current unstaged, uncommitted candidate
+and has passed deterministic streaming, migration, persistence/restart, cancellation, offscreen
+Qt/qasync, and legacy campaign regression validation. Fresh Sol/xhigh review found and drove bounded
+repairs for persistence-authority edge cases; fresh Round 21 returned `PASS` with no concrete closure
+blockers, and human closure is approved.
+A separate operator live acceptance also
+completed a real local Qwen generation, exercised explicit mid-stream cancellation to `ABORTED`,
+preserved partial output across restart, and used no paid or OpenRouter request. The initial wrong
+endpoint failures were expected operator/configuration failures and were preserved as failed attempts.
 
-The candidate is prepared for human review but is not staged, committed, pushed, or otherwise landed.
-Phase 3 remains the next future phase and has not been implemented or authorized by this status update.
+This live evidence is recorded separately from automated validation and independent adversarial review;
+the final deterministic matrix was `244 passed, 1 skipped`. The retained Phase 2 recovery-artifact
+interaction remains a separate human-adjudication boundary.
+
+The candidate is prepared for independent review but is not staged, committed, pushed, or otherwise
+landed. Phase 4 remains the next future phase and has not been implemented.
 
 The accepted target is a real native Linux desktop application centred on persistent multi-chat with
 lossless lineage, concurrent streaming generation, deterministic context construction, reusable
@@ -86,9 +95,9 @@ conversation truth, real generation, concurrency/workspace, provider/model usabi
 context/attachments, search, inspection, recovery/import-export, campaign integration, product
 finishing/packaging, and a final torture run.
 
-The current candidate claim is limited to the Phase 1 and Phase 2 scope recorded in the closure report.
-The remaining listed desktop capabilities are target design, not implemented status. Later
-implementation edits, provider/API calls, commits, and landing remain separately approved
+The current candidate claim is limited to the Phase 1 through Phase 3 scope recorded in the closure and
+implementation reports. The remaining listed desktop capabilities are target design, not implemented.
+Later implementation edits, provider/API calls, commits, and landing remain separately approved
 consequences.
 
 Future Code/Git, Android, persistent daemon/remote clients, MCP/tool frameworks, scheduling, RAG,

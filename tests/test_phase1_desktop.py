@@ -13,9 +13,11 @@ from bots5.core.events import EventBus
 from bots5.domain.clock import SystemClock
 from bots5.domain.ids import Uuid7Factory
 from bots5.infrastructure.generation.fake import FakeStreamingBackend
+from bots5.infrastructure.generation.openai_compatible import OpenAICompatibleStreamingBackend
 from bots5.infrastructure.persistence import SQLiteAppStateStore, upgrade_database
 from bots5.desktop.window import MainWindow
 from bots5.domain.models import MessageRole
+from bots5.bootstrap.desktop import _parser
 
 
 def test_minimal_native_window_has_chat_list_transcript_and_composer(tmp_path):
@@ -88,3 +90,24 @@ def test_stale_transcript_refresh_cannot_overwrite_the_selected_chat():
 
     asyncio.run(scenario())
     qt_application.processEvents()
+
+
+def test_desktop_parser_exposes_explicit_local_backend_configuration():
+    args = _parser().parse_args(
+        [
+            "--backend",
+            "local_openai",
+            "--base-url",
+            "http://127.0.0.1:8000/v1",
+            "--model",
+            "Qwen3-8B",
+            "--api-key-env",
+            "LOCAL_QWEN_KEY",
+        ]
+    )
+
+    assert args.backend == "local_openai"
+    assert args.base_url == "http://127.0.0.1:8000/v1"
+    assert args.model == "Qwen3-8B"
+    assert args.api_key_env == "LOCAL_QWEN_KEY"
+    assert _parser().parse_args([]).backend == "fake"

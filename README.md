@@ -27,14 +27,34 @@ The Linux v0.1 native desktop product, architecture, implementation-technology b
 construction sequence have been accepted. See `docs/LINUX_V0_1_DESIGN.md` for the build-facing
 contract.
 
-The current candidate implements and validates Phase 1 (native walking skeleton) and Phase 2
-(conversation truth, immutable lineage/revisions, and deterministic fake generation). The exact
-implementation and validation record is in `docs/LINUX_V0_1_PHASE1_PHASE2_CLOSURE_REPORT.md`.
-Those changes remain an uncommitted candidate pending human review and separate commit approval.
+The current candidate implements and validates Phase 1 (native walking skeleton), Phase 2
+(conversation truth, immutable lineage/revisions, and deterministic fake generation), and the bounded
+Phase 3 real-generation vertical slice. Phase 1 and Phase 2 remain closed; the Phase 3 implementation,
+deterministic validation, independent review, and supplied manual local-Qwen acceptance record are in
+`docs/LINUX_V0_1_PHASE3_IMPLEMENTATION_REPORT.md`. Human closure is approved after fresh independent
+Sol/xhigh Round 21 `PASS`; final zero-spend validation was `244 passed, 1 skipped`, with manual local
+Qwen completion/cancellation and restart persistence recorded. All Phase 3 changes remain an
+unstaged, uncommitted candidate pending separate landing approval. The retained Phase 2
+recovery-artifact interaction remains a separate human-adjudication boundary.
 
 The existing CLI, runner, filesystem campaign persistence, manifest semantics, and
 `Provider.complete()` seam remain preserved. Later Linux v0.1 phases remain future work and are not
 advanced by this candidate.
+
+For opt-in local Phase 3 desktop testing, supply the backend, endpoint, and model explicitly:
+
+```bash
+bots5-desktop --backend local_openai \
+  --base-url http://127.0.0.1:8000/v1 \
+  --model Qwen3-8B \
+  --api-key-env LOCAL_QWEN_API_KEY
+```
+
+The fake backend remains the default. Phase 3 sends only the current user message, uses one ordinary
+`stream=true` request, and stores provider usage/cost as unknown when the endpoint does not supply it.
+The opt-in acceptance probe is `tests/test_phase3_local_qwen.py`; it skips unless a local endpoint and
+model are explicitly provided through its documented environment variables. It never selects
+OpenRouter.
 
 Remaining Linux v0.1 phases remain separately gated. Future Android, Code/Git, daemon/remote-client,
 MCP/tool frameworks, scheduling, RAG, and operating-mode capability systems remain deferred unless a

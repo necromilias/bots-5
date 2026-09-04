@@ -21,6 +21,20 @@ validated job
 
 There is no autonomous delegation loop and no worker-to-worker dependency in V0.
 
+## Linux v0.1 Phase 3 generation
+
+The desktop core starts with the fake streaming backend. An explicit `bots5-desktop` selection wires
+the B.O.T.S.-owned `openai_compatible_http` streaming backend to either the local OpenAI-compatible
+provider identity or the existing OpenRouter provider seam. The request snapshot records the selected
+provider, model, normalized non-secret base URL, authentication environment-variable name when used,
+and the exact current user message. It never records the resolved credential.
+
+The backend emits a dispatch marker before opening the HTTP stream, normalizes SSE deltas and optional
+usage/cost telemetry, and never adds a telemetry-specific alternate request shape. Each delta is
+persisted before its `message_delta` event. Terminal state is persisted before its terminal event. A
+local cancellation cancels the owned task and HTTP stream, preserves committed partial text, records
+`ABORTED`; `remote_outcome_unknown` is true only when dispatch may have occurred, and does not retry.
+
 ## Trust boundaries
 
 The operator and manifest are trusted. Model output is untrusted text. OpenRouter and the configured

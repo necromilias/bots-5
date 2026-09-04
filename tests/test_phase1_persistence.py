@@ -25,7 +25,7 @@ def test_real_migration_creates_state_schema_and_enables_sqlite_safety(tmp_path:
         with store.engine.connect() as connection:
             assert connection.execute(text("PRAGMA foreign_keys")).scalar_one() == 1
             assert connection.execute(text("PRAGMA journal_mode")).scalar_one().lower() == "wal"
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0004_integrity_guard_function"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0005_generation_outcomes"
 
         now = datetime.now(timezone.utc)
         chat = Chat(str(uuid4()), "Test", now, now)

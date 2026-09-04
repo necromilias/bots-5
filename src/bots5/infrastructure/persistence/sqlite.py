@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+
 from dataclasses import replace
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from sqlalchemy import Engine, create_engine, delete, event, func, insert, select, update
@@ -18,6 +20,13 @@ from bots5.domain.models import (
 )
 
 from .schema import chats, generation_attempts, messages
+from .phase3_validation import (
+    PHASE3_BACKEND_ID,
+    is_phase3_record,
+    validate_remote_outcome_transition,
+    validate_outcome_fields,
+    validate_request_snapshot,
+)
 from .transition_guard import (
     arm_transition,
     clear_transition,
@@ -45,25 +54,79 @@ _ATTEMPT_TO_MESSAGE_STATE = {
     AttemptState.FAILED: MessageState.FAILED,
     AttemptState.ABORTED: MessageState.ABORTED,
 }
+_PHASE3_COLUMN_TYPES = {
+    "provider_id": "VARCHAR(64)",
+    "returned_model": "TEXT",
+    "request_id": "TEXT",
+    "finish_reason": "VARCHAR(128)",
+    "prompt_tokens": "INTEGER",
+    "completion_tokens": "INTEGER",
+    "reasoning_tokens": "INTEGER",
+    "total_tokens": "INTEGER",
+    "known_cost_usd": "TEXT",
+    "remote_outcome_unknown": "BOOLEAN",
+}
 
 
-def _validate_request_snapshot(attempt: GenerationAttempt) -> None:
+def _validate_request_snapshot(
+    attempt: GenerationAttempt,
+    user_message_content: object | None = None,
+    *,
+    phase3: bool | None = None,
+) -> None:
+    validate_request_snapshot(
+        attempt_id=attempt.id,
+        chat_id=attempt.chat_id,
+        user_message_id=attempt.user_message_id,
+        backend_id=attempt.backend_id,
+        model=attempt.model,
+        provider_id=attempt.provider_id,
+        request_snapshot=attempt.request_snapshot,
+        user_message_content=user_message_content,
+        phase3=phase3,
+        error_type=StateError,
+    )
+
+
+def _validate_attempt_outcome(
+    attempt: GenerationAttempt,
+    *,
+    phase3: bool | None = None,
+) -> None:
+    if phase3 is None:
+        phase3 = attempt.provider_id is not None or attempt.backend_id == PHASE3_BACKEND_ID
+    validate_outcome_fields(
+        state=attempt.state.value,
+        provider_id=attempt.provider_id,
+        finish_reason=attempt.finish_reason,
+        prompt_tokens=attempt.prompt_tokens,
+        completion_tokens=attempt.completion_tokens,
+        reasoning_tokens=attempt.reasoning_tokens,
+        total_tokens=attempt.total_tokens,
+        known_cost_usd=attempt.known_cost_usd,
+        remote_outcome_unknown=attempt.remote_outcome_unknown,
+        returned_model=attempt.returned_model,
+        request_id=attempt.request_id,
+        outcome_error_type=attempt.error_type,
+        outcome_error_message=attempt.error_message,
+        phase3=phase3,
+        error_type=StateError,
+    )
+
+
+def _is_persisted_phase3_attempt(attempt: GenerationAttempt) -> bool:
     try:
         snapshot = json.loads(attempt.request_snapshot)
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise StateError("generation request snapshot must be valid JSON") from exc
+    except (TypeError, ValueError):
+        snapshot = {}
     if not isinstance(snapshot, dict):
-        raise StateError("generation request snapshot must be a JSON object")
-    expected = {
-        "attempt_id": attempt.id,
-        "chat_id": attempt.chat_id,
-        "user_message_id": attempt.user_message_id,
-        "backend_id": attempt.backend_id,
-        "model": attempt.model,
-    }
-    for key, value in expected.items():
-        if key in snapshot and snapshot[key] != value:
-            raise StateError(f"generation request snapshot contradicts {key}")
+        snapshot = {}
+    return is_phase3_record(
+        backend_id=attempt.backend_id,
+        provider_id=attempt.provider_id,
+        snapshot=snapshot,
+        include_backend_marker=False,
+    )
 
 
 def _engine(database: Path) -> Engine:
@@ -109,8 +172,23 @@ def _message(row) -> Message:
     )
 
 
-def _attempt(row) -> GenerationAttempt:
-    return GenerationAttempt(
+def _attempt(row, user_message_content: object | None = None) -> GenerationAttempt:
+    token_values = {}
+    for field in (
+        "prompt_tokens",
+        "completion_tokens",
+        "reasoning_tokens",
+        "total_tokens",
+    ):
+        value = getattr(row, field)
+        token_values[field] = value
+    cost = None
+    if row.known_cost_usd is not None:
+        try:
+            cost = Decimal(str(row.known_cost_usd))
+        except (InvalidOperation, ValueError):
+            raise StateError(f"generation attempt has invalid cost: {row.id}") from None
+    attempt = GenerationAttempt(
         id=row.id,
         chat_id=row.chat_id,
         user_message_id=row.user_message_id,
@@ -123,7 +201,27 @@ def _attempt(row) -> GenerationAttempt:
         ended_at=None if row.ended_at is None else parse_utc(row.ended_at),
         error_type=row.error_type,
         error_message=row.error_message,
+        provider_id=row.provider_id,
+        returned_model=row.returned_model,
+        request_id=row.request_id,
+        finish_reason=row.finish_reason,
+        prompt_tokens=token_values["prompt_tokens"],
+        completion_tokens=token_values["completion_tokens"],
+        reasoning_tokens=token_values["reasoning_tokens"],
+        total_tokens=token_values["total_tokens"],
+        known_cost_usd=cost,
+        remote_outcome_unknown=(
+            None if row.remote_outcome_unknown is None else bool(row.remote_outcome_unknown)
+        ),
     )
+    persisted_phase3 = _is_persisted_phase3_attempt(attempt)
+    _validate_request_snapshot(
+        attempt,
+        user_message_content,
+        phase3=persisted_phase3,
+    )
+    _validate_attempt_outcome(attempt, phase3=persisted_phase3)
+    return attempt
 
 
 def _message_values(message: Message) -> dict[str, object]:
@@ -151,12 +249,71 @@ class SQLiteAppStateStore:
     def open(cls, database: Path) -> SQLiteAppStateStore:
         engine = _engine(database)
         try:
-            with engine.connect() as connection:
+            with engine.begin() as connection:
                 integrity = __import__(
                     "bots5.infrastructure.persistence.migrations.versions.0003_integrity_boundaries",
                     fromlist=["_validate_existing_state"],
                 )
                 integrity._validate_existing_state(connection)
+                column_info = {
+                    row[1]: row
+                    for row in connection.exec_driver_sql(
+                        "PRAGMA table_info(generation_attempts)"
+                    ).fetchall()
+                }
+                columns = set(column_info)
+                revision = connection.exec_driver_sql(
+                    "SELECT version_num FROM alembic_version"
+                ).scalar_one_or_none()
+                phase3_columns = {
+                    "provider_id",
+                    "returned_model",
+                    "request_id",
+                    "finish_reason",
+                    "prompt_tokens",
+                    "completion_tokens",
+                    "reasoning_tokens",
+                    "total_tokens",
+                    "known_cost_usd",
+                    "remote_outcome_unknown",
+                }
+                if revision == "0005_generation_outcomes" and not phase3_columns <= columns:
+                    missing = ", ".join(sorted(phase3_columns - columns))
+                    raise RuntimeError(
+                        "current Phase 3 schema is missing generation outcome columns: "
+                        f"{missing}"
+                    )
+                if revision == "0005_generation_outcomes":
+                    non_nullable = sorted(
+                        name for name in phase3_columns if column_info[name][3] != 0
+                    )
+                    if non_nullable:
+                        raise RuntimeError(
+                            "current Phase 3 schema outcome columns must be nullable: "
+                            + ", ".join(non_nullable)
+                        )
+                    wrong_types = sorted(
+                        name
+                        for name, expected_type in _PHASE3_COLUMN_TYPES.items()
+                        if str(column_info[name][2]).upper().replace(" ", "")
+                        != expected_type
+                    )
+                    if wrong_types:
+                        details = ", ".join(
+                            f"{name}={column_info[name][2]}"
+                            for name in wrong_types
+                        )
+                        raise RuntimeError(
+                            "current Phase 3 schema outcome columns have invalid declared types: "
+                            + details
+                        )
+                if "provider_id" in columns:
+                    outcomes = __import__(
+                        "bots5.infrastructure.persistence.migrations.versions.0005_generation_outcomes",
+                        fromlist=["_validate_outcome_rows", "_replace_attempt_triggers"],
+                    )
+                    outcomes._validate_outcome_rows(connection)
+                    outcomes._replace_attempt_triggers(connection)
         except BaseException:
             engine.dispose()
             raise
@@ -260,14 +417,35 @@ class SQLiteAppStateStore:
         self._ensure_open()
         with self._engine.connect() as connection:
             rows = connection.execute(
-                select(generation_attempts)
+                select(
+                    generation_attempts,
+                    messages.c.id.label("_attempt_user_message_id"),
+                    messages.c.content.label("_attempt_user_message_content"),
+                )
+                .select_from(
+                    generation_attempts.outerjoin(
+                        messages,
+                        messages.c.id == generation_attempts.c.user_message_id,
+                    )
+                )
                 .where(generation_attempts.c.chat_id == chat_id)
                 .order_by(
                     generation_attempts.c.started_at.asc(),
                     generation_attempts.c.id.asc(),
                 )
             ).fetchall()
-        return tuple(_attempt(row) for row in rows)
+        attempts = []
+        for row in rows:
+            mapping = row._mapping
+            if mapping["_attempt_user_message_id"] is None:
+                raise StateError(
+                    "generation attempt user message not found: "
+                    f"{mapping['id']}"
+                )
+            attempts.append(
+                _attempt(row, mapping["_attempt_user_message_content"])
+            )
+        return tuple(attempts)
 
     def next_message_sequence(self, chat_id: str) -> int:
         self._ensure_open()
@@ -283,7 +461,6 @@ class SQLiteAppStateStore:
         messages_to_insert: tuple[Message, ...],
         attempt: GenerationAttempt,
     ) -> None:
-        _validate_request_snapshot(attempt)
         if attempt.state is not AttemptState.RUNNING or attempt.ended_at is not None:
             raise StateError("generation start must use a running attempt without an end time")
         pending = {message.id: message for message in messages_to_insert}
@@ -353,6 +530,8 @@ class SQLiteAppStateStore:
             raise StateError("generation attempt user and assistant messages must differ")
         if assistant_message.parent_id != user_message.id:
             raise StateError("generation attempt assistant must belong to its user turn")
+        _validate_request_snapshot(attempt, user_message.content)
+        _validate_attempt_outcome(attempt)
 
         arm_transition(
             connection,
@@ -377,6 +556,20 @@ class SQLiteAppStateStore:
                     state=attempt.state.value,
                     request_snapshot=attempt.request_snapshot,
                     started_at=utc_iso(attempt.started_at),
+                    provider_id=attempt.provider_id,
+                    returned_model=attempt.returned_model,
+                    request_id=attempt.request_id,
+                    finish_reason=attempt.finish_reason,
+                    prompt_tokens=attempt.prompt_tokens,
+                    completion_tokens=attempt.completion_tokens,
+                    reasoning_tokens=attempt.reasoning_tokens,
+                    total_tokens=attempt.total_tokens,
+                    known_cost_usd=(
+                        None
+                        if attempt.known_cost_usd is None
+                        else str(attempt.known_cost_usd)
+                    ),
+                    remote_outcome_unknown=attempt.remote_outcome_unknown,
                 )
             )
         finally:
@@ -472,6 +665,8 @@ class SQLiteAppStateStore:
 
     def finalize_generation(self, message: Message, attempt: GenerationAttempt) -> None:
         self._ensure_open()
+        persisted_phase3 = _is_persisted_phase3_attempt(attempt)
+        _validate_attempt_outcome(attempt, phase3=persisted_phase3)
         if message.state not in _MESSAGE_TERMINAL_STATES:
             raise StateError("finalized message must be terminal")
         if attempt.state not in _ATTEMPT_TERMINAL_STATES:
@@ -483,7 +678,7 @@ class SQLiteAppStateStore:
             expected_message_states.add(MessageState.TRUNCATED)
         if message.state not in expected_message_states:
             raise StateError("message and attempt terminal states do not match")
-        _validate_request_snapshot(attempt)
+        _validate_request_snapshot(attempt, phase3=persisted_phase3)
         with self._engine.begin() as connection:
             stored_message_row = connection.execute(
                 select(messages).where(messages.c.id == message.id)
@@ -497,6 +692,15 @@ class SQLiteAppStateStore:
                 raise StateError(f"generation attempt not found: {attempt.id}")
             stored_message = _message(stored_message_row)
             stored_attempt = _attempt(stored_attempt_row)
+            validate_remote_outcome_transition(
+                old_state=stored_attempt.state.value,
+                old_remote_outcome_unknown=stored_attempt.remote_outcome_unknown,
+                new_state=attempt.state.value,
+                new_remote_outcome_unknown=attempt.remote_outcome_unknown,
+                new_finish_reason=attempt.finish_reason,
+                phase3=_is_persisted_phase3_attempt(stored_attempt),
+                error_type=StateError,
+            )
             if stored_message.state != MessageState.STREAMING:
                 raise StateError(f"message is not streaming: {message.id}")
             if stored_attempt.state != AttemptState.RUNNING:
@@ -505,6 +709,16 @@ class SQLiteAppStateStore:
                 raise StateError("finalized message does not belong to the attempt")
             if stored_attempt.user_message_id != message.parent_id:
                 raise StateError("finalized message has the wrong user turn")
+            stored_user_row = connection.execute(
+                select(messages).where(messages.c.id == stored_attempt.user_message_id)
+            ).first()
+            if stored_user_row is None:
+                raise StateError(f"generation attempt user message not found: {attempt.id}")
+            _validate_request_snapshot(
+                attempt,
+                stored_user_row.content,
+                phase3=persisted_phase3,
+            )
             if stored_attempt.chat_id != message.chat_id or attempt.chat_id != message.chat_id:
                 raise StateError("finalized message and attempt must share a chat")
             if (
@@ -512,6 +726,7 @@ class SQLiteAppStateStore:
                 or attempt.assistant_message_id != stored_attempt.assistant_message_id
                 or attempt.backend_id != stored_attempt.backend_id
                 or attempt.model != stored_attempt.model
+                or attempt.provider_id != stored_attempt.provider_id
                 or attempt.request_snapshot != stored_attempt.request_snapshot
                 or utc_iso(attempt.started_at) != utc_iso(stored_attempt.started_at)
             ):
@@ -528,6 +743,20 @@ class SQLiteAppStateStore:
                         ended_at=None if attempt.ended_at is None else utc_iso(attempt.ended_at),
                         error_type=attempt.error_type,
                         error_message=attempt.error_message,
+                        provider_id=attempt.provider_id,
+                        returned_model=attempt.returned_model,
+                        request_id=attempt.request_id,
+                        finish_reason=attempt.finish_reason,
+                        prompt_tokens=attempt.prompt_tokens,
+                        completion_tokens=attempt.completion_tokens,
+                        reasoning_tokens=attempt.reasoning_tokens,
+                        total_tokens=attempt.total_tokens,
+                        known_cost_usd=(
+                            None
+                            if attempt.known_cost_usd is None
+                            else str(attempt.known_cost_usd)
+                        ),
+                        remote_outcome_unknown=attempt.remote_outcome_unknown,
                     )
                 )
                 if attempt_result.rowcount != 1:
@@ -570,13 +799,56 @@ class SQLiteAppStateStore:
                     ended_at=now,
                     error_type="aborted",
                     error_message="generation was interrupted before application restart",
+                    remote_outcome_unknown=(
+                        True
+                        if attempt.remote_outcome_unknown is None
+                        else attempt.remote_outcome_unknown
+                    ),
                 ),
             )
 
     def update_attempt(self, attempt: GenerationAttempt) -> None:
         self._ensure_open()
-        _validate_request_snapshot(attempt)
+        persisted_phase3 = _is_persisted_phase3_attempt(attempt)
+        _validate_attempt_outcome(attempt, phase3=persisted_phase3)
+        _validate_request_snapshot(attempt, phase3=persisted_phase3)
         with self._engine.begin() as connection:
+            stored_row = connection.execute(
+                select(generation_attempts).where(generation_attempts.c.id == attempt.id)
+            ).first()
+            if stored_row is None:
+                raise StateError(f"generation attempt not found: {attempt.id}")
+            stored = _attempt(stored_row)
+            user_row = connection.execute(
+                select(messages).where(messages.c.id == stored.user_message_id)
+            ).first()
+            if user_row is None:
+                raise StateError(f"generation attempt user message not found: {attempt.id}")
+            _validate_request_snapshot(
+                attempt,
+                user_row.content,
+                phase3=persisted_phase3,
+            )
+            validate_remote_outcome_transition(
+                old_state=stored.state.value,
+                old_remote_outcome_unknown=stored.remote_outcome_unknown,
+                new_state=attempt.state.value,
+                new_remote_outcome_unknown=attempt.remote_outcome_unknown,
+                new_finish_reason=attempt.finish_reason,
+                phase3=_is_persisted_phase3_attempt(stored),
+                error_type=StateError,
+            )
+            if (
+                attempt.chat_id != stored.chat_id
+                or attempt.user_message_id != stored.user_message_id
+                or attempt.assistant_message_id != stored.assistant_message_id
+                or attempt.backend_id != stored.backend_id
+                or attempt.model != stored.model
+                or attempt.provider_id != stored.provider_id
+                or attempt.request_snapshot != stored.request_snapshot
+                or utc_iso(attempt.started_at) != utc_iso(stored.started_at)
+            ):
+                raise StateError("generation request snapshot identity is immutable")
             result = connection.execute(
                 update(generation_attempts)
                 .where(generation_attempts.c.id == attempt.id)
@@ -585,6 +857,19 @@ class SQLiteAppStateStore:
                     ended_at=None if attempt.ended_at is None else utc_iso(attempt.ended_at),
                     error_type=attempt.error_type,
                     error_message=attempt.error_message,
+                    returned_model=attempt.returned_model,
+                    request_id=attempt.request_id,
+                    finish_reason=attempt.finish_reason,
+                    prompt_tokens=attempt.prompt_tokens,
+                    completion_tokens=attempt.completion_tokens,
+                    reasoning_tokens=attempt.reasoning_tokens,
+                    total_tokens=attempt.total_tokens,
+                    known_cost_usd=(
+                        None
+                        if attempt.known_cost_usd is None
+                        else str(attempt.known_cost_usd)
+                    ),
+                    remote_outcome_unknown=attempt.remote_outcome_unknown,
                 )
             )
             if result.rowcount != 1:

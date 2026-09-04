@@ -236,8 +236,10 @@ def test_restart_reconciles_a_persisted_running_generation(tmp_path):
         clock=SystemClock(),
     )
     try:
-        assert application._store.get_message(assistant.id).state == MessageState.ABORTED
-        assert application._store.list_generation_attempts(chat.id)[0].state == AttemptState.ABORTED
+            assert application._store.get_message(assistant.id).state == MessageState.ABORTED
+            reconciled = application._store.list_generation_attempts(chat.id)[0]
+            assert reconciled.state == AttemptState.ABORTED
+            assert reconciled.remote_outcome_unknown is True
     finally:
         asyncio.run(application.close())
 

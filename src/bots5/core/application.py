@@ -24,7 +24,9 @@ from .generation import (
     GenerationBackend,
     GenerationCompleted,
     GenerationDelta,
+    GenerationDispatched,
     GenerationFailed,
+    GenerationMetadata,
     GenerationRequest,
 )
 from .ports import AppStateStore
@@ -39,6 +41,39 @@ def _tracked_command(method):
     return wrapper
 
 
+def _merge_attempt_metadata(attempt: GenerationAttempt, event) -> GenerationAttempt:
+    return replace(
+        attempt,
+        returned_model=event.returned_model or attempt.returned_model,
+        request_id=event.request_id or attempt.request_id,
+        prompt_tokens=(
+            event.prompt_tokens
+            if event.prompt_tokens is not None
+            else attempt.prompt_tokens
+        ),
+        completion_tokens=(
+            event.completion_tokens
+            if event.completion_tokens is not None
+            else attempt.completion_tokens
+        ),
+        reasoning_tokens=(
+            event.reasoning_tokens
+            if event.reasoning_tokens is not None
+            else attempt.reasoning_tokens
+        ),
+        total_tokens=(
+            event.total_tokens
+            if event.total_tokens is not None
+            else attempt.total_tokens
+        ),
+        known_cost_usd=(
+            event.known_cost_usd
+            if event.known_cost_usd is not None
+            else attempt.known_cost_usd
+        ),
+    )
+
+
 class BotsApplication:
     def __init__(
         self,
@@ -51,6 +86,9 @@ class BotsApplication:
         execution: ExecutionManager | None = None,
         backend_id: str = "fake",
         model: str = "fake-v0.1",
+        provider_id: str | None = None,
+        base_url: str | None = None,
+        api_key_env: str | None = None,
     ) -> None:
         self._store = store
         self._events = events
@@ -60,8 +98,14 @@ class BotsApplication:
         self._execution = execution or ExecutionManager()
         self._backend_id = backend_id
         self._model = model
+        self._provider_id = provider_id
+        self._base_url = base_url
+        self._api_key_env = api_key_env
         self._closed = False
         self._pending_generations: dict[str, tuple[Message, GenerationAttempt]] = {}
+        self._generation_tasks: dict[str, asyncio.Task[None]] = {}
+        self._generation_terminal_events: dict[str, asyncio.Event] = {}
+        self._cancel_requested: set[str] = set()
         self._active_commands = 0
         self._commands_idle = asyncio.Event()
         self._commands_idle.set()
@@ -89,6 +133,16 @@ class BotsApplication:
         attempt: GenerationAttempt,
     ) -> None:
         self._pending_generations[attempt.id] = (message, attempt)
+        self._generation_terminal_events[attempt.id] = asyncio.Event()
+
+    def _mark_terminal_persisted(self, attempt_id: str) -> None:
+        event = self._generation_terminal_events.get(attempt_id)
+        if event is not None:
+            event.set()
+
+    def _finalize_generation(self, message: Message, attempt: GenerationAttempt) -> None:
+        self._store.finalize_generation(message, attempt)
+        self._mark_terminal_persisted(attempt.id)
 
     def _update_tracked_generation(
         self,
@@ -181,6 +235,9 @@ class BotsApplication:
             backend_id=self._backend_id,
             model=self._model,
             prompt=user_message.content,
+            provider_id=self._provider_id,
+            base_url=self._base_url,
+            api_key_env=self._api_key_env,
         )
         attempt = GenerationAttempt(
             id=attempt_id,
@@ -190,8 +247,12 @@ class BotsApplication:
             backend_id=self._backend_id,
             model=self._model,
             state=AttemptState.RUNNING,
-            request_snapshot=json.dumps(request.model_dump(mode="json"), sort_keys=True),
+            request_snapshot=json.dumps(
+                request.model_dump(mode="json", exclude_none=True), sort_keys=True
+            ),
             started_at=now,
+            provider_id=self._provider_id,
+            remote_outcome_unknown=False,
         )
         return request, attempt
 
@@ -231,6 +292,7 @@ class BotsApplication:
             self._run_generation(request, assistant_message, attempt, ready),
             name=f"bots5-generation-{attempt.id}",
         )
+        self._generation_tasks[attempt.id] = task
         ready_wait = asyncio.create_task(ready.wait())
         try:
             done, _ = await asyncio.wait(
@@ -245,6 +307,59 @@ class BotsApplication:
             if not ready_wait.done():
                 ready_wait.cancel()
             await asyncio.gather(ready_wait, return_exceptions=True)
+
+    @_tracked_command
+    async def cancel_generation(self, attempt_id: str) -> GenerationAttempt:
+        """Cancel one local generation and wait until its aborted state is durable."""
+        self._ensure_open()
+        pending = self._pending_generations.get(attempt_id)
+        task = self._generation_tasks.get(attempt_id)
+        if pending is None or task is None:
+            raise StateError(f"generation attempt is not running: {attempt_id}")
+        self._cancel_requested.add(attempt_id)
+        terminal_event = self._generation_terminal_events.get(attempt_id)
+        if not task.done() and (
+            terminal_event is None or not terminal_event.is_set()
+        ):
+            task.cancel()
+        if terminal_event is None:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        else:
+            wait_task = asyncio.create_task(terminal_event.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    (task, wait_task),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if wait_task not in done:
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+            finally:
+                if not wait_task.done():
+                    wait_task.cancel()
+                await asyncio.gather(wait_task, return_exceptions=True)
+        if task.done():
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        message, _ = pending
+        stored = next(
+            (
+                attempt
+                for attempt in self._store.list_generation_attempts(message.chat_id)
+                if attempt.id == attempt_id
+            ),
+            None,
+        )
+        if stored is None:
+            raise StateError(f"generation attempt disappeared: {attempt_id}")
+        return stored
 
     @_tracked_command
     async def send_message(self, chat_id: str, text: str) -> GenerationAttempt:
@@ -480,6 +595,7 @@ class BotsApplication:
         message = assistant_message
         current_attempt = attempt
         terminal_persisted = False
+        dispatch_may_have_occurred = False
         try:
             ready.set()
             await asyncio.sleep(0)
@@ -487,7 +603,24 @@ class BotsApplication:
             async for event in self._backend.stream(request):
                 if event.attempt_id != attempt.id:
                     raise StateError("generation backend returned an event for another attempt")
-                if isinstance(event, GenerationDelta):
+                if attempt.id in self._cancel_requested:
+                    raise asyncio.CancelledError
+                if isinstance(event, GenerationDispatched):
+                    dispatch_may_have_occurred = True
+                    current_attempt = replace(current_attempt, remote_outcome_unknown=True)
+                    self._store.update_attempt(current_attempt)
+                    self._update_tracked_generation(message, current_attempt)
+                    await self._publish_after_persistence(
+                        "generation_dispatched",
+                        chat_id=message.chat_id,
+                        message_id=message.id,
+                        attempt_id=attempt.id,
+                    )
+                elif isinstance(event, GenerationMetadata):
+                    current_attempt = _merge_attempt_metadata(current_attempt, event)
+                    self._store.update_attempt(current_attempt)
+                    self._update_tracked_generation(message, current_attempt)
+                elif isinstance(event, GenerationDelta):
                     message = replace(
                         message,
                         state=MessageState.STREAMING,
@@ -505,12 +638,46 @@ class BotsApplication:
                 elif isinstance(event, GenerationCompleted):
                     terminal = True
                     now = self._clock.now()
+                    current_attempt = _merge_attempt_metadata(current_attempt, event)
+                    if type(event.finish_reason) is not str or not event.finish_reason:
+                        error_type = "malformed_finish_reason"
+                        error_message = "generation completed with an invalid finish_reason"
+                        message = replace(message, state=MessageState.FAILED)
+                        current_attempt = replace(
+                            current_attempt,
+                            state=AttemptState.FAILED,
+                            ended_at=now,
+                            error_type=error_type,
+                            error_message=error_message,
+                            finish_reason=None,
+                            remote_outcome_unknown=(
+                                event.remote_outcome_unknown
+                                if event.remote_outcome_unknown is not None
+                                else dispatch_may_have_occurred
+                            ),
+                        )
+                        self._finalize_generation(message, current_attempt)
+                        terminal_persisted = True
+                        await self._publish_after_persistence(
+                            "generation_failed",
+                            chat_id=message.chat_id,
+                            message_id=message.id,
+                            attempt_id=attempt.id,
+                            error_type=error_type,
+                            error_message=error_message,
+                        )
+                        break
+                    current_attempt = replace(
+                        current_attempt,
+                        finish_reason=event.finish_reason,
+                    )
                     if event.finish_reason == "stop":
                         message = replace(message, state=MessageState.COMPLETE)
                         current_attempt = replace(
                             current_attempt,
                             state=AttemptState.COMPLETE,
                             ended_at=now,
+                            remote_outcome_unknown=event.remote_outcome_unknown,
                         )
                         event_kind = "generation_completed"
                     else:
@@ -521,9 +688,10 @@ class BotsApplication:
                             ended_at=now,
                             error_type="non_stop_finish",
                             error_message=f"generation ended with finish_reason={event.finish_reason}",
+                            remote_outcome_unknown=event.remote_outcome_unknown,
                         )
                         event_kind = "generation_incomplete"
-                    self._store.finalize_generation(message, current_attempt)
+                    self._finalize_generation(message, current_attempt)
                     terminal_persisted = True
                     await self._publish_after_persistence(
                         event_kind,
@@ -543,8 +711,13 @@ class BotsApplication:
                         ended_at=now,
                         error_type=event.error_type,
                         error_message=event.error_message,
+                        remote_outcome_unknown=(
+                            event.remote_outcome_unknown
+                            if event.remote_outcome_unknown is not None
+                            else dispatch_may_have_occurred
+                        ),
                     )
-                    self._store.finalize_generation(message, current_attempt)
+                    self._finalize_generation(message, current_attempt)
                     terminal_persisted = True
                     await self._publish_after_persistence(
                         "generation_failed",
@@ -556,7 +729,26 @@ class BotsApplication:
                     )
                     break
 
-            if not terminal:
+            if not terminal and attempt.id in self._cancel_requested:
+                now = self._clock.now()
+                message = replace(message, state=MessageState.ABORTED)
+                current_attempt = replace(
+                    current_attempt,
+                    state=AttemptState.ABORTED,
+                    ended_at=now,
+                    error_type="aborted",
+                    error_message="generation was cancelled",
+                    remote_outcome_unknown=dispatch_may_have_occurred,
+                )
+                self._finalize_generation(message, current_attempt)
+                terminal_persisted = True
+                await self._publish_after_persistence(
+                    "generation_aborted",
+                    chat_id=message.chat_id,
+                    message_id=message.id,
+                    attempt_id=attempt.id,
+                )
+            elif not terminal:
                 now = self._clock.now()
                 message = replace(message, state=MessageState.INCOMPLETE)
                 current_attempt = replace(
@@ -565,8 +757,9 @@ class BotsApplication:
                     ended_at=now,
                     error_type="missing_terminal_event",
                     error_message="generation stream ended without a terminal event",
+                    remote_outcome_unknown=dispatch_may_have_occurred,
                 )
-                self._store.finalize_generation(message, current_attempt)
+                self._finalize_generation(message, current_attempt)
                 terminal_persisted = True
                 await self._publish_after_persistence(
                     "generation_incomplete",
@@ -585,8 +778,9 @@ class BotsApplication:
                 ended_at=now,
                 error_type="aborted",
                 error_message="generation was cancelled",
+                remote_outcome_unknown=dispatch_may_have_occurred,
             )
-            self._store.finalize_generation(message, current_attempt)
+            self._finalize_generation(message, current_attempt)
             terminal_persisted = True
             await self._publish_after_persistence(
                 "generation_aborted",
@@ -606,8 +800,19 @@ class BotsApplication:
                 ended_at=now,
                 error_type=type(exc).__name__,
                 error_message=str(exc)[:500],
+                returned_model=None,
+                request_id=None,
+                finish_reason=None,
+                prompt_tokens=None,
+                completion_tokens=None,
+                reasoning_tokens=None,
+                total_tokens=None,
+                known_cost_usd=None,
+                remote_outcome_unknown=(
+                    True if dispatch_may_have_occurred else current_attempt.remote_outcome_unknown
+                ),
             )
-            self._store.finalize_generation(message, current_attempt)
+            self._finalize_generation(message, current_attempt)
             terminal_persisted = True
             await self._publish_after_persistence(
                 "generation_failed",
@@ -619,6 +824,9 @@ class BotsApplication:
             )
         finally:
             self._pending_generations.pop(attempt.id, None)
+            self._generation_tasks.pop(attempt.id, None)
+            self._generation_terminal_events.pop(attempt.id, None)
+            self._cancel_requested.discard(attempt.id)
 
     async def close(self) -> None:
         if self._closed:
@@ -660,6 +868,7 @@ class BotsApplication:
                             ended_at=now,
                             error_type="aborted",
                             error_message="generation was cancelled during shutdown",
+                            remote_outcome_unknown=stored_attempt.remote_outcome_unknown,
                         ),
                     )
             except BaseException as exc:
@@ -667,6 +876,8 @@ class BotsApplication:
                     reconciliation_failure = exc
             finally:
                 self._pending_generations.pop(attempt_id, None)
+                self._generation_tasks.pop(attempt_id, None)
+                self._cancel_requested.discard(attempt_id)
 
         try:
             self._store.close()

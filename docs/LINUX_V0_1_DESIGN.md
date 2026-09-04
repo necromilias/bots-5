@@ -1,15 +1,19 @@
 # Linux v0.1 accepted design
 
-Status: accepted target design; Phase 1 and Phase 2 are implemented and independently validated in
-the current candidate, while human closure and landing remain pending.
+Status: accepted target design; Phase 1 and Phase 2 are implemented and independently validated, and
+the bounded Phase 3 real-generation slice is implemented, deterministically validated, manually
+accepted against a local Qwen endpoint, independently audited through fresh Round 21 Sol/xhigh
+`PASS`, and human-closed in the current unstaged candidate. Landing remains separately pending.
+The retained Phase 2 recovery-artifact interaction remains a separate human-adjudication boundary.
 
 This document is the build-facing technical contract for the first native Linux B.O.T.S. desktop
 application. Organisational Memory owns the full decision rationale and supersession history. This
 repository remains authoritative for what is actually implemented.
 
 Current implemented V0/V0.2 behaviour remains unchanged, and the accepted Phase 1/Phase 2 desktop
-candidate is recorded separately in `docs/LINUX_V0_1_PHASE1_PHASE2_CLOSURE_REPORT.md`. Future phases
-remain separately approved work.
+candidate is recorded separately in `docs/LINUX_V0_1_PHASE1_PHASE2_CLOSURE_REPORT.md`. The Phase 3
+implementation record is `docs/LINUX_V0_1_PHASE3_IMPLEMENTATION_REPORT.md`. Future phases remain
+separately approved work.
 
 ## Product target
 
