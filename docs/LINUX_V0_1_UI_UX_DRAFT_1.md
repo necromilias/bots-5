@@ -250,7 +250,7 @@ Placeholders and visual affordances may exist only when they do not silently cre
 
 The reference mockup is illustrative only:
 
-`docs/assets/ui-ux-draft-1-reference.jpg`
+`docs/assets/ui-ux-draft-1-reference.svg`
 
 It is intended to communicate approximate visual direction, density, message alignment, control placement, and the overall "simple surface / deep capability" feel.
 
