@@ -1,0 +1,1 @@
+"""Desktop composition roots."""

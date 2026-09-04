@@ -24,19 +24,25 @@ operator-supplied local OpenAI-compatible HTTP/HTTPS endpoint.
 ## Linux v0.1 desktop direction
 
 The Linux v0.1 native desktop product, architecture, implementation-technology baseline, and phased
-construction sequence have been accepted. See `docs/LINUX_V0_1_DESIGN.md` for the build-facing target.
+construction sequence have been accepted. See `docs/LINUX_V0_1_DESIGN.md` for the build-facing
+contract.
 
-That document is target design, not an implementation-status claim. The current CLI/runtime behaviour
-and dependencies described below remain the implemented state until separately approved desktop changes
-land.
+The current candidate implements and validates Phase 1 (native walking skeleton) and Phase 2
+(conversation truth, immutable lineage/revisions, and deterministic fake generation). The exact
+implementation and validation record is in `docs/LINUX_V0_1_PHASE1_PHASE2_CLOSURE_REPORT.md`.
+Those changes remain an uncommitted candidate pending human review and separate commit approval.
 
-Linux v0.1 implementation remains separately gated. Future Android, Code/Git, daemon/remote-client,
+The existing CLI, runner, filesystem campaign persistence, manifest semantics, and
+`Provider.complete()` seam remain preserved. Later Linux v0.1 phases remain future work and are not
+advanced by this candidate.
+
+Remaining Linux v0.1 phases remain separately gated. Future Android, Code/Git, daemon/remote-client,
 MCP/tool frameworks, scheduling, RAG, and operating-mode capability systems remain deferred unless a
 concrete v0.1 blocker separately promotes them.
 
 ## Install
 
-Requires Python 3.12+.
+Requires Python 3.12 or 3.13.
 
 ```bash
 python -m venv .venv

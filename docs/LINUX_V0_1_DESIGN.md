@@ -1,12 +1,15 @@
 # Linux v0.1 accepted design
 
-Status: accepted target design; implementation not yet implied.
+Status: accepted target design; Phase 1 and Phase 2 are implemented and independently validated in
+the current candidate, while human closure and landing remain pending.
 
 This document is the build-facing technical contract for the first native Linux B.O.T.S. desktop
 application. Organisational Memory owns the full decision rationale and supersession history. This
 repository remains authoritative for what is actually implemented.
 
-Current implemented V0/V0.2 behaviour remains unchanged until separately approved code changes land.
+Current implemented V0/V0.2 behaviour remains unchanged, and the accepted Phase 1/Phase 2 desktop
+candidate is recorded separately in `docs/LINUX_V0_1_PHASE1_PHASE2_CLOSURE_REPORT.md`. Future phases
+remain separately approved work.
 
 ## Product target
 

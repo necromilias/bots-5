@@ -64,7 +64,18 @@ See `docs/V0_2_DESIGN_CAMPAIGN_REPORT.md` for the campaign evidence and implemen
 ## Linux v0.1 — native desktop design accepted
 
 Linux v0.1 product, architecture, implementation-technology, and construction-sequence decisions have
-been human-adjudicated and accepted. See `docs/LINUX_V0_1_DESIGN.md` for the build-facing contract.
+been human-adjudicated and accepted. See `docs/LINUX_V0_1_DESIGN.md` for the build-facing contract and
+`docs/LINUX_V0_1_PHASE1_PHASE2_CLOSURE_REPORT.md` for the current implementation and validation record.
+
+### Implemented candidate status
+
+Phase 1 and Phase 2 are implemented in the current uncommitted candidate and have passed the required
+deterministic, migration, persistence/restart, offscreen Qt/qasync, and independent adversarial
+validation gates. Manual operator smoke testing also verified native launch, chat creation, fake
+generation, normal close/reopen, and message persistence across restart.
+
+The candidate is prepared for human review but is not staged, committed, pushed, or otherwise landed.
+Phase 3 remains the next future phase and has not been implemented or authorized by this status update.
 
 The accepted target is a real native Linux desktop application centred on persistent multi-chat with
 lossless lineage, concurrent streaming generation, deterministic context construction, reusable
@@ -75,9 +86,10 @@ conversation truth, real generation, concurrency/workspace, provider/model usabi
 context/attachments, search, inspection, recovery/import-export, campaign integration, product
 finishing/packaging, and a final torture run.
 
-The current repository state does not yet claim that Linux v0.1 desktop features are implemented.
-Implementation edits, dependency changes, provider/API calls, commits, and landing remain separately
-approved consequences.
+The current candidate claim is limited to the Phase 1 and Phase 2 scope recorded in the closure report.
+The remaining listed desktop capabilities are target design, not implemented status. Later
+implementation edits, provider/API calls, commits, and landing remain separately approved
+consequences.
 
 Future Code/Git, Android, persistent daemon/remote clients, MCP/tool frameworks, scheduling, RAG,
 mode-governed capability envelopes, and other Future Fuckery remain deferred unless a concrete Linux
