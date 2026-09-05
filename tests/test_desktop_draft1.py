@@ -267,10 +267,13 @@ def test_draft1_busy_state_blocks_navigation_and_stop_persists_abort(tmp_path):
             assert window._generation_busy
             assert window.generation_indicator.text() == "● Generating…"
             assert window.composer.isReadOnly()
-            assert not window.chat_list.isEnabled()
-            assert not window.new_chat_button.isEnabled()
+            assert window.chat_list.isEnabled()
+            assert window.new_chat_button.isEnabled()
             assert not window.send_button.isEnabled()
             window._on_chat_selected(1)
+            await _wait_until(lambda: window._current_chat_id != first_chat_id)
+            window._on_chat_selected(window._chat_ids.index(first_chat_id))
+            await asyncio.sleep(0.02)
             assert window._current_chat_id == first_chat_id
 
             window.cancel_button.click()

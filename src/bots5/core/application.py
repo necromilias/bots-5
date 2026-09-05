@@ -10,11 +10,13 @@ from bots5.domain.clock import Clock, SystemClock
 from bots5.domain.ids import IdFactory, Uuid7Factory
 from bots5.domain.models import (
     AttemptState,
+    ChatActivity,
     Chat,
     GenerationAttempt,
     Message,
     MessageRole,
     MessageState,
+    WorkspaceWindowState,
 )
 
 from .errors import StateError
@@ -162,6 +164,77 @@ class BotsApplication:
     def subscribe(self) -> EventSubscription:
         self._ensure_open()
         return self._events.subscribe()
+
+    def has_active_generations(self) -> bool:
+        return bool(self._pending_generations) or bool(
+            self._store.list_active_generation_attempts()
+        )
+
+    def active_attempt_ids(self, chat_id: str | None = None) -> tuple[str, ...]:
+        pending = tuple(
+            attempt_id
+            for attempt_id, (_, attempt) in self._pending_generations.items()
+            if chat_id is None or attempt.chat_id == chat_id
+        )
+        persisted = tuple(
+            attempt.id
+            for attempt in self._store.list_active_generation_attempts(chat_id)
+            if attempt.id not in pending
+        )
+        return pending + persisted
+
+    def _ensure_chat_has_no_active_generation(self, chat_id: str) -> None:
+        active = self._store.list_active_generation_attempts(chat_id)
+        if active:
+            raise StateError(
+                "chat already has an active generation: "
+                f"{chat_id} ({active[0].id})"
+            )
+
+    @_tracked_command
+    async def chat_activity(self, chat_id: str) -> ChatActivity:
+        self._ensure_open()
+        if self._store.get_chat(chat_id) is None:
+            raise StateError(f"chat not found: {chat_id}")
+        return ChatActivity(
+            active_attempt_ids=tuple(
+                attempt.id for attempt in self._store.list_active_generation_attempts(chat_id)
+            )
+        )
+
+    @_tracked_command
+    async def list_workspace_windows(self) -> tuple[WorkspaceWindowState, ...]:
+        self._ensure_open()
+        return self._store.list_workspace_windows()
+
+    @_tracked_command
+    async def save_workspace_window(
+        self,
+        *,
+        window_id: str,
+        ordinal: int,
+        geometry: tuple[int, int, int, int] | None,
+        selected_chat_id: str | None,
+        rail_collapsed: bool,
+        restore_open: bool = True,
+    ) -> WorkspaceWindowState:
+        self._ensure_open()
+        state = WorkspaceWindowState(
+            window_id=window_id,
+            ordinal=ordinal,
+            geometry=geometry,
+            selected_chat_id=selected_chat_id,
+            rail_collapsed=rail_collapsed,
+            restore_open=restore_open,
+            updated_at=self._clock.now(),
+        )
+        self._store.save_workspace_window(state)
+        return state
+
+    @_tracked_command
+    async def delete_workspace_window(self, window_id: str) -> None:
+        self._ensure_open()
+        self._store.delete_workspace_window(window_id)
 
     @_tracked_command
     async def create_chat(self, title: str = "New chat") -> Chat:
@@ -315,7 +388,12 @@ class BotsApplication:
         pending = self._pending_generations.get(attempt_id)
         task = self._generation_tasks.get(attempt_id)
         if pending is None or task is None:
-            raise StateError(f"generation attempt is not running: {attempt_id}")
+            stored = self._store.get_generation_attempt(attempt_id)
+            if stored is None:
+                raise StateError(f"generation attempt is not running: {attempt_id}")
+            if stored.state is not AttemptState.RUNNING:
+                return stored
+            raise StateError(f"generation task is unavailable: {attempt_id}")
         self._cancel_requested.add(attempt_id)
         terminal_event = self._generation_terminal_events.get(attempt_id)
         if not task.done() and (
@@ -369,6 +447,7 @@ class BotsApplication:
         chat = self._store.get_chat(chat_id)
         if chat is None:
             raise StateError(f"chat not found: {chat_id}")
+        self._ensure_chat_has_no_active_generation(chat_id)
 
         now = self._clock.now()
         user_message = Message(
@@ -435,6 +514,7 @@ class BotsApplication:
         chat = self._store.get_chat(chat_id)
         if chat is None:
             raise StateError(f"chat not found: {chat_id}")
+        self._ensure_chat_has_no_active_generation(chat_id)
         target = self._active_branch_contains(chat_id, message_id)
         if target.role != MessageRole.USER or target.state != MessageState.SENT:
             raise StateError("only sent user messages can be edited")
@@ -516,6 +596,7 @@ class BotsApplication:
         chat = self._store.get_chat(chat_id)
         if chat is None:
             raise StateError(f"chat not found: {chat_id}")
+        self._ensure_chat_has_no_active_generation(chat_id)
         target = self._active_branch_contains(chat_id, message_id)
         if target.role != MessageRole.ASSISTANT or target.state == MessageState.STREAMING:
             raise StateError("only terminal assistant messages can be regenerated")

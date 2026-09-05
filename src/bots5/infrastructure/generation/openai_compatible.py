@@ -14,7 +14,12 @@ from bots5.core.generation import (
 )
 from bots5.core.urls import canonical_http_base_url
 from bots5.errors import ProviderError, ProviderHttpError, ProviderResponseError
-from bots5.providers.base import CompletionRequest, CompletionStreamEvent, StreamingProvider
+from bots5.providers.base import (
+    CompletionRequest,
+    CompletionStreamEvent,
+    ReasoningEffort,
+    StreamingProvider,
+)
 
 
 class OpenAICompatibleStreamingBackend:
@@ -31,6 +36,7 @@ class OpenAICompatibleStreamingBackend:
         api_key_env: str | None = None,
         temperature: float = 0.0,
         max_output_tokens: int = 1024,
+        reasoning_effort: ReasoningEffort | None = None,
     ) -> None:
         if provider_id not in {"local_openai", "openrouter"}:
             raise ValueError(f"unsupported OpenAI-compatible provider ID: {provider_id}")
@@ -43,12 +49,15 @@ class OpenAICompatibleStreamingBackend:
             raise ValueError("temperature must be between 0 and 2")
         if max_output_tokens < 1:
             raise ValueError("max_output_tokens must be positive")
+        if reasoning_effort not in {None, "none"}:
+            raise ValueError("reasoning_effort must be None or 'none'")
         self._provider = provider
         self.provider_id = provider_id
         self.base_url = base_url
         self.api_key_env = api_key_env
         self.temperature = temperature
         self.max_output_tokens = max_output_tokens
+        self.reasoning_effort = reasoning_effort
 
     @staticmethod
     def _merge_metadata(
@@ -110,6 +119,7 @@ class OpenAICompatibleStreamingBackend:
             temperature=self.temperature,
             max_output_tokens=self.max_output_tokens,
             timeout_seconds=0.0,
+            reasoning_effort=self.reasoning_effort,
         )
         metadata = CompletionStreamEvent()
         finish_reason: str | None = None

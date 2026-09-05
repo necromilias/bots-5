@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import re
 
 from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from sqlalchemy import Engine, create_engine, delete, event, func, insert, select, update
+from sqlalchemy import Engine, create_engine, delete, event, func, insert, select, text, update
 
 from bots5.core.errors import RevisionConflict, StateError
 from bots5.domain.clock import parse_utc, utc_iso
@@ -17,9 +18,10 @@ from bots5.domain.models import (
     Message,
     MessageRole,
     MessageState,
+    WorkspaceWindowState,
 )
 
-from .schema import chats, generation_attempts, messages
+from .schema import chats, generation_attempts, messages, workspace_windows
 from .phase3_validation import (
     PHASE3_BACKEND_ID,
     is_phase3_record,
@@ -66,6 +68,24 @@ _PHASE3_COLUMN_TYPES = {
     "known_cost_usd": "TEXT",
     "remote_outcome_unknown": "BOOLEAN",
 }
+_PHASE4_WORKSPACE_COLUMN_TYPES = {
+    "window_id": "VARCHAR(128)",
+    "ordinal": "INTEGER",
+    "geometry_json": "TEXT",
+    "selected_chat_id": "VARCHAR(64)",
+    "rail_collapsed": "BOOLEAN",
+    "restore_open": "BOOLEAN",
+    "updated_at": "VARCHAR(40)",
+}
+_PHASE4_WORKSPACE_NOT_NULL = {
+    "ordinal",
+    "rail_collapsed",
+    "restore_open",
+    "updated_at",
+}
+_PHASE4_ACTIVE_INDEX_PREDICATE = re.compile(
+    r"\(?\s*(?i:state|\"state\"|`state`|\[state\])\s*=\s*'running'\s*\)?",
+)
 
 
 def _validate_request_snapshot(
@@ -240,6 +260,129 @@ def _message_values(message: Message) -> dict[str, object]:
     }
 
 
+def _workspace_window(row) -> WorkspaceWindowState:
+    mapping = row._mapping
+    geometry_value = mapping["geometry_json"]
+    geometry: tuple[int, int, int, int] | None
+    if geometry_value is None:
+        geometry = None
+    else:
+        try:
+            decoded = json.loads(geometry_value)
+        except (TypeError, ValueError) as exc:
+            raise StateError("workspace geometry is not valid JSON") from exc
+        if (
+            not isinstance(decoded, list)
+            or len(decoded) != 4
+            or not all(type(value) is int for value in decoded)
+        ):
+            raise StateError("workspace geometry must contain four integers")
+        geometry = tuple(decoded)  # type: ignore[assignment]
+    try:
+        return WorkspaceWindowState(
+            window_id=str(mapping["window_id"]),
+            ordinal=int(mapping["ordinal"]),
+            geometry=geometry,
+            selected_chat_id=mapping["selected_chat_id"],
+            rail_collapsed=bool(mapping["rail_collapsed"]),
+            restore_open=bool(mapping["restore_open"]),
+            updated_at=parse_utc(mapping["updated_at"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise StateError("workspace window state is malformed") from exc
+
+
+def _validate_phase4_schema(connection) -> None:
+    table_exists = connection.exec_driver_sql(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'workspace_windows'"
+    ).first()
+    if table_exists is None:
+        raise RuntimeError("current Phase 4 schema is missing workspace_windows")
+
+    workspace_columns = {
+        row[1]: row
+        for row in connection.exec_driver_sql("PRAGMA table_info(workspace_windows)").fetchall()
+    }
+    missing_columns = sorted(set(_PHASE4_WORKSPACE_COLUMN_TYPES) - set(workspace_columns))
+    if missing_columns:
+        raise RuntimeError(
+            "current Phase 4 workspace_windows schema is missing columns: "
+            + ", ".join(missing_columns)
+        )
+    wrong_columns = sorted(
+        name
+        for name, expected_type in _PHASE4_WORKSPACE_COLUMN_TYPES.items()
+        if str(workspace_columns[name][2]).upper().replace(" ", "")
+        != expected_type
+    )
+    if wrong_columns:
+        details = ", ".join(
+            f"{name}={workspace_columns[name][2]}" for name in wrong_columns
+        )
+        raise RuntimeError(
+            "current Phase 4 workspace_windows columns have invalid declared types: "
+            + details
+        )
+    wrong_nullability = sorted(
+        name
+        for name in _PHASE4_WORKSPACE_NOT_NULL
+        if workspace_columns[name][3] != 1
+    )
+    if wrong_nullability:
+        raise RuntimeError(
+            "current Phase 4 workspace_windows columns must be non-null: "
+            + ", ".join(wrong_nullability)
+        )
+    if workspace_columns["window_id"][5] != 1:
+        raise RuntimeError("current Phase 4 workspace_windows must use window_id as its primary key")
+
+    foreign_keys = connection.exec_driver_sql(
+        "PRAGMA foreign_key_list(workspace_windows)"
+    ).fetchall()
+    if not any(
+        row[2] == "chats"
+        and row[3] == "selected_chat_id"
+        and row[4] == "id"
+        and str(row[6]).upper() == "SET NULL"
+        for row in foreign_keys
+    ):
+        raise RuntimeError(
+            "current Phase 4 workspace_windows is missing the selected_chat_id chat reference"
+        )
+
+    index_rows = connection.exec_driver_sql(
+        "PRAGMA index_list(generation_attempts)"
+    ).fetchall()
+    active_index = next(
+        (row for row in index_rows if row[1] == "ux_generation_attempts_active_chat"),
+        None,
+    )
+    if active_index is None:
+        raise RuntimeError("current Phase 4 schema is missing the active-chat uniqueness index")
+    if active_index[2] != 1 or active_index[4] != 1:
+        raise RuntimeError("current Phase 4 active-chat index must be unique and partial")
+    index_columns = connection.exec_driver_sql(
+        "PRAGMA index_info(ux_generation_attempts_active_chat)"
+    ).fetchall()
+    if [(row[0], row[2]) for row in index_columns] != [(0, "chat_id")]:
+        raise RuntimeError(
+            "current Phase 4 active-chat index must cover only generation_attempts.chat_id"
+        )
+    index_sql = connection.execute(
+        text(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'index' AND name = 'ux_generation_attempts_active_chat'"
+        )
+    ).scalar_one_or_none()
+    normalized_index_sql = " ".join(str(index_sql or "").strip().rstrip(";").split())
+    where_match = re.search(r"\bwhere\b(?P<predicate>.*)\Z", normalized_index_sql, re.IGNORECASE)
+    predicate = where_match.group("predicate").strip() if where_match else ""
+    if not _PHASE4_ACTIVE_INDEX_PREDICATE.fullmatch(predicate):
+        raise RuntimeError(
+            "current Phase 4 active-chat index must be filtered to running attempts"
+        )
+
+
 class SQLiteAppStateStore:
     def __init__(self, engine: Engine):
         self._engine = engine
@@ -277,13 +420,13 @@ class SQLiteAppStateStore:
                     "known_cost_usd",
                     "remote_outcome_unknown",
                 }
-                if revision == "0005_generation_outcomes" and not phase3_columns <= columns:
+                if revision in {"0005_generation_outcomes", "0006_phase4_workspace"} and not phase3_columns <= columns:
                     missing = ", ".join(sorted(phase3_columns - columns))
                     raise RuntimeError(
                         "current Phase 3 schema is missing generation outcome columns: "
                         f"{missing}"
                     )
-                if revision == "0005_generation_outcomes":
+                if revision in {"0005_generation_outcomes", "0006_phase4_workspace"} or "provider_id" in columns:
                     non_nullable = sorted(
                         name for name in phase3_columns if column_info[name][3] != 0
                     )
@@ -307,6 +450,8 @@ class SQLiteAppStateStore:
                             "current Phase 3 schema outcome columns have invalid declared types: "
                             + details
                         )
+                if revision == "0006_phase4_workspace":
+                    _validate_phase4_schema(connection)
                 if "provider_id" in columns:
                     outcomes = __import__(
                         "bots5.infrastructure.persistence.migrations.versions.0005_generation_outcomes",
@@ -447,6 +592,59 @@ class SQLiteAppStateStore:
             )
         return tuple(attempts)
 
+    def list_active_generation_attempts(
+        self,
+        chat_id: str | None = None,
+    ) -> tuple[GenerationAttempt, ...]:
+        self._ensure_open()
+        statement = (
+            select(
+                generation_attempts,
+                messages.c.id.label("_attempt_user_message_id"),
+                messages.c.content.label("_attempt_user_message_content"),
+            )
+            .select_from(
+                generation_attempts.join(
+                    messages,
+                    messages.c.id == generation_attempts.c.user_message_id,
+                )
+            )
+            .where(generation_attempts.c.state == AttemptState.RUNNING.value)
+            .order_by(generation_attempts.c.started_at.asc(), generation_attempts.c.id.asc())
+        )
+        if chat_id is not None:
+            statement = statement.where(generation_attempts.c.chat_id == chat_id)
+        with self._engine.connect() as connection:
+            rows = connection.execute(statement).fetchall()
+        return tuple(
+            _attempt(row, row._mapping["_attempt_user_message_content"])
+            for row in rows
+        )
+
+    def get_generation_attempt(self, attempt_id: str) -> GenerationAttempt | None:
+        self._ensure_open()
+        with self._engine.connect() as connection:
+            row = connection.execute(
+                select(
+                    generation_attempts,
+                    messages.c.id.label("_attempt_user_message_id"),
+                    messages.c.content.label("_attempt_user_message_content"),
+                )
+                .select_from(
+                    generation_attempts.outerjoin(
+                        messages,
+                        messages.c.id == generation_attempts.c.user_message_id,
+                    )
+                )
+                .where(generation_attempts.c.id == attempt_id)
+            ).first()
+        if row is None:
+            return None
+        mapping = row._mapping
+        if mapping["_attempt_user_message_id"] is None:
+            raise StateError(f"generation attempt user message not found: {attempt_id}")
+        return _attempt(row, mapping["_attempt_user_message_content"])
+
     def next_message_sequence(self, chat_id: str) -> int:
         self._ensure_open()
         with self._engine.connect() as connection:
@@ -532,6 +730,20 @@ class SQLiteAppStateStore:
             raise StateError("generation attempt assistant must belong to its user turn")
         _validate_request_snapshot(attempt, user_message.content)
         _validate_attempt_outcome(attempt)
+
+        active_id = connection.execute(
+            select(generation_attempts.c.id)
+            .where(
+                generation_attempts.c.chat_id == attempt.chat_id,
+                generation_attempts.c.state == AttemptState.RUNNING.value,
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+        if active_id is not None:
+            raise StateError(
+                "chat already has an active generation: "
+                f"{attempt.chat_id} ({active_id})"
+            )
 
         arm_transition(
             connection,
@@ -874,6 +1086,53 @@ class SQLiteAppStateStore:
             )
             if result.rowcount != 1:
                 raise StateError(f"generation attempt not found: {attempt.id}")
+
+    def list_workspace_windows(self) -> tuple[WorkspaceWindowState, ...]:
+        self._ensure_open()
+        with self._engine.connect() as connection:
+            rows = connection.execute(
+                select(workspace_windows).order_by(
+                    workspace_windows.c.ordinal.asc(),
+                    workspace_windows.c.window_id.asc(),
+                )
+            ).fetchall()
+        states: list[WorkspaceWindowState] = []
+        for row in rows:
+            try:
+                states.append(_workspace_window(row))
+            except StateError:
+                # Presentation corruption must fall back to a fresh window;
+                # it must not prevent access to durable chat state.
+                continue
+        return tuple(states)
+
+    def save_workspace_window(self, state: WorkspaceWindowState) -> None:
+        self._ensure_open()
+        geometry_json = None if state.geometry is None else json.dumps(list(state.geometry))
+        with self._engine.begin() as connection:
+            connection.execute(
+                delete(workspace_windows).where(
+                    workspace_windows.c.window_id == state.window_id
+                )
+            )
+            connection.execute(
+                insert(workspace_windows).values(
+                    window_id=state.window_id,
+                    ordinal=state.ordinal,
+                    geometry_json=geometry_json,
+                    selected_chat_id=state.selected_chat_id,
+                    rail_collapsed=state.rail_collapsed,
+                    restore_open=state.restore_open,
+                    updated_at=utc_iso(state.updated_at),
+                )
+            )
+
+    def delete_workspace_window(self, window_id: str) -> None:
+        self._ensure_open()
+        with self._engine.begin() as connection:
+            connection.execute(
+                delete(workspace_windows).where(workspace_windows.c.window_id == window_id)
+            )
 
     def close(self) -> None:
         if not self._closed:

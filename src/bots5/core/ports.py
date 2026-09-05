@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from bots5.domain.models import Chat, GenerationAttempt, Message
+from bots5.domain.models import Chat, GenerationAttempt, Message, WorkspaceWindowState
 
 
 class AppStateStore(Protocol):
@@ -29,6 +29,15 @@ class AppStateStore(Protocol):
         ...
 
     def list_generation_attempts(self, chat_id: str) -> tuple[GenerationAttempt, ...]:
+        ...
+
+    def list_active_generation_attempts(
+        self,
+        chat_id: str | None = None,
+    ) -> tuple[GenerationAttempt, ...]:
+        ...
+
+    def get_generation_attempt(self, attempt_id: str) -> GenerationAttempt | None:
         ...
 
     def get_message(self, message_id: str) -> Message | None:
@@ -72,6 +81,15 @@ class AppStateStore(Protocol):
         ...
 
     def reconcile_interrupted_generations(self, now) -> None:
+        ...
+
+    def list_workspace_windows(self) -> tuple[WorkspaceWindowState, ...]:
+        ...
+
+    def save_workspace_window(self, state: WorkspaceWindowState) -> None:
+        ...
+
+    def delete_workspace_window(self, window_id: str) -> None:
         ...
 
     def close(self) -> None:

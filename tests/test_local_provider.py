@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import httpx
 import pytest
@@ -11,7 +12,7 @@ from bots5.providers.openai_compatible import OpenAICompatibleProvider
 from bots5.providers.openrouter import OpenRouterProvider
 
 
-def req() -> CompletionRequest:
+def req(*, reasoning_effort=None) -> CompletionRequest:
     return CompletionRequest(
         model="model-x",
         system="sys",
@@ -19,6 +20,7 @@ def req() -> CompletionRequest:
         temperature=0.1,
         max_output_tokens=100,
         timeout_seconds=1.0,
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -40,8 +42,6 @@ def test_local_provider_builds_non_streaming_request_and_appends_endpoint():
     )
     result = asyncio.run(provider.complete(req()))
 
-    import json
-
     payload = json.loads(seen["json"])
     assert seen["url"] == "http://127.0.0.1:8000/v1/chat/completions"
     assert "authorization" not in seen["headers"]
@@ -54,6 +54,34 @@ def test_local_provider_builds_non_streaming_request_and_appends_endpoint():
     assert payload["max_tokens"] == 100
     assert payload["stream"] is False
     assert result.output_text == "ok"
+
+
+def test_local_provider_emits_explicit_reasoning_effort_without_changing_other_fields():
+    seen = {}
+
+    async def handler(request: httpx.Request):
+        seen["payload"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={"choices": [{"finish_reason": "stop", "message": {"content": "ok"}}]},
+        )
+
+    provider = OpenAICompatibleProvider(
+        "http://127.0.0.1:8000/v1", _transport=httpx.MockTransport(handler)
+    )
+    asyncio.run(provider.complete(req(reasoning_effort="none")))
+
+    assert seen["payload"] == {
+        "model": "model-x",
+        "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "user"},
+        ],
+        "temperature": 0.1,
+        "max_tokens": 100,
+        "stream": False,
+        "reasoning_effort": "none",
+    }
 
 
 def test_local_provider_uses_only_configured_auth_environment(monkeypatch):

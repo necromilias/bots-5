@@ -103,6 +103,8 @@ def test_desktop_parser_exposes_explicit_local_backend_configuration():
             "Qwen3-8B",
             "--api-key-env",
             "LOCAL_QWEN_KEY",
+            "--reasoning-effort",
+            "none",
         ]
     )
 
@@ -110,4 +112,6 @@ def test_desktop_parser_exposes_explicit_local_backend_configuration():
     assert args.base_url == "http://127.0.0.1:8000/v1"
     assert args.model == "Qwen3-8B"
     assert args.api_key_env == "LOCAL_QWEN_KEY"
+    assert args.reasoning_effort == "none"
     assert _parser().parse_args([]).backend == "fake"
+    assert _parser().parse_args([]).reasoning_effort is None

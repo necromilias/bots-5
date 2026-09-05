@@ -95,3 +95,38 @@ class GenerationAttempt:
     total_tokens: int | None = None
     known_cost_usd: Decimal | None = None
     remote_outcome_unknown: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ChatActivity:
+    """Session-derived activity for one chat; never persisted as domain truth."""
+
+    active_attempt_ids: tuple[str, ...] = ()
+    background_completion: bool = False
+    needs_attention: bool = False
+
+    @property
+    def has_running(self) -> bool:
+        return bool(self.active_attempt_ids)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceWindowState:
+    """Minimal restorable presentation state for one native window."""
+
+    window_id: str
+    ordinal: int
+    geometry: tuple[int, int, int, int] | None
+    selected_chat_id: str | None
+    rail_collapsed: bool
+    restore_open: bool
+    updated_at: datetime
+
+    def __post_init__(self) -> None:
+        if not self.window_id:
+            raise ValueError("workspace window id must not be empty")
+        if self.ordinal < 0:
+            raise ValueError("workspace window ordinal must be nonnegative")
+        if self.geometry is not None:
+            if len(self.geometry) != 4 or not all(isinstance(value, int) for value in self.geometry):
+                raise ValueError("workspace geometry must contain four integers")

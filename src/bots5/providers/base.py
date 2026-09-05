@@ -3,7 +3,10 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Protocol
+from typing import Literal, Protocol
+
+
+ReasoningEffort = Literal["none"]
 
 
 @dataclass(frozen=True)
@@ -14,6 +17,7 @@ class CompletionRequest:
     temperature: float
     max_output_tokens: int
     timeout_seconds: float
+    reasoning_effort: ReasoningEffort | None = None
 
 
 @dataclass(frozen=True)

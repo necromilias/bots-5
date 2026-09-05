@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -21,7 +21,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from bots5.domain.models import Chat, GenerationAttempt, Message, MessageRole, MessageState
+from bots5.domain.models import (
+    Chat,
+    ChatActivity,
+    GenerationAttempt,
+    Message,
+    MessageRole,
+    MessageState,
+)
 
 from .profile import DesktopSessionInfo
 
@@ -106,6 +113,7 @@ class TopBar(QFrame):
 
 class LeftRail(QFrame):
     new_chat_requested = Signal()
+    chat_indicator_requested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -140,6 +148,13 @@ class LeftRail(QFrame):
         self.chat_list.setAccessibleName("Chats")
         layout.addWidget(self.chat_list, 1)
 
+        self.activity_column = QVBoxLayout()
+        self.activity_column.setContentsMargins(0, 2, 0, 0)
+        self.activity_column.setSpacing(4)
+        layout.addLayout(self.activity_column)
+        self._chat_buttons: dict[str, QToolButton] = {}
+        self._chat_titles: dict[str, str] = {}
+
     def _focus_chat_list(self) -> None:
         if self._collapsed:
             self.set_collapsed(False)
@@ -172,9 +187,30 @@ class LeftRail(QFrame):
         )
         self.section_label.setVisible(not collapsed)
         self.chat_list.setVisible(not collapsed)
+        for button in self._chat_buttons.values():
+            button.setVisible(collapsed)
 
     def set_chats(self, chats: Iterable[Chat], selected_chat_id: str | None) -> None:
         chats = tuple(chats)
+        while self.activity_column.count():
+            item = self.activity_column.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._chat_buttons.clear()
+        self._chat_titles = {chat.id: chat.title for chat in chats}
+        for chat in chats:
+            button = self._icon_button("·", chat.title)
+            button.setObjectName("chatActivityIndicator")
+            button.setCheckable(True)
+            button.setFixedSize(32, 32)
+            button.setVisible(self._collapsed)
+            button.clicked.connect(
+                lambda checked=False, chat_id=chat.id: self.chat_indicator_requested.emit(chat_id)
+            )
+            self.activity_column.addWidget(button)
+            self._chat_buttons[chat.id] = button
+        self.activity_column.addStretch(1)
         self.chat_list.blockSignals(True)
         try:
             self.chat_list.clear()
@@ -191,6 +227,33 @@ class LeftRail(QFrame):
                 self.chat_list.setCurrentRow(0)
         finally:
             self.chat_list.blockSignals(False)
+        self.set_activity({}, selected_chat_id)
+
+    def set_activity(
+        self,
+        activities: Mapping[str, ChatActivity],
+        selected_chat_id: str | None,
+    ) -> None:
+        for chat_id, button in self._chat_buttons.items():
+            activity = activities.get(chat_id, ChatActivity())
+            if activity.has_running:
+                marker = "●"
+                state = "running"
+            elif activity.needs_attention:
+                marker = "!"
+                state = "needs attention"
+            elif activity.background_completion:
+                marker = "✓"
+                state = "completed in background"
+            else:
+                marker = "·"
+                state = "idle"
+            button.setText(marker)
+            title = self._chat_titles.get(chat_id, chat_id)
+            selected = "; selected" if chat_id == selected_chat_id else ""
+            button.setToolTip(f"{title} — {state}{selected}")
+            button.setAccessibleName(button.toolTip())
+            button.setChecked(chat_id == selected_chat_id)
 
 
 class MessageRow(QWidget):

@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QClipboard
+from PySide6.QtGui import QAction, QClipboard
 from PySide6.QtWidgets import (
     QDockWidget,
     QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QToolButton,
     QVBoxLayout,
@@ -18,10 +19,10 @@ from PySide6.QtWidgets import (
 
 from bots5.core.application import BotsApplication
 from bots5.core.events import CoreEvent
-from bots5.domain.models import AttemptState, Chat, Message, MessageRole
+from bots5.domain.models import AttemptState, Chat, ChatActivity, Message, MessageRole, WorkspaceWindowState
 
-from .bridge import CoreEventBridge
 from .profile import DesktopSessionInfo
+from .session import DesktopSessionController
 from .theme import apply_draft1_theme
 from .widgets import ComposerEdit, InspectorPanel, LeftRail, MessageRow, TopBar, TranscriptView
 
@@ -38,16 +39,25 @@ _TERMINAL_EVENT_KINDS = frozenset(
 
 class MainWindow(QMainWindow):
     closed = Signal()
+    new_window_requested = Signal()
 
     def __init__(
         self,
         application: BotsApplication,
         session: DesktopSessionInfo | None = None,
+        workspace: DesktopSessionController | None = None,
+        window_state: WorkspaceWindowState | None = None,
     ) -> None:
         super().__init__()
         self._application = application
         self._session = session or DesktopSessionInfo("fake", "fake-v0.1")
-        self._bridge = CoreEventBridge(application)
+        self._workspace = workspace or DesktopSessionController(application, self._session)
+        self._owns_workspace = workspace is None
+        self._bridge = self._workspace.bridge
+        self._window_state = window_state
+        self._window_id = window_state.window_id if window_state is not None else None
+        self._window_ordinal = window_state.ordinal if window_state is not None else None
+        self._closing = False
         self._chat_ids: list[str] = []
         self._current_chat_id: str | None = None
         self._current_chat: Chat | None = None
@@ -59,6 +69,8 @@ class MainWindow(QMainWindow):
         self._generation_busy = False
         self._editing_message_id: str | None = None
         self._editing_chat_id: str | None = None
+        self._activity: dict[str, ChatActivity] = {}
+        self._workspace_attached = True
 
         self.setWindowTitle("B.O.T.S. 5")
         self.resize(1180, 760)
@@ -66,7 +78,8 @@ class MainWindow(QMainWindow):
         if application_instance is not None:
             apply_draft1_theme(application_instance)
         self._build_ui()
-        self._bridge.event_received.connect(self._on_event)
+        self._workspace.event_received.connect(self._on_event)
+        self._workspace.activity_changed.connect(self._on_activity_changed)
 
     @staticmethod
     def _qt_application():
@@ -75,6 +88,14 @@ class MainWindow(QMainWindow):
         return QApplication.instance()
 
     def _build_ui(self) -> None:
+        self.new_window_action = QAction("New Window", self)
+        self.new_window_action.setShortcut("Ctrl+Shift+N")
+        self.new_window_action.setToolTip("Open another window over this B.O.T.S. session")
+        self.new_window_action.triggered.connect(
+            lambda checked=False: self.new_window_requested.emit()
+        )
+        self.menuBar().addAction(self.new_window_action)
+
         root = QWidget(self)
         root.setObjectName("draft1Root")
         root_layout = QVBoxLayout(root)
@@ -93,6 +114,7 @@ class MainWindow(QMainWindow):
 
         self.rail = LeftRail(body)
         self.rail.new_chat_requested.connect(self._on_new_chat)
+        self.rail.chat_indicator_requested.connect(self._on_chat_indicator_selected)
         self.rail.chat_list.currentRowChanged.connect(self._on_chat_selected)
         body_layout.addWidget(self.rail)
         self.chat_list = self.rail.chat_list
@@ -199,16 +221,39 @@ class MainWindow(QMainWindow):
         return button
 
     async def initialize(self) -> None:
-        self._bridge.start()
+        if self._window_id is None:
+            self._window_id, self._window_ordinal = self._workspace.register_window(self)
+        else:
+            self._window_id, self._window_ordinal = self._workspace.register_window(
+                self,
+                window_id=self._window_id,
+                ordinal=self._window_ordinal,
+            )
+        self._workspace.start()
+        if self._window_state is not None:
+            self.rail.set_collapsed(self._window_state.rail_collapsed)
+            geometry = self._window_state.geometry
+            if geometry is not None:
+                self.setGeometry(*geometry)
         chats = await self._application.list_chats()
         if not chats:
             await self._application.create_chat()
             chats = await self._application.list_chats()
         self._replace_chat_list(chats)
         if chats:
-            self._current_chat_id = chats[0].id
-            self.rail.chat_list.setCurrentRow(0)
-            await self._refresh_transcript(chats[0].id)
+            selected = (
+                self._window_state.selected_chat_id
+                if self._window_state is not None
+                else None
+            )
+            if selected not in {chat.id for chat in chats}:
+                selected = chats[0].id
+            self._current_chat_id = selected
+            self._select_chat_row(selected)
+            self._workspace.set_selected_chat(self._window_id, selected)
+            await self._refresh_transcript(selected)
+            await self._sync_current_activity()
+        await self._save_workspace()
 
     def _replace_chat_list(self, chats: tuple[Chat, ...] | list[Chat]) -> None:
         chats = tuple(chats)
@@ -217,6 +262,7 @@ class MainWindow(QMainWindow):
         self.rail.set_chats(chats, selected)
         if self._current_chat_id not in self._chat_ids:
             self._current_chat_id = self._chat_ids[0] if self._chat_ids else None
+        self.rail.set_activity(self._activity, self._current_chat_id)
         self._update_controls()
 
     def _select_chat_row(self, chat_id: str | None) -> None:
@@ -225,24 +271,29 @@ class MainWindow(QMainWindow):
         self.rail.chat_list.setCurrentRow(self._chat_ids.index(chat_id))
 
     def _on_chat_selected(self, row: int) -> None:
-        if self._generation_busy:
-            self._select_chat_row(self._current_chat_id)
-            return
         if 0 <= row < len(self._chat_ids):
             chat_id = self._chat_ids[row]
             if chat_id != self._current_chat_id:
                 self._clear_editing()
             self._current_chat_id = chat_id
             self._selected_message = None
+            if self._window_id is not None:
+                self._workspace.set_selected_chat(self._window_id, chat_id)
+            self.rail.set_activity(self._activity, chat_id)
             self._schedule(self._refresh_transcript(self._current_chat_id))
+            self._schedule(self._sync_current_activity())
+            self._schedule(self._save_workspace())
+
+    def _on_chat_indicator_selected(self, chat_id: str) -> None:
+        self._select_chat_row(chat_id)
 
     def _toggle_rail(self) -> None:
         self.rail.set_collapsed(not self.rail.collapsed)
+        self._schedule(self._save_workspace())
 
     def _on_new_chat(self) -> None:
-        if not self._generation_busy:
-            self._clear_editing()
-            self._schedule(self._create_chat())
+        self._clear_editing()
+        self._schedule(self._create_chat())
 
     async def _create_chat(self) -> None:
         chat = await self._application.create_chat()
@@ -254,8 +305,7 @@ class MainWindow(QMainWindow):
         await self._refresh_transcript(chat.id)
 
     def _on_send(self) -> None:
-        if not self._generation_busy:
-            self._schedule(self._send_message())
+        self._schedule(self._send_message())
 
     async def _send_message(self) -> None:
         if self._generation_busy or self._current_chat_id is None:
@@ -284,11 +334,13 @@ class MainWindow(QMainWindow):
         attempts = await self._application.list_generation_attempts(chat_id)
         current = next((attempt for attempt in attempts if attempt.id == attempt_id), None)
         if current is None or current.state is AttemptState.RUNNING:
-            self._set_generation_busy(True)
-            self._active_attempt_id = attempt_id
+            if chat_id == self._current_chat_id:
+                self._set_generation_busy(True)
+                self._active_attempt_id = attempt_id
         else:
-            self._active_attempt_id = None
-            self._set_generation_busy(False)
+            if chat_id == self._current_chat_id:
+                self._active_attempt_id = None
+                self._set_generation_busy(False)
         await self._refresh_transcript(chat_id)
 
     def _on_cancel(self) -> None:
@@ -361,7 +413,7 @@ class MainWindow(QMainWindow):
         return message_id
 
     def _on_regenerate_message(self, message: Message) -> None:
-        if not self._generation_busy and self._current_chat_id is not None:
+        if self._current_chat_id is not None:
             self._schedule(self._regenerate_message(message))
 
     async def _regenerate_message(self, message: Message) -> None:
@@ -395,11 +447,11 @@ class MainWindow(QMainWindow):
         self._generation_busy = busy
         self.generation_indicator.setVisible(busy)
         self.composer.setReadOnly(busy)
-        self.chat_list.setEnabled(not busy)
-        self.new_chat_button.setEnabled(not busy)
+        self.chat_list.setEnabled(True)
+        self.new_chat_button.setEnabled(True)
         self.send_button.setEnabled(not busy and bool(self.composer.toPlainText().strip()))
         self.cancel_button.setEnabled(busy and self._active_attempt_id is not None)
-        self.rail.chat_button.setEnabled(not busy)
+        self.rail.chat_button.setEnabled(True)
         for row in self.transcript.message_rows.values():
             row.set_generation_busy(busy)
 
@@ -410,6 +462,8 @@ class MainWindow(QMainWindow):
         self.cancel_button.setEnabled(self._generation_busy and self._active_attempt_id is not None)
 
     def _on_event(self, event: CoreEvent) -> None:
+        if not self._workspace_attached:
+            return
         if not isinstance(event, CoreEvent):
             return
         chat_id = event.payload.get("chat_id")
@@ -424,6 +478,35 @@ class MainWindow(QMainWindow):
             self._active_attempt_id = None
             self._set_generation_busy(False)
         self._schedule(self._handle_event(event))
+
+    def _on_activity_changed(self, chat_id: str, activity: ChatActivity) -> None:
+        if not self._workspace_attached:
+            return
+        self._activity[chat_id] = activity
+        self.rail.set_activity(self._activity, self._current_chat_id)
+        if chat_id == self._current_chat_id:
+            self._schedule(self._sync_current_activity())
+
+    async def _sync_current_activity(self) -> None:
+        chat_id = self._current_chat_id
+        if chat_id is None:
+            self._active_attempt_id = None
+            self._set_generation_busy(False)
+            return
+        activity = self._workspace.activity_for(chat_id)
+        if not activity.active_attempt_ids:
+            try:
+                activity = await self._application.chat_activity(chat_id)
+            except Exception:
+                activity = ChatActivity()
+        self._activity[chat_id] = activity
+        if activity.active_attempt_ids:
+            self._active_attempt_id = activity.active_attempt_ids[0]
+            self._set_generation_busy(True)
+        else:
+            self._active_attempt_id = None
+            self._set_generation_busy(False)
+        self.rail.set_activity(self._activity, chat_id)
 
     async def _handle_event(self, event: CoreEvent) -> None:
         chat_id = event.payload.get("chat_id")
@@ -461,6 +544,18 @@ class MainWindow(QMainWindow):
         if self.inspector_dock.isVisible():
             await self._refresh_inspector()
 
+    async def _save_workspace(self) -> None:
+        if self._window_id is None:
+            return
+        geometry = self.geometry()
+        await self._workspace.save_window(
+            window_id=self._window_id,
+            geometry=(geometry.x(), geometry.y(), geometry.width(), geometry.height()),
+            selected_chat_id=self._current_chat_id,
+            rail_collapsed=self.rail.collapsed,
+            restore_open=True,
+        )
+
     async def _refresh_inspector(self) -> None:
         if self._current_chat is None:
             return
@@ -493,25 +588,126 @@ class MainWindow(QMainWindow):
             self._schedule(self._refresh_inspector())
 
     def _schedule(self, coroutine) -> None:
+        if not self._workspace_attached:
+            coroutine.close()
+            return
         task = asyncio.create_task(coroutine)
         self._refresh_tasks.add(task)
         task.add_done_callback(self._refresh_tasks.discard)
 
     def stop_bridge(self) -> None:
-        self._bridge.stop()
+        self._detach_workspace()
+        if self._owns_workspace:
+            self._workspace.bridge.stop()
         for task in tuple(self._refresh_tasks):
             if not task.done():
                 task.cancel()
         self._refresh_tasks.clear()
+
+    def _detach_workspace(self) -> None:
+        if not self._workspace_attached:
+            return
+        self._workspace_attached = False
+        for signal, slot in (
+            (self._workspace.event_received, self._on_event),
+            (self._workspace.activity_changed, self._on_activity_changed),
+        ):
+            try:
+                signal.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
 
     async def stop_bridge_async(self) -> None:
         tasks = tuple(self._refresh_tasks)
         self.stop_bridge()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        await self._bridge.stop_async()
+        if self._owns_workspace:
+            if self._window_id is not None:
+                await self._workspace.unregister_window(
+                    self._window_id,
+                    geometry=(
+                        self.geometry().x(),
+                        self.geometry().y(),
+                        self.geometry().width(),
+                        self.geometry().height(),
+                    ),
+                    selected_chat_id=self._current_chat_id,
+                    rail_collapsed=self.rail.collapsed,
+                )
+                self._window_id = None
+            await self._workspace.close()
+        elif self._window_id is not None:
+            await self._workspace.unregister_window(
+                self._window_id,
+                geometry=(
+                    self.geometry().x(),
+                    self.geometry().y(),
+                    self.geometry().width(),
+                    self.geometry().height(),
+                ),
+                selected_chat_id=self._current_chat_id,
+                rail_collapsed=self.rail.collapsed,
+            )
+            self._window_id = None
 
     def closeEvent(self, event) -> None:
-        self._bridge.stop()
-        self.closed.emit()
+        if self._closing:
+            event.accept()
+            return
+        if (
+            self._window_id is not None
+            and self._workspace.is_last_window(self._window_id)
+            and self._application.has_active_generations()
+        ):
+            answer = QMessageBox.question(
+                self,
+                "Stop active generations?",
+                "Active generations will be cancelled and their partial output preserved.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+        self._closing = True
         event.accept()
+        self._schedule(self._finish_close())
+
+    async def _finish_close(self) -> None:
+        self.stop_bridge()
+        tasks = tuple(self._refresh_tasks)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if self._window_id is not None and not self._owns_workspace:
+            final_window = self._workspace.is_last_window(self._window_id)
+            await self._workspace.unregister_window(
+                self._window_id,
+                geometry=(
+                    self.geometry().x(),
+                    self.geometry().y(),
+                    self.geometry().width(),
+                    self.geometry().height(),
+                ),
+                selected_chat_id=self._current_chat_id,
+                rail_collapsed=self.rail.collapsed,
+                restore_open=final_window,
+            )
+            self._window_id = None
+        elif self._window_id is not None:
+            final_window = self._workspace.is_last_window(self._window_id)
+            await self._workspace.unregister_window(
+                self._window_id,
+                geometry=(
+                    self.geometry().x(),
+                    self.geometry().y(),
+                    self.geometry().width(),
+                    self.geometry().height(),
+                ),
+                selected_chat_id=self._current_chat_id,
+                rail_collapsed=self.rail.collapsed,
+                restore_open=final_window,
+            )
+            self._window_id = None
+            await self._workspace.close()
+        self.closed.emit()

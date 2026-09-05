@@ -208,6 +208,11 @@ class OpenAICompatibleProvider:
             "temperature": request.temperature,
             "max_tokens": request.max_output_tokens,
             "stream": stream,
+            **(
+                {"reasoning_effort": request.reasoning_effort}
+                if request.reasoning_effort is not None
+                else {}
+            ),
         }
 
     def _headers(self) -> dict[str, str]:

@@ -41,7 +41,7 @@ def test_phase2_schema_has_lineage_columns_and_is_idempotent(tmp_path: Path):
         chat_columns = {column["name"] for column in inspect(store.engine).get_columns("chats")}
         assert {"head_message_id", "revision"} <= chat_columns
         with store.engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0005_generation_outcomes"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0006_phase4_workspace"
         foreign_keys = inspect(store.engine).get_foreign_keys("chats")
         assert any(
             foreign_key["referred_table"] == "messages"
@@ -524,7 +524,7 @@ def test_stale_chat_revision_rolls_back_the_new_lineage_nodes(tmp_path: Path):
             "{}",
             now,
         )
-        with pytest.raises(RevisionConflict):
+        with pytest.raises(StateError, match="active generation"):
             store.persist_generation_start(
                 replace(chat, head_message_id="a2", revision=1),
                 second_user,
@@ -765,6 +765,10 @@ def test_finalize_generation_rejects_a_message_from_another_attempt(tmp_path: Pa
             first_attempt,
             expected_chat_revision=0,
         )
+        store.finalize_generation(
+            replace(first_assistant, state=MessageState.COMPLETE, content="done"),
+            replace(first_attempt, state=AttemptState.COMPLETE, ended_at=now, finish_reason="stop"),
+        )
         store.persist_generation_start(
             replace(chat, head_message_id="a2", revision=2),
             second_user,
@@ -772,12 +776,12 @@ def test_finalize_generation_rejects_a_message_from_another_attempt(tmp_path: Pa
             second_attempt,
             expected_chat_revision=1,
         )
-        with pytest.raises(StateError, match="does not belong"):
+        with pytest.raises(StateError, match="message is not streaming|does not belong"):
             store.finalize_generation(
                 replace(first_assistant, state=MessageState.COMPLETE),
                 replace(second_attempt, state=AttemptState.COMPLETE, ended_at=now),
             )
-        assert store.get_message("a1").state == MessageState.STREAMING
+        assert store.get_message("a1").state == MessageState.COMPLETE
         assert store.list_generation_attempts("chat")[1].state == AttemptState.RUNNING
     finally:
         store.close()
@@ -790,7 +794,7 @@ def test_upgrade_from_existing_phase2_revision_installs_integrity_boundary(tmp_p
     store = SQLiteAppStateStore.open(database)
     try:
         with store.engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0005_generation_outcomes"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0006_phase4_workspace"
             assert connection.execute(
                 text("SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'messages_validate_insert'")
             ).scalar_one() == 1

@@ -104,7 +104,7 @@ def test_phase3_outcome_columns_are_additive_and_nullable(tmp_path: Path):
         assert all(columns[name]["nullable"] for name in outcome_columns)
         with store.engine.connect() as connection:
             assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-                "0005_generation_outcomes"
+                "0006_phase4_workspace"
             )
     finally:
         store.close()
@@ -1075,6 +1075,7 @@ def test_streaming_backend_uses_one_ordinary_stream_request_and_persists_telemet
         provider_id="local_openai",
         base_url=provider.base_url,
         api_key_env=provider.api_key_env,
+        reasoning_effort="none",
     )
 
     async def scenario():
@@ -1120,6 +1121,7 @@ def test_streaming_backend_uses_one_ordinary_stream_request_and_persists_telemet
             {"role": "user", "content": "exact current message"}
         ]
         assert "stream_options" not in payload
+        assert payload["reasoning_effort"] == "none"
         assert seen["url"] == "http://127.0.0.1:9000/v1/chat/completions"
         assert seen["headers"]["authorization"] == "Bearer secret-value-that-must-not-persist"
 

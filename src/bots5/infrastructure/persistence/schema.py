@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import Boolean, Column, ForeignKey, Index, Integer, MetaData, String, Table, Text
+from sqlalchemy import Boolean, Column, ForeignKey, Index, Integer, MetaData, String, Table, Text, text
 
 
 metadata = MetaData()
@@ -71,4 +71,22 @@ generation_attempts = Table(
     Column("known_cost_usd", Text),
     Column("remote_outcome_unknown", Boolean),
     Index("ux_generation_attempts_assistant", "assistant_message_id", unique=True),
+    Index(
+        "ux_generation_attempts_active_chat",
+        "chat_id",
+        unique=True,
+        sqlite_where=text("state = 'running'"),
+    ),
+)
+
+workspace_windows = Table(
+    "workspace_windows",
+    metadata,
+    Column("window_id", String(128), primary_key=True),
+    Column("ordinal", Integer, nullable=False),
+    Column("geometry_json", Text, nullable=True),
+    Column("selected_chat_id", String(64), ForeignKey("chats.id", ondelete="SET NULL")),
+    Column("rail_collapsed", Boolean, nullable=False, default=False),
+    Column("restore_open", Boolean, nullable=False, default=True),
+    Column("updated_at", String(40), nullable=False),
 )

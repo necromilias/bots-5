@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from bots5.core.application import BotsApplication
@@ -16,7 +16,9 @@ from bots5.infrastructure.generation.fake import FakeStreamingBackend
 from bots5.infrastructure.generation.openai_compatible import OpenAICompatibleStreamingBackend
 from bots5.infrastructure.persistence import SQLiteAppStateStore, upgrade_database
 from bots5.providers.openai_compatible import OpenAICompatibleProvider
+from bots5.providers.base import ReasoningEffort
 from bots5.desktop.profile import DesktopSessionInfo
+from bots5.desktop.session import DesktopSessionController
 
 
 @dataclass(slots=True)
@@ -25,8 +27,49 @@ class DesktopRuntime:
     authority: AuthorityLock
     application: BotsApplication
     session: DesktopSessionInfo
+    workspace: DesktopSessionController
+    windows: list[object] = field(default_factory=list)
+    _opening_windows: set[asyncio.Task[None]] = field(default_factory=set)
+
+    def _forget_window(self, window: object) -> None:
+        if window in self.windows:
+            self.windows.remove(window)
+
+    def _request_new_window(self) -> None:
+        task = asyncio.create_task(self.open_window())
+        self._opening_windows.add(task)
+        task.add_done_callback(self._opening_windows.discard)
+
+    async def open_window(self, state=None):
+        from bots5.desktop.window import MainWindow
+
+        window = MainWindow(
+            self.application,
+            self.session,
+            workspace=self.workspace,
+            window_state=state,
+        )
+        self.windows.append(window)
+        window.closed.connect(lambda window=window: self._forget_window(window))
+        window.new_window_requested.connect(
+            lambda: self._request_new_window()
+        )
+        try:
+            await window.initialize()
+            window.show()
+        except BaseException:
+            self._forget_window(window)
+            await window.stop_bridge_async()
+            raise
+        return window
 
     async def close(self) -> None:
+        for task in tuple(self._opening_windows):
+            if not task.done():
+                task.cancel()
+        if self._opening_windows:
+            await asyncio.gather(*self._opening_windows, return_exceptions=True)
+        await self.workspace.close()
         await self.application.close()
         self.authority.release()
 
@@ -38,6 +81,7 @@ def build_runtime(
     base_url: str | None = None,
     model: str | None = None,
     api_key_env: str | None = None,
+    reasoning_effort: ReasoningEffort | None = None,
 ) -> DesktopRuntime:
     paths = resolve_app_paths(data_root)
     paths.ensure()
@@ -66,6 +110,7 @@ def build_runtime(
                 provider_id="local_openai",
                 base_url=provider.base_url,
                 api_key_env=provider.api_key_env,
+                reasoning_effort=reasoning_effort,
             )
             backend_id = OpenAICompatibleStreamingBackend.backend_id
             selected_model = model
@@ -86,15 +131,17 @@ def build_runtime(
             base_url=selected_base_url,
             api_key_env=selected_api_key_env,
         )
+        session = DesktopSessionInfo(
+            backend_id=backend_id,
+            model=selected_model,
+            provider_id=provider_id,
+        )
         return DesktopRuntime(
             paths,
             authority,
             application,
-            DesktopSessionInfo(
-                backend_id=backend_id,
-                model=selected_model,
-                provider_id=provider_id,
-            ),
+            session,
+            DesktopSessionController(application, session, ids=ids),
         )
     except Exception:
         authority.release()
@@ -130,6 +177,12 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="optional environment-variable name for local backend authentication",
     )
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=("none",),
+        default=None,
+        help="optional OpenAI-compatible reasoning setting",
+    )
     return parser
 
 
@@ -154,21 +207,24 @@ def main(argv: list[str] | None = None) -> int:
                 base_url=args.base_url,
                 model=args.model,
                 api_key_env=args.api_key_env,
+                reasoning_effort=args.reasoning_effort,
             )
         except Exception as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
 
         async def serve() -> None:
-            window = MainWindow(runtime.application, runtime.session)
-            closed = asyncio.Event()
-            window.closed.connect(closed.set)
+            workspace = runtime.workspace
+            states = tuple(
+                state for state in await workspace.load_workspace() if state.restore_open
+            )
+            if not states:
+                states = (None,)
             try:
-                await window.initialize()
-                window.show()
-                await closed.wait()
+                for state in states:
+                    await runtime.open_window(state)
+                await workspace.wait_closed()
             finally:
-                await window.stop_bridge_async()
                 await runtime.close()
 
         try:
