@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -233,6 +234,133 @@ def test_draft1_qasync_boundary_preserves_durable_state_across_close_reopen(tmp_
             ]
         finally:
             await restarted.close()
+
+    _run_qasync(qt_application, scenario())
+
+
+def test_phase5_add_connection_save_is_durable_without_automatic_discovery(tmp_path):
+    qt_application = QApplication.instance() or QApplication([])
+
+    async def scenario():
+        runtime = build_runtime(tmp_path / "data")
+        window = await runtime.open_window()
+        try:
+            window._on_settings_requested()
+            await _wait_until(lambda: window._settings_dialog is not None)
+            window._on_add_connection_requested()
+            await _wait_until(lambda: window._add_connection_dialog is not None)
+            dialog = window._add_connection_dialog
+            assert dialog is not None
+            dialog.connection_definition.setCurrentIndex(
+                dialog.connection_definition.findData("generic_openai_compatible")
+            )
+            dialog.connection_name.setText("Operator API")
+            dialog.connection_endpoint.setText("http://127.0.0.1:9011/v1")
+            dialog.save_button.click()
+
+            for _ in range(200):
+                connections = await runtime.application.list_provider_connections()
+                if any(item.name == "Operator API" for item in connections):
+                    break
+                await asyncio.sleep(0.005)
+            else:
+                raise AssertionError("timed out waiting for added connection")
+            added = next(item for item in connections if item.name == "Operator API")
+            assert await runtime.application.list_model_catalogue(added.id) == ()
+        finally:
+            await window.stop_bridge_async()
+            await runtime.close()
+
+    _run_qasync(qt_application, scenario())
+
+
+def test_phase5_add_connection_save_and_refresh_is_explicit_and_uses_builtin_fake_adapter(tmp_path):
+    qt_application = QApplication.instance() or QApplication([])
+
+    async def scenario():
+        runtime = build_runtime(tmp_path / "data")
+        window = await runtime.open_window()
+        try:
+            window._on_add_connection_requested()
+            await _wait_until(lambda: window._add_connection_dialog is not None)
+            dialog = window._add_connection_dialog
+            assert dialog is not None
+            dialog.connection_definition.setCurrentIndex(
+                dialog.connection_definition.findData("fake")
+            )
+            dialog.connection_name.setText("Explicit fake refresh")
+            dialog.save_refresh_button.click()
+            for _ in range(200):
+                connections = await runtime.application.list_provider_connections()
+                connection = next(
+                    (item for item in connections if item.name == "Explicit fake refresh"),
+                    None,
+                )
+                if connection is not None and await runtime.application.list_model_catalogue(connection.id):
+                    break
+                await asyncio.sleep(0.005)
+            else:
+                raise AssertionError("timed out waiting for explicit fake refresh")
+            assert connection is not None
+            models = await runtime.application.list_model_catalogue(connection.id)
+            assert [model.provider_model_id for model in models] == ["fake-v0.1"]
+        finally:
+            await window.stop_bridge_async()
+            await runtime.close()
+
+    _run_qasync(qt_application, scenario())
+
+
+def test_phase5_connection_add_and_edit_converge_between_windows(tmp_path):
+    qt_application = QApplication.instance() or QApplication([])
+
+    async def scenario():
+        runtime = build_runtime(tmp_path / "data")
+        first = await runtime.open_window()
+        second = await runtime.open_window()
+        try:
+            first._on_settings_requested()
+            second._on_settings_requested()
+            await _wait_until(lambda: first._settings_dialog is not None)
+            await _wait_until(lambda: second._settings_dialog is not None)
+            first._on_add_connection_requested()
+            await _wait_until(lambda: first._add_connection_dialog is not None)
+            dialog = first._add_connection_dialog
+            assert dialog is not None
+            dialog.connection_definition.setCurrentIndex(
+                dialog.connection_definition.findData("generic_openai_compatible")
+            )
+            dialog.connection_name.setText("Converging API")
+            dialog.connection_endpoint.setText("http://127.0.0.1:9012/v1")
+            dialog.save_button.click()
+
+            await _wait_until(
+                lambda: any(
+                    "Converging API" in second._settings_dialog.connection_list.item(row).text()
+                    for row in range(second._settings_dialog.connection_list.count())
+                )
+            )
+            connection = next(
+                item for item in await runtime.application.list_provider_connections()
+                if item.name == "Converging API"
+            )
+            await runtime.application.edit_provider_connection(
+                replace(connection, name="Converged API"),
+                expected_revision=connection.revision,
+            )
+            await _wait_until(
+                lambda: all(
+                    any(
+                        "Converged API" in dialog.connection_list.item(row).text()
+                        for row in range(dialog.connection_list.count())
+                    )
+                    for dialog in (first._settings_dialog, second._settings_dialog)
+                )
+            )
+        finally:
+            await first.stop_bridge_async()
+            await second.stop_bridge_async()
+            await runtime.close()
 
     _run_qasync(qt_application, scenario())
 

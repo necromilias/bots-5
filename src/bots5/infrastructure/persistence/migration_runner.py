@@ -7,17 +7,21 @@ import shutil
 import sqlite3
 from pathlib import Path
 
+from uuid6 import uuid7
+
 from alembic import command
 from alembic.config import Config
 
 
-_HEAD = "0006_phase4_workspace"
+_HEAD = "0008_catalogue_refresh_outcomes"
 _SUPPORTED_REVISIONS = {
     "0001_desktop_state",
     "0002_conversation_lineage",
     "0003_integrity_boundaries",
     "0004_integrity_guard_function",
     "0005_generation_outcomes",
+    "0006_phase4_workspace",
+    "0007_phase5_provider_model_configuration",
     _HEAD,
 }
 
@@ -113,62 +117,105 @@ def _write_recovery_metadata(
     )
 
 
-def _create_recovery_point(database: Path) -> None:
-    recovery_point = database.with_name(f".{database.name}.pre-migration")
-    metadata_path = _recovery_metadata_path(recovery_point)
-    temporary = recovery_point.with_name(f".{recovery_point.name}.tmp")
-    temporary_metadata = metadata_path.with_name(f".{metadata_path.name}.tmp")
+def _new_recovery_temporary_path(path: Path) -> Path:
+    """Choose a temporary path that cannot clobber another invocation's evidence."""
+    while True:
+        candidate = path.with_name(f"{path.name}.tmp-{uuid7()}")
+        if not candidate.exists():
+            return candidate
+
+
+def _is_suffixed_recovery_artifact(path: Path, database: Path) -> bool:
+    prefix = f".{database.name}.pre-migration-"
+    if not path.name.startswith(prefix):
+        return False
+    suffix = path.name[len(prefix) :]
+    # A valid suffixed recovery point is ``<digest>-<uuid7>``. Files with
+    # these markers are in-flight evidence from an interrupted invocation,
+    # not recovery databases, and must remain untouched for the next retry.
+    return not (
+        suffix.endswith(".json")
+        or suffix.endswith(".tmp")
+        or ".tmp-" in suffix
+    )
+
+
+def _create_recovery_point(database: Path) -> Path:
+    """Create a verified point without overwriting an older valid artifact.
+
+    The original fixed ``.pre-migration`` name is retained as the first
+    candidate for compatibility.  When it belongs to another source state,
+    a digest/UUIDv7-suffixed path is selected and all older evidence remains
+    untouched.
+    """
     source_digest = _logical_digest(database)
-    if recovery_point.exists():
+    canonical = database.with_name(f".{database.name}.pre-migration")
+    candidates = [
+        canonical,
+        *sorted(
+            path
+            for path in database.parent.glob(f".{database.name}.pre-migration-*")
+            if _is_suffixed_recovery_artifact(path, database)
+        ),
+    ]
+    for recovery_point in candidates:
+        metadata_path = _recovery_metadata_path(recovery_point)
+        if not recovery_point.exists():
+            continue
         if metadata_path.exists():
-            _verify_recovery_point(recovery_point, metadata_path, source_digest)
-            return
-        recovery_digest = _logical_digest(recovery_point)
-        if recovery_digest != source_digest:
-            raise RuntimeError(
-                f"recovery point cannot be verified without matching metadata: {recovery_point}"
-            )
-        if temporary_metadata.exists():
-            _verify_recovery_point(recovery_point, temporary_metadata, source_digest)
-        else:
-            _write_recovery_metadata(
-                temporary_metadata,
-                source_digest=source_digest,
-                recovery_digest=recovery_digest,
-                schema_revision=_read_revision(database),
-            )
-            _verify_recovery_point(recovery_point, temporary_metadata, source_digest)
-        os.replace(temporary_metadata, metadata_path)
-        return
-    if metadata_path.exists():
-        raise RuntimeError(f"orphaned recovery-point metadata exists: {metadata_path}")
-    if temporary_metadata.exists() and not temporary.exists():
-        temporary_metadata.unlink()
+            try:
+                _verify_recovery_point(recovery_point, metadata_path, source_digest)
+            except RuntimeError:
+                continue
+            return recovery_point
+        if _logical_digest(recovery_point) == source_digest:
+            temporary_metadata = _new_recovery_temporary_path(metadata_path)
+            try:
+                _write_recovery_metadata(
+                    temporary_metadata,
+                    source_digest=source_digest,
+                    recovery_digest=source_digest,
+                    schema_revision=_read_revision(database),
+                )
+                _verify_recovery_point(recovery_point, temporary_metadata, source_digest)
+                os.replace(temporary_metadata, metadata_path)
+            finally:
+                if temporary_metadata.exists():
+                    temporary_metadata.unlink()
+            return recovery_point
+
+    recovery_point = canonical
+    if recovery_point.exists() or _recovery_metadata_path(recovery_point).exists():
+        recovery_point = database.with_name(
+            f".{database.name}.pre-migration-{source_digest[:16]}-{uuid7()}"
+        )
+    metadata_path = _recovery_metadata_path(recovery_point)
+    temporary = _new_recovery_temporary_path(recovery_point)
+    temporary_metadata = _new_recovery_temporary_path(metadata_path)
     try:
-        if not temporary.exists():
-            with sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True) as source:
-                with sqlite3.connect(temporary) as destination:
-                    source.backup(destination)
-            shutil.copymode(database, temporary)
+        with sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True) as source:
+            with sqlite3.connect(temporary) as destination:
+                source.backup(destination)
+        shutil.copymode(database, temporary)
         recovery_digest = _logical_digest(temporary)
         if recovery_digest != source_digest:
             raise RuntimeError("recovery point fingerprint differs from the source database")
-        if not temporary_metadata.exists():
-            _write_recovery_metadata(
-                temporary_metadata,
-                source_digest=source_digest,
-                recovery_digest=recovery_digest,
-                schema_revision=_read_revision(database),
-            )
+        _write_recovery_metadata(
+            temporary_metadata,
+            source_digest=source_digest,
+            recovery_digest=recovery_digest,
+            schema_revision=_read_revision(database),
+        )
         _verify_recovery_point(temporary, temporary_metadata, source_digest)
         os.replace(temporary, recovery_point)
         os.replace(temporary_metadata, metadata_path)
+        return recovery_point
     except (OSError, sqlite3.DatabaseError) as exc:
         raise RuntimeError(f"cannot create verified recovery point: {recovery_point}") from exc
     finally:
         if temporary.exists():
             temporary.unlink()
-        if temporary_metadata.exists() and not recovery_point.exists():
+        if temporary_metadata.exists():
             temporary_metadata.unlink()
 
 
@@ -207,8 +254,7 @@ def upgrade_database(database: Path | str) -> None:
         )
     recovery_point: Path | None = None
     if database.exists() and database.stat().st_size > 0 and current_revision != _HEAD:
-        _create_recovery_point(database)
-        recovery_point = database.with_name(f".{database.name}.pre-migration")
+        recovery_point = _create_recovery_point(database)
     metadata_path = None if recovery_point is None else _recovery_metadata_path(recovery_point)
     config = Config()
     config.set_main_option("script_location", str(Path(__file__).with_name("migrations")))

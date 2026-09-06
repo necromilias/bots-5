@@ -8,13 +8,16 @@ from pathlib import Path
 
 from bots5.core.application import BotsApplication
 from bots5.core.events import EventBus
+from bots5.core.provider_configuration import ProviderConfiguration
 from bots5.domain.clock import SystemClock
 from bots5.domain.ids import Uuid7Factory
 from bots5.infrastructure.app_paths import AppPaths, resolve_app_paths
 from bots5.infrastructure.authority_lock import AuthorityLock
 from bots5.infrastructure.generation.fake import FakeStreamingBackend
 from bots5.infrastructure.generation.openai_compatible import OpenAICompatibleStreamingBackend
+from bots5.infrastructure.generation.router import BuiltinProviderRouter
 from bots5.infrastructure.persistence import SQLiteAppStateStore, upgrade_database
+from bots5.infrastructure.secrets import secret_store_for
 from bots5.providers.openai_compatible import OpenAICompatibleProvider
 from bots5.providers.base import ReasoningEffort
 from bots5.desktop.profile import DesktopSessionInfo
@@ -93,7 +96,7 @@ def build_runtime(
         ids = Uuid7Factory()
         events = EventBus(clock, ids)
         if backend == "fake":
-            generation_backend = FakeStreamingBackend()
+            generation_backend = BuiltinProviderRouter(fake_backend=FakeStreamingBackend())
             backend_id = "fake"
             selected_model = "fake-v0.1"
             provider_id = None
@@ -119,6 +122,11 @@ def build_runtime(
             selected_api_key_env = provider.api_key_env
         else:
             raise ValueError(f"unsupported desktop backend: {backend}")
+        configuration = (
+            ProviderConfiguration(store, ids, clock, secret_store_factory=secret_store_for)
+            if backend == "fake"
+            else None
+        )
         application = BotsApplication(
             store,
             events,
@@ -130,6 +138,7 @@ def build_runtime(
             provider_id=provider_id,
             base_url=selected_base_url,
             api_key_env=selected_api_key_env,
+            configuration=configuration,
         )
         session = DesktopSessionInfo(
             backend_id=backend_id,

@@ -17,6 +17,8 @@ dependencies = [
   "pydantic>=2,<3",
   "platformdirs>=4,<5",
   "uuid6>=2024.7.10,<2027",
+  "keyring>=25,<26",
+  "secretstorage>=3,<4",
 ]
 
 [project.optional-dependencies]

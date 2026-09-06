@@ -18,8 +18,17 @@ from bots5.domain.models import (
     MessageState,
     WorkspaceWindowState,
 )
+from bots5.domain.provider import (
+    BackendType,
+    CapabilityFact,
+    CapabilityKey,
+    CapabilitySource,
+    CapabilityState,
+    CatalogueRefreshFailureClass,
+)
+from bots5.errors import ProviderError
 
-from .errors import StateError
+from .errors import RevisionConflict, StateError
 from .events import EventBus, EventSubscription
 from .execution import ExecutionManager
 from .generation import (
@@ -32,6 +41,53 @@ from .generation import (
     GenerationRequest,
 )
 from .ports import AppStateStore
+from .provider_configuration import ProviderConfiguration
+from .secrets import SecretStoreError, reject_secret_material, sanitize_secret_error
+from bots5.providers.discovery import ModelDiscoveryError
+
+
+class GenerationTimeout(Exception):
+    """A B.O.T.S.-owned generation deadline expired after request preparation."""
+
+
+_FAKE_TRUSTED_CAPABILITIES = (
+    (CapabilityKey.STREAMING.value, None),
+    (CapabilityKey.TEMPERATURE.value, None),
+    (CapabilityKey.MAX_OUTPUT_TOKENS.value, 16384),
+    (CapabilityKey.REASONING_NONE.value, None),
+    (CapabilityKey.REQUEST_ID.value, None),
+    (CapabilityKey.RETURNED_MODEL.value, None),
+)
+
+
+def _fake_capability_facts(model_entry_id: str, observed_at):
+    return tuple(
+        CapabilityFact(
+            model_entry_id,
+            key,
+            CapabilityState.SUPPORTED,
+            CapabilitySource.TRUSTED_REGISTRY,
+            source_revision=1,
+            value=value,
+            provenance={"field": "built-in fake backend"},
+            observed_at=observed_at,
+        )
+        for key, value in _FAKE_TRUSTED_CAPABILITIES
+    )
+
+
+def _abandon_task(task: asyncio.Task[object]) -> None:
+    """Cancel a child without allowing a cancellation-resistant backend to hold us up."""
+    if not task.done():
+        task.cancel()
+
+    def consume(completed: asyncio.Task[object]) -> None:
+        try:
+            completed.result()
+        except BaseException:
+            pass
+
+    task.add_done_callback(consume)
 
 
 def _tracked_command(method):
@@ -91,6 +147,7 @@ class BotsApplication:
         provider_id: str | None = None,
         base_url: str | None = None,
         api_key_env: str | None = None,
+        configuration: ProviderConfiguration | None = None,
     ) -> None:
         self._store = store
         self._events = events
@@ -103,6 +160,7 @@ class BotsApplication:
         self._provider_id = provider_id
         self._base_url = base_url
         self._api_key_env = api_key_env
+        self._configuration = configuration
         self._closed = False
         self._pending_generations: dict[str, tuple[Message, GenerationAttempt]] = {}
         self._generation_tasks: dict[str, asyncio.Task[None]] = {}
@@ -242,6 +300,10 @@ class BotsApplication:
         now = self._clock.now()
         chat = Chat(id=self._ids.new(), title=title, created_at=now, updated_at=now)
         self._store.create_chat(chat)
+        if self._configuration is not None:
+            _, default_model_entry_id, _ = self._store.get_application_generation_config()
+            if default_model_entry_id is not None:
+                self._store.set_chat_model_selection(chat.id, default_model_entry_id)
         await self._events.publish("chat_created", chat_id=chat.id, title=chat.title)
         self._ensure_open()
         return chat
@@ -301,6 +363,31 @@ class BotsApplication:
         attempt_id: str,
         now,
     ) -> tuple[GenerationRequest, GenerationAttempt]:
+        if self._configuration is not None:
+            prepared, snapshot = self._configuration.prepare_generation(
+                chat_id=chat_id,
+                user_message_id=user_message.id,
+                prompt=user_message.content,
+                attempt_id=attempt_id,
+            )
+            request = prepared.request
+            attempt = GenerationAttempt(
+                id=attempt_id,
+                chat_id=chat_id,
+                user_message_id=user_message.id,
+                assistant_message_id=assistant_message.id,
+                backend_id=request.backend_id,
+                model=request.model,
+                state=AttemptState.RUNNING,
+                request_snapshot=snapshot,
+                started_at=now,
+                provider_id=request.provider_id,
+                remote_outcome_unknown=False,
+                connection_id=prepared.attempt_connection_id,
+                model_entry_id=prepared.model_entry_id,
+            )
+            return request, attempt
+
         request = GenerationRequest(
             attempt_id=attempt_id,
             chat_id=chat_id,
@@ -328,6 +415,421 @@ class BotsApplication:
             remote_outcome_unknown=False,
         )
         return request, attempt
+
+    @_tracked_command
+    async def list_provider_connections(self):
+        self._ensure_open()
+        if self._configuration is None:
+            return ()
+        return self._configuration.list_connections()
+
+    @_tracked_command
+    async def provider_credential_status(self, connection_id: str):
+        self._ensure_open()
+        if self._configuration is None:
+            return None
+        connection = self._store.get_provider_connection(connection_id)
+        if connection is None:
+            raise StateError(f"provider connection not found: {connection_id}")
+        return self._configuration.credential_status(connection)
+
+    @_tracked_command
+    async def list_model_catalogue(self, connection_id: str | None = None):
+        self._ensure_open()
+        if self._configuration is None:
+            return ()
+        return self._configuration.list_models(connection_id)
+
+    @_tracked_command
+    async def chat_model_selection(self, chat_id: str):
+        self._ensure_open()
+        if self._configuration is None:
+            return None
+        return self._configuration.get_selection(chat_id)
+
+    @_tracked_command
+    async def select_model(self, chat_id: str, model_entry_id: str, *, expected_revision: int | None = None):
+        self._ensure_open()
+        if self._configuration is None:
+            raise StateError("provider/model configuration is unavailable")
+        selection = self._store.set_chat_model_selection(
+            chat_id, model_entry_id, expected_revision=expected_revision
+        )
+        await self._events.publish(
+            "chat_model_selection_changed",
+            chat_id=chat_id,
+            model_entry_id=model_entry_id,
+            revision=selection.revision,
+        )
+        return selection
+
+    @_tracked_command
+    async def resolve_chat_generation_settings(self, chat_id: str):
+        self._ensure_open()
+        if self._configuration is None:
+            return None
+        selection = self._configuration.get_selection(chat_id)
+        if selection.model_entry_id is None:
+            return None
+        return self._configuration._resolve_settings(chat_id, selection.model_entry_id)
+
+    @_tracked_command
+    async def chat_generation_settings_override(self, chat_id: str):
+        self._ensure_open()
+        if self._configuration is None:
+            return None
+        selection = self._configuration.get_selection(chat_id)
+        if selection.model_entry_id is None:
+            return None
+        return self._store.get_chat_model_generation_settings(chat_id, selection.model_entry_id)
+
+    @_tracked_command
+    async def chat_generation_settings_override_with_revision(self, chat_id: str):
+        self._ensure_open()
+        if self._configuration is None:
+            return None, None
+        selection = self._configuration.get_selection(chat_id)
+        if selection.model_entry_id is None:
+            return None, None
+        return self._store.get_chat_model_generation_config(chat_id, selection.model_entry_id)
+
+    @_tracked_command
+    async def set_chat_generation_settings(
+        self,
+        chat_id: str,
+        settings,
+        *,
+        expected_revision: int | None = None,
+        expected_model_entry_id: str | None = None,
+    ):
+        self._ensure_open()
+        if self._configuration is None:
+            raise StateError("provider/model configuration is unavailable")
+        selection = self._configuration.get_selection(chat_id)
+        if selection.model_entry_id is None:
+            raise StateError("chat requires an explicit model selection")
+        if (
+            expected_model_entry_id is not None
+            and selection.model_entry_id != expected_model_entry_id
+        ):
+            raise RevisionConflict("chat model selection changed")
+        from .provider_configuration import _validate_settings
+
+        _validate_settings(settings)
+        revision = self._store.set_chat_model_generation_settings(
+            chat_id, selection.model_entry_id, settings, expected_revision=expected_revision
+        )
+        await self._events.publish(
+            "chat_model_generation_settings_changed",
+            chat_id=chat_id,
+            model_entry_id=selection.model_entry_id,
+            revision=revision,
+        )
+        return await self.resolve_chat_generation_settings(chat_id)
+
+    @_tracked_command
+    async def set_application_generation_settings(self, settings, *, expected_revision: int | None = None):
+        self._ensure_open()
+        if self._configuration is None:
+            raise StateError("provider/model configuration is unavailable")
+        from .provider_configuration import _validate_settings
+
+        _validate_settings(settings)
+        revision = self._store.set_application_generation_settings(
+            settings, expected_revision=expected_revision
+        )
+        await self._events.publish("application_generation_settings_changed", revision=revision)
+        return revision
+
+    @_tracked_command
+    async def application_generation_settings(self):
+        self._ensure_open()
+        if self._configuration is None:
+            return None
+        return self._store.get_application_generation_settings()
+
+    @_tracked_command
+    async def create_provider_connection(self, **kwargs):
+        self._ensure_open()
+        if self._configuration is None:
+            raise StateError("provider/model configuration is unavailable")
+        connection = self._configuration.create_connection(**kwargs)
+        await self._events.publish("provider_connection_changed", connection_id=connection.id)
+        return connection
+
+    @_tracked_command
+    async def edit_provider_connection(self, connection, *, expected_revision: int):
+        self._ensure_open()
+        if self._configuration is None:
+            raise StateError("provider/model configuration is unavailable")
+        updated = self._configuration.edit_connection(connection, expected_revision=expected_revision)
+        await self._events.publish("provider_connection_changed", connection_id=updated.id)
+        return updated
+
+    @_tracked_command
+    async def set_provider_connection_enabled(self, connection_id: str, enabled: bool, *, expected_revision: int):
+        self._ensure_open()
+        current = self._store.get_provider_connection(connection_id)
+        if current is None:
+            raise StateError(f"provider connection not found: {connection_id}")
+        updated = self._store.set_provider_connection_enabled(
+            connection_id, enabled, expected_revision=expected_revision
+        )
+        await self._events.publish("provider_connection_changed", connection_id=updated.id)
+        return updated
+
+    async def save_connection_credential(
+        self,
+        connection_id: str,
+        value: str,
+        *,
+        expected_revision: int | None = None,
+        expected_credential_reference: str | None = None,
+    ):
+        try:
+            async with self._command_scope():
+                self._ensure_open()
+                if self._configuration is None:
+                    raise StateError("provider/model configuration is unavailable")
+                connection = self._store.get_provider_connection(connection_id)
+                if connection is None:
+                    raise StateError(f"provider connection not found: {connection_id}")
+                if expected_revision is not None and connection.revision != expected_revision:
+                    raise RevisionConflict("provider credential settings are stale")
+                if (
+                    expected_credential_reference is not None
+                    and connection.credential_reference != expected_credential_reference
+                ):
+                    raise RevisionConflict("provider credential reference is stale")
+                save_failure: SecretStoreError | None = None
+                try:
+                    status = self._configuration.save_credential(connection, value)
+                except Exception as exc:
+                    save_failure = SecretStoreError(sanitize_secret_error(exc, value))
+                # The status event contains no credential material, but publication
+                # may wait on a full subscriber queue. Clear the value first. This
+                # also ensures the new exception is raised after the source error's
+                # exception block has ended, without retaining its traceback/context.
+                value = None
+                if save_failure is not None:
+                    raise save_failure
+                await self._events.publish(
+                    "provider_credential_status_changed",
+                    connection_id=connection_id,
+                    status=status.status,
+                )
+                return status
+        finally:
+            # Failed tasks retain traceback frames. Do not leave the submitted
+            # credential in this frame for callers that inspect task.exception().
+            value = None
+
+    @_tracked_command
+    async def delete_connection_credential(
+        self,
+        connection_id: str,
+        *,
+        expected_revision: int | None = None,
+        expected_credential_reference: str | None = None,
+    ):
+        self._ensure_open()
+        if self._configuration is None:
+            raise StateError("provider/model configuration is unavailable")
+        connection = self._store.get_provider_connection(connection_id)
+        if connection is None:
+            raise StateError(f"provider connection not found: {connection_id}")
+        if expected_revision is not None and connection.revision != expected_revision:
+            raise RevisionConflict("provider credential settings are stale")
+        if (
+            expected_credential_reference is not None
+            and connection.credential_reference != expected_credential_reference
+        ):
+            raise RevisionConflict("provider credential reference is stale")
+        status = self._configuration.delete_credential(connection)
+        await self._events.publish("provider_credential_status_changed", connection_id=connection_id, status=status.status)
+        return status
+
+    @_tracked_command
+    async def retire_provider_connection(self, connection_id: str, *, expected_revision: int, replacement_model_entry_id: str | None = None):
+        self._ensure_open()
+        updated = self._store.retire_provider_connection(
+            connection_id,
+            expected_revision=expected_revision,
+            replacement_model_entry_id=replacement_model_entry_id,
+        )
+        await self._events.publish("provider_connection_changed", connection_id=updated.id)
+        return updated
+
+    @_tracked_command
+    async def add_manual_model(self, *, connection_id: str, provider_model_id: str, display_name: str | None = None, metadata: dict[str, object] | None = None):
+        self._ensure_open()
+        if self._configuration is None:
+            raise StateError("provider/model configuration is unavailable")
+        model = self._configuration.add_manual_model(
+            connection_id=connection_id,
+            provider_model_id=provider_model_id,
+            display_name=display_name,
+            metadata=metadata,
+        )
+        await self._events.publish("model_catalogue_changed", connection_id=connection_id)
+        return model
+
+    @_tracked_command
+    async def refresh_models(self, connection_id: str, discoverer):
+        """Perform one operator-triggered refresh; no caller invokes this at startup."""
+        self._ensure_open()
+        if self._configuration is None:
+            raise StateError("provider/model configuration is unavailable")
+        connection = self._store.get_provider_connection(connection_id)
+        if connection is None:
+            raise StateError(f"provider connection not found: {connection_id}")
+        expected_catalogue_revision = connection.catalogue_revision
+        expected_connection_revision = connection.revision
+        failure_catalogue_changed = False
+        failure_class = CatalogueRefreshFailureClass.UNKNOWN
+        credential: str | None = None
+        failure: BaseException | None = None
+        try:
+            credential = self._configuration.credential_value(connection)
+            discovered = await discoverer.discover(connection, credential)
+            records = tuple(model.as_record() for model in discovered)
+            try:
+                reject_secret_material(records, credential)
+            except Exception as exc:
+                raise ProviderError(sanitize_secret_error(exc, credential)) from None
+            models = self._store.refresh_model_catalogue(
+                connection_id,
+                records,
+                success=True,
+                expected_catalogue_revision=expected_catalogue_revision,
+                expected_connection_revision=expected_connection_revision,
+            )
+            refreshed_connection = self._store.get_provider_connection(connection_id)
+            discovery_revision = None if refreshed_connection is None else refreshed_connection.catalogue_revision
+            for model in models:
+                if model.availability.value != "available":
+                    continue
+                metadata = model.metadata
+                for metadata_key, capability_key in (
+                    ("context_length", CapabilityKey.CONTEXT_TOKENS.value),
+                    ("max_output_tokens", CapabilityKey.OUTPUT_TOKENS.value),
+                ):
+                    value = metadata.get(metadata_key)
+                    if type(value) is int and value > 0:
+                        self._store.set_capability_fact(
+                            CapabilityFact(
+                                model.id,
+                                capability_key,
+                                CapabilityState.SUPPORTED,
+                                CapabilitySource.PROVIDER_METADATA,
+                                discovery_revision,
+                                value,
+                                {"field": metadata_key, "catalogue_revision": discovery_revision},
+                                self._clock.now(),
+                            )
+                        )
+                if connection.backend_type is BackendType.FAKE:
+                    for fact in _fake_capability_facts(model.id, self._clock.now()):
+                        self._store.set_capability_fact(fact)
+        except Exception as exc:
+            if not isinstance(exc, RevisionConflict):
+                if isinstance(exc, ModelDiscoveryError):
+                    failure_class = exc.failure_class
+                try:
+                    self._store.refresh_model_catalogue(
+                        connection_id,
+                        (),
+                        success=False,
+                        failure_class=failure_class,
+                        expected_catalogue_revision=expected_catalogue_revision,
+                        expected_connection_revision=expected_connection_revision,
+                    )
+                    failure_catalogue_changed = True
+                except RevisionConflict:
+                    pass
+            if credential is not None and not isinstance(exc, RevisionConflict):
+                failure = ProviderError(
+                    f"model discovery failed: {sanitize_secret_error(exc, credential)}"
+                )
+            else:
+                failure = exc
+            # Do not carry the resolved credential across any event-bus await.
+            credential = None
+            discovered = None
+            records = None
+            models = None
+        if failure_catalogue_changed:
+            await self._events.publish("model_catalogue_changed", connection_id=connection_id)
+        if failure is not None:
+            raise failure
+        # The provider operation and all secret-dependent validation are complete.
+        # Event publication may suspend under subscriber backpressure, so the
+        # resolved credential must not remain reachable during that await.
+        credential = None
+        await self._events.publish("model_catalogue_changed", connection_id=connection_id)
+        return models
+
+    @_tracked_command
+    async def set_application_default_model(self, model_entry_id: str, *, expected_revision: int | None = None):
+        self._ensure_open()
+        revision = self._store.set_application_default_model(
+            model_entry_id, expected_revision=expected_revision
+        )
+        await self._events.publish("application_default_model_changed", model_entry_id=model_entry_id, revision=revision)
+        return revision
+
+    @_tracked_command
+    async def set_model_defaults(self, model_entry_id: str, settings, *, expected_revision: int | None = None):
+        self._ensure_open()
+        if self._configuration is None:
+            raise StateError("provider/model configuration is unavailable")
+        revision = self._configuration.set_model_defaults(model_entry_id, settings, expected_revision=expected_revision)
+        await self._events.publish("model_generation_settings_changed", model_entry_id=model_entry_id, revision=revision)
+        return revision
+
+    @_tracked_command
+    async def model_defaults(self, model_entry_id: str):
+        self._ensure_open()
+        if self._configuration is None:
+            return None
+        return self._store.get_model_generation_settings(model_entry_id)
+
+    @_tracked_command
+    async def model_defaults_with_revision(self, model_entry_id: str):
+        self._ensure_open()
+        if self._configuration is None:
+            return None, None
+        return self._store.get_model_generation_config(model_entry_id)
+
+    @_tracked_command
+    async def application_generation_config(self):
+        self._ensure_open()
+        if self._configuration is None:
+            return None
+        return self._store.get_application_generation_config()
+
+    @_tracked_command
+    async def set_capability_override(self, override, *, expected_revision: int | None = None):
+        self._ensure_open()
+        if self._configuration is None:
+            raise StateError("provider/model configuration is unavailable")
+        result = self._configuration.set_capability_override(override, expected_revision=expected_revision)
+        await self._events.publish("capability_changed", model_entry_id=result.model_entry_id, capability_key=result.key)
+        return result
+
+    @_tracked_command
+    async def capability_overrides(self, model_entry_id: str):
+        self._ensure_open()
+        if self._configuration is None:
+            return ()
+        return self._store.list_capability_overrides(model_entry_id)
+
+    @_tracked_command
+    async def model_capabilities(self, model_entry_id: str):
+        self._ensure_open()
+        if self._configuration is None:
+            return ()
+        return self._configuration.resolve_capabilities(model_entry_id)
 
     def _new_assistant(
         self,
@@ -681,7 +1183,48 @@ class BotsApplication:
             ready.set()
             await asyncio.sleep(0)
             terminal = False
-            async for event in self._backend.stream(request):
+            stream = self._backend.stream(request)
+            iterator = stream.__aiter__()
+            deadline = (
+                None
+                if request.timeout_seconds is None
+                else asyncio.get_running_loop().time() + request.timeout_seconds
+            )
+            while True:
+                if deadline is None:
+                    try:
+                        event = await iterator.__anext__()
+                    except StopAsyncIteration:
+                        break
+                else:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        raise GenerationTimeout
+                    next_event = asyncio.create_task(iterator.__anext__())
+                    deadline_wait = asyncio.create_task(asyncio.sleep(remaining))
+                    try:
+                        done, _ = await asyncio.wait(
+                            (next_event, deadline_wait),
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if next_event in done:
+                            deadline_wait.cancel()
+                            await asyncio.gather(deadline_wait, return_exceptions=True)
+                            try:
+                                event = next_event.result()
+                            except StopAsyncIteration:
+                                break
+                        else:
+                            _abandon_task(next_event)
+                            raise GenerationTimeout
+                    finally:
+                        if not next_event.done():
+                            _abandon_task(next_event)
+                        if not deadline_wait.done():
+                            deadline_wait.cancel()
+                        await asyncio.gather(deadline_wait, return_exceptions=True)
+                        if next_event.done():
+                            _abandon_task(next_event)
                 if event.attempt_id != attempt.id:
                     raise StateError("generation backend returned an event for another attempt")
                 if attempt.id in self._cancel_requested:
@@ -848,6 +1391,31 @@ class BotsApplication:
                     message_id=message.id,
                     attempt_id=attempt.id,
                 )
+        except GenerationTimeout:
+            if terminal_persisted:
+                raise
+            now = self._clock.now()
+            message = replace(message, state=MessageState.FAILED)
+            current_attempt = replace(
+                current_attempt,
+                state=AttemptState.FAILED,
+                ended_at=now,
+                error_type="timeout",
+                error_message="B.O.T.S. generation deadline expired",
+                remote_outcome_unknown=(
+                    True if dispatch_may_have_occurred else current_attempt.remote_outcome_unknown
+                ),
+            )
+            self._finalize_generation(message, current_attempt)
+            terminal_persisted = True
+            await self._publish_after_persistence(
+                "generation_failed",
+                chat_id=message.chat_id,
+                message_id=message.id,
+                attempt_id=attempt.id,
+                error_type="timeout",
+                error_message="B.O.T.S. generation deadline expired",
+            )
         except asyncio.CancelledError:
             if terminal_persisted:
                 raise

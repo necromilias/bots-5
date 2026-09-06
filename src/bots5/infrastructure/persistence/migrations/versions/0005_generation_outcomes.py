@@ -86,6 +86,7 @@ def _validate_outcome_rows(connection) -> None:
             outcome_error_type=row["error_type"],
             outcome_error_message=row["error_message"],
             phase3=phase3,
+            phase5=snapshot_for_classification.get("snapshot_version") == 2,
             error_type=RuntimeError,
         )
 
@@ -93,11 +94,17 @@ def _validate_outcome_rows(connection) -> None:
 def _replace_attempt_triggers(connection) -> None:
     connection.execute(sa.text("DROP TRIGGER IF EXISTS generation_attempt_validate_insert"))
     connection.execute(sa.text("DROP TRIGGER IF EXISTS generation_attempt_validate_update"))
-    insert_phase3_marker = "(NEW.provider_id IS NOT NULL OR NEW.backend_id = 'openai_compatible_http')"
+    connection.execute(sa.text("DROP TRIGGER IF EXISTS generation_attempt_phase5_completion_insert"))
+    connection.execute(sa.text("DROP TRIGGER IF EXISTS generation_attempt_phase5_completion_update"))
+    insert_phase3_marker = (
+        "((NEW.provider_id IS NOT NULL OR NEW.backend_id = 'openai_compatible_http') "
+        "AND COALESCE(json_extract(NEW.request_snapshot, '$.snapshot_version'), 0) <> 2)"
+    )
     update_phase3_marker = (
-        "COALESCE((OLD.provider_id IS NOT NULL OR NEW.provider_id IS NOT NULL OR "
+        "COALESCE(((OLD.provider_id IS NOT NULL OR NEW.provider_id IS NOT NULL OR "
         "json_extract(NEW.request_snapshot, '$.provider_id') IN ('local_openai', 'openrouter') OR "
-        "json_extract(NEW.request_snapshot, '$.backend_id') = 'openai_compatible_http'), 0)"
+        "json_extract(NEW.request_snapshot, '$.backend_id') = 'openai_compatible_http') "
+        "AND COALESCE(json_extract(NEW.request_snapshot, '$.snapshot_version'), 0) <> 2), 0)"
     )
     insert_snapshot_validation = (
         "bots5_valid_request_snapshot(NEW.request_snapshot, NEW.id, NEW.chat_id, "
@@ -150,7 +157,8 @@ def _replace_attempt_triggers(connection) -> None:
             "(json_type(NEW.request_snapshot, '$.backend_id') IS NOT NULL AND json_extract(NEW.request_snapshot, '$.backend_id') <> NEW.backend_id)) "
             "OR (json_type(NEW.request_snapshot, '$.model') = 'null' OR "
             "(json_type(NEW.request_snapshot, '$.model') IS NOT NULL AND json_extract(NEW.request_snapshot, '$.model') <> NEW.model)) "
-            "OR (NEW.provider_id IS NOT NULL AND NEW.provider_id NOT IN ('local_openai', 'openrouter')) "
+            "OR (NEW.provider_id IS NOT NULL AND NEW.provider_id NOT IN ('local_openai', 'openrouter') "
+            "AND NOT (NEW.provider_id = 'generic' AND json_extract(NEW.request_snapshot, '$.snapshot_version') = 2)) "
             "OR " + insert_snapshot_validation + " "
             "OR " + insert_outcome_validation + " "
             "OR (" + insert_phase3_marker + " AND NEW.remote_outcome_unknown IS NULL) "
@@ -173,6 +181,28 @@ def _replace_attempt_triggers(connection) -> None:
     )
     connection.execute(
         sa.text(
+            "CREATE TRIGGER generation_attempt_phase5_completion_insert "
+            "BEFORE INSERT ON generation_attempts "
+            "WHEN json_extract(NEW.request_snapshot, '$.snapshot_version') = 2 AND ("
+            "(NEW.state = 'complete' AND (NEW.finish_reason IS NOT 'stop' OR NEW.remote_outcome_unknown IS NOT 0)) OR "
+            "(NEW.state = 'incomplete' AND NEW.finish_reason IS 'stop') OR "
+            "(NEW.state IN ('running', 'failed', 'aborted') AND NEW.finish_reason IS NOT NULL)) "
+            "BEGIN SELECT RAISE(ABORT, 'Phase 5 generation finish_reason is inconsistent with state'); END"
+        )
+    )
+    connection.execute(
+        sa.text(
+            "CREATE TRIGGER generation_attempt_phase5_completion_update "
+            "BEFORE UPDATE OF state, finish_reason, request_snapshot ON generation_attempts "
+            "WHEN json_extract(NEW.request_snapshot, '$.snapshot_version') = 2 AND ("
+            "(NEW.state = 'complete' AND (NEW.finish_reason IS NOT 'stop' OR NEW.remote_outcome_unknown IS NOT 0)) OR "
+            "(NEW.state = 'incomplete' AND NEW.finish_reason IS 'stop') OR "
+            "(NEW.state IN ('running', 'failed', 'aborted') AND NEW.finish_reason IS NOT NULL)) "
+            "BEGIN SELECT RAISE(ABORT, 'Phase 5 generation finish_reason is inconsistent with state'); END"
+        )
+    )
+    connection.execute(
+        sa.text(
             "CREATE TRIGGER generation_attempt_validate_update BEFORE UPDATE OF "
             "id, chat_id, user_message_id, assistant_message_id, backend_id, model, "
             "request_snapshot, started_at, state, ended_at, error_type, error_message, "
@@ -189,7 +219,8 @@ def _replace_attempt_triggers(connection) -> None:
             "OR NEW.backend_id IS NOT OLD.backend_id OR NEW.model IS NOT OLD.model "
             "OR NEW.request_snapshot IS NOT OLD.request_snapshot "
             "OR NEW.started_at IS NOT OLD.started_at) "
-            "OR (NEW.provider_id IS NOT NULL AND NEW.provider_id NOT IN ('local_openai', 'openrouter')) "
+            "OR (NEW.provider_id IS NOT NULL AND NEW.provider_id NOT IN ('local_openai', 'openrouter') "
+            "AND NOT (NEW.provider_id = 'generic' AND json_extract(NEW.request_snapshot, '$.snapshot_version') = 2)) "
             "OR " + update_snapshot_validation + " "
             "OR " + update_outcome_validation + " "
             "OR " + remote_transition_validation + " "

@@ -18,15 +18,25 @@ def test_real_migration_creates_state_schema_and_enables_sqlite_safety(tmp_path:
     try:
         assert set(inspect(store.engine).get_table_names()) == {
             "alembic_version",
+            "application_generation_config",
+            "capability_facts",
+            "capability_observations",
+            "capability_overrides",
             "chats",
+            "chat_model_generation_config",
+            "chat_model_selection",
             "generation_attempts",
             "messages",
+            "model_catalogue_entries",
+            "model_generation_config",
+            "provider_connections",
+            "catalogue_refresh_state",
             "workspace_windows",
         }
         with store.engine.connect() as connection:
             assert connection.execute(text("PRAGMA foreign_keys")).scalar_one() == 1
             assert connection.execute(text("PRAGMA journal_mode")).scalar_one().lower() == "wal"
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0006_phase4_workspace"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0008_catalogue_refresh_outcomes"
 
         now = datetime.now(timezone.utc)
         chat = Chat(str(uuid4()), "Test", now, now)

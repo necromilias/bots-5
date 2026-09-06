@@ -192,6 +192,11 @@ class OpenRouterProvider:
             "temperature": request.temperature,
             "max_tokens": request.max_output_tokens,
             "stream": stream,
+            **(
+                {"reasoning_effort": request.reasoning_effort}
+                if request.reasoning_effort is not None
+                else {}
+            ),
         }
 
     def _headers(self) -> dict[str, str]:
@@ -215,6 +220,10 @@ class OpenRouterProvider:
                     json=payload,
                 )
         except httpx.HTTPError as exc:
+            raise ProviderError(f"provider_transport_error: {self._sanitize(str(exc))}") from None
+        except ProviderError:
+            raise
+        except Exception as exc:
             raise ProviderError(f"provider_transport_error: {self._sanitize(str(exc))}") from None
 
         duration = time.monotonic() - started
@@ -268,4 +277,8 @@ class OpenRouterProvider:
                             raise ProviderResponseError("malformed_provider_response") from None
                         yield self._normalize_stream_chunk(data)
         except httpx.HTTPError as exc:
+            raise ProviderError(f"provider_transport_error: {self._sanitize(str(exc))}") from None
+        except ProviderError:
+            raise
+        except Exception as exc:
             raise ProviderError(f"provider_transport_error: {self._sanitize(str(exc))}") from None

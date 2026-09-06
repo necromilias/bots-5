@@ -95,6 +95,8 @@ class GenerationAttempt:
     total_tokens: int | None = None
     known_cost_usd: Decimal | None = None
     remote_outcome_unknown: bool | None = None
+    connection_id: str | None = None
+    model_entry_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

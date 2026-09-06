@@ -41,7 +41,7 @@ def test_phase2_schema_has_lineage_columns_and_is_idempotent(tmp_path: Path):
         chat_columns = {column["name"] for column in inspect(store.engine).get_columns("chats")}
         assert {"head_message_id", "revision"} <= chat_columns
         with store.engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0006_phase4_workspace"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0008_catalogue_refresh_outcomes"
         foreign_keys = inspect(store.engine).get_foreign_keys("chats")
         assert any(
             foreign_key["referred_table"] == "messages"
@@ -198,7 +198,7 @@ def test_upgrade_refuses_an_unknown_newer_schema(tmp_path: Path):
         upgrade_database(database)
 
 
-def test_stale_recovery_point_is_rejected(tmp_path: Path):
+def test_stale_recovery_point_gets_collision_safe_identity(tmp_path: Path):
     database = tmp_path / "stale.sqlite3"
     _upgrade_to(database, "0001_desktop_state")
     engine = create_engine(f"sqlite:///{database}")
@@ -220,8 +220,12 @@ def test_stale_recovery_point_is_rejected(tmp_path: Path):
     finally:
         engine.dispose()
 
-    with pytest.raises(RuntimeError, match="does not match"):
-        _create_recovery_point(database)
+    recovery_point = _create_recovery_point(database)
+    assert recovery_point != tmp_path / ".stale.sqlite3.pre-migration"
+    assert recovery_point.name.startswith(".stale.sqlite3.pre-migration-")
+    assert (tmp_path / ".stale.sqlite3.pre-migration").is_file()
+    assert (tmp_path / ".stale.sqlite3.pre-migration.json").is_file()
+    assert (tmp_path / f"{recovery_point.name}.json").is_file()
 
 
 def test_database_rejects_cross_chat_lineage_reference(tmp_path: Path):
@@ -794,7 +798,7 @@ def test_upgrade_from_existing_phase2_revision_installs_integrity_boundary(tmp_p
     store = SQLiteAppStateStore.open(database)
     try:
         with store.engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0006_phase4_workspace"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0008_catalogue_refresh_outcomes"
             assert connection.execute(
                 text("SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'messages_validate_insert'")
             ).scalar_one() == 1
@@ -863,7 +867,7 @@ def test_recovery_point_reconstructs_metadata_after_second_replace_failure(tmp_p
     temporary_metadata = tmp_path / "..recovery.sqlite3.pre-migration.json.tmp"
     assert recovery_point.is_file()
     assert not metadata_path.exists()
-    assert temporary_metadata.is_file()
+    assert not temporary_metadata.exists()
 
     monkeypatch.setattr(migration_runner.os, "replace", original_replace)
     _create_recovery_point(database)

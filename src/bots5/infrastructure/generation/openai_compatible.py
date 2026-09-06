@@ -38,7 +38,7 @@ class OpenAICompatibleStreamingBackend:
         max_output_tokens: int = 1024,
         reasoning_effort: ReasoningEffort | None = None,
     ) -> None:
-        if provider_id not in {"local_openai", "openrouter"}:
+        if provider_id not in {"generic", "local_openai", "openrouter"}:
             raise ValueError(f"unsupported OpenAI-compatible provider ID: {provider_id}")
         base_url = canonical_http_base_url(
             base_url,
@@ -116,10 +116,10 @@ class OpenAICompatibleStreamingBackend:
             model=request.model,
             system="",
             user=request.prompt,
-            temperature=self.temperature,
-            max_output_tokens=self.max_output_tokens,
-            timeout_seconds=0.0,
-            reasoning_effort=self.reasoning_effort,
+            temperature=float((request.effective_settings or {}).get("temperature", self.temperature)),
+            max_output_tokens=int((request.effective_settings or {}).get("max_output_tokens", self.max_output_tokens)),
+            timeout_seconds=float(request.timeout_seconds or 0.0),
+            reasoning_effort=(request.effective_settings or {}).get("reasoning_effort", self.reasoning_effort),
         )
         metadata = CompletionStreamEvent()
         finish_reason: str | None = None

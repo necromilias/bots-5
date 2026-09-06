@@ -20,6 +20,22 @@ class GenerationRequest(BaseModel):
     provider_id: str | None = None
     base_url: str | None = None
     api_key_env: str | None = None
+    connection_id: str | None = None
+    connection_name: str | None = None
+    connection_revision: int | None = None
+    model_entry_id: str | None = None
+    catalogue_revision: int | None = None
+    credential_source: str | None = None
+    credential_reference: str | None = None
+    credential_status: str | None = None
+    provider_profile: str | None = None
+    effective_settings: dict[str, object] | None = None
+    settings_provenance: dict[str, str] | None = None
+    capabilities: list[dict[str, object]] | None = None
+    capability_provenance: dict[str, object] | None = None
+    manual_overrides: dict[str, object] | None = None
+    omitted_settings: dict[str, str] | None = None
+    timeout_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

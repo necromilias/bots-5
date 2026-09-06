@@ -53,6 +53,7 @@ class OpenAICompatibleProvider:
         base_url: str,
         api_key_env: str | None = None,
         *,
+        api_key: str | None = None,
         _transport: httpx.AsyncBaseTransport | None = None,
     ):
         self._base_url = _validated_base_url(base_url)
@@ -61,7 +62,11 @@ class OpenAICompatibleProvider:
                 "local_openai api_key_env must be a non-empty environment variable name"
             )
         self._api_key_env = api_key_env
-        self._api_key = None
+        if api_key_env is not None and api_key is not None:
+            raise ProviderError("credential source is ambiguous")
+        if api_key is not None and (type(api_key) is not str or not api_key):
+            raise ProviderError("credential value is missing")
+        self._api_key = api_key
         if api_key_env is not None:
             api_key = os.environ.get(api_key_env)
             if not api_key:
@@ -237,6 +242,10 @@ class OpenAICompatibleProvider:
                 )
         except httpx.HTTPError as exc:
             raise ProviderError(f"provider_transport_error: {self._sanitize(str(exc))}") from None
+        except ProviderError:
+            raise
+        except Exception as exc:
+            raise ProviderError(f"provider_transport_error: {self._sanitize(str(exc))}") from None
 
         duration = time.monotonic() - started
         if not 200 <= response.status_code < 300:
@@ -290,4 +299,8 @@ class OpenAICompatibleProvider:
                             raise ProviderResponseError("malformed_provider_response") from None
                         yield self._normalize_stream_chunk(data)
         except httpx.HTTPError as exc:
+            raise ProviderError(f"provider_transport_error: {self._sanitize(str(exc))}") from None
+        except ProviderError:
+            raise
+        except Exception as exc:
             raise ProviderError(f"provider_transport_error: {self._sanitize(str(exc))}") from None

@@ -104,7 +104,7 @@ def test_phase3_outcome_columns_are_additive_and_nullable(tmp_path: Path):
         assert all(columns[name]["nullable"] for name in outcome_columns)
         with store.engine.connect() as connection:
             assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-                "0006_phase4_workspace"
+                "0008_catalogue_refresh_outcomes"
             )
     finally:
         store.close()

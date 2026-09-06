@@ -10,6 +10,7 @@ from bots5.core.urls import canonical_http_base_url
 
 PHASE3_BACKEND_ID = "openai_compatible_http"
 PHASE3_PROVIDER_IDS = frozenset({"local_openai", "openrouter"})
+PHASE5_PROVIDER_IDS = frozenset({"generic", "openrouter"})
 _PHASE3_REQUIRED_SNAPSHOT_KEYS = (
     "attempt_id",
     "chat_id",
@@ -26,8 +27,24 @@ _PHASE3_ALLOWED_SNAPSHOT_KEYS = frozenset(
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SQLITE_INTEGER_MAX = 2**63 - 1
 _FORBIDDEN_SNAPSHOT_KEYS = frozenset(
-    {"api_key", "api_key_value", "authorization", "secret", "secret_value"}
+    {
+        "apikey",
+        "apikeyvalue",
+        "apitoken",
+        "accesstoken",
+        "authorization",
+        "clientsecret",
+        "password",
+        "refreshtoken",
+        "secret",
+        "secretvalue",
+        "token",
+    }
 )
+
+
+def _normalise_secret_key(key: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", key.casefold())
 
 
 def _object_without_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -42,7 +59,8 @@ def _object_without_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str,
 def _contains_forbidden_key(value: object) -> bool:
     if isinstance(value, Mapping):
         return any(
-            key in _FORBIDDEN_SNAPSHOT_KEYS or _contains_forbidden_key(nested)
+            (isinstance(key, str) and _normalise_secret_key(key) in _FORBIDDEN_SNAPSHOT_KEYS)
+            or _contains_forbidden_key(nested)
             for key, nested in value.items()
         )
     if isinstance(value, list):
@@ -94,6 +112,11 @@ def is_phase3_record(
     snapshot: Mapping[str, object],
     include_backend_marker: bool = True,
 ) -> bool:
+    # Phase 5 uses the historical nullable provider_id column for profile
+    # attribution.  Its closed snapshot marker is the compatibility boundary
+    # and must prevent those rows from being reclassified as Phase 3 rows.
+    if snapshot.get("snapshot_version") == 2:
+        return False
     return (
         provider_id is not None
         or snapshot.get("provider_id") in PHASE3_PROVIDER_IDS
@@ -121,6 +144,23 @@ def validate_request_snapshot(
         raise error_type("generation request snapshot must be valid JSON") from exc
     if not isinstance(snapshot, dict):
         raise error_type("generation request snapshot must be a JSON object")
+
+    if snapshot.get("snapshot_version") == 2:
+        try:
+            from .phase5_validation import validate_phase5_snapshot
+
+            return validate_phase5_snapshot(
+                request_snapshot,
+                attempt_id=attempt_id,
+                chat_id=chat_id,
+                user_message_id=user_message_id,
+                backend_id=backend_id,
+                model=model,
+                provider_id=provider_id,
+                user_message_content=user_message_content,
+            )
+        except ValueError as exc:
+            raise error_type(str(exc)) from None
 
     expected = {
         "attempt_id": attempt_id,
@@ -287,9 +327,10 @@ def validate_outcome_fields(
     outcome_error_type: object | None = None,
     outcome_error_message: object | None = None,
     phase3: bool | None = None,
+    phase5: bool | None = None,
     error_type: type[Exception] = ValueError,
 ) -> None:
-    if provider_id is not None and provider_id not in PHASE3_PROVIDER_IDS:
+    if provider_id is not None and provider_id not in PHASE3_PROVIDER_IDS | PHASE5_PROVIDER_IDS:
         raise error_type("generation attempt has an invalid provider ID")
     for name, value in (("returned_model", returned_model), ("request_id", request_id)):
         if value is not None and (type(value) is not str or not value):
@@ -321,7 +362,8 @@ def validate_outcome_fields(
     ):
         raise error_type("generation attempt has invalid finish_reason")
     if phase3 is None:
-        phase3 = provider_id is not None
+        phase3 = provider_id is not None and provider_id not in PHASE5_PROVIDER_IDS
+    phase5 = phase5 if phase5 is not None else False
     if phase3:
         if remote_outcome_unknown is None:
             raise error_type(
@@ -349,6 +391,18 @@ def validate_outcome_fields(
         elif state in {"failed", "aborted"} and finish_reason is not None:
             raise error_type(
                 f"Phase 3 {state} generation cannot have finish_reason"
+            )
+    if phase5 and state == "complete":
+        if finish_reason != "stop":
+            raise error_type("Phase 5 complete generation requires finish_reason=stop")
+        if remote_outcome_unknown not in {False, 0}:
+            raise error_type("Phase 5 complete generation cannot have an unknown outcome")
+    if phase5:
+        if state == "incomplete" and finish_reason == "stop":
+            raise error_type("Phase 5 incomplete generation cannot have finish_reason=stop")
+        if state in {"running", "failed", "aborted"} and finish_reason is not None:
+            raise error_type(
+                f"Phase 5 {state} generation cannot have finish_reason"
             )
 
 

@@ -6,6 +6,7 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool, text
 
 from bots5.infrastructure.persistence.schema import metadata
+from bots5.infrastructure.persistence.transition_guard import install_transition_guard
 
 
 config = context.config
@@ -29,6 +30,7 @@ def run_migrations_online() -> None:
         poolclass=pool.NullPool,
     )
     with connectable.connect() as connection:
+        install_transition_guard(connection.connection.driver_connection, None)
         # SQLite cannot rebuild a referenced table with foreign-key actions
         # enabled: dropping the old table would cascade its dependants. The
         # migration itself validates its backfill, creates the constraints,

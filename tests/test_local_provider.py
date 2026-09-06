@@ -197,6 +197,28 @@ def test_local_provider_transport_and_json_errors_are_provider_errors():
         asyncio.run(provider.complete(req()))
 
 
+def test_local_provider_sanitizes_unexpected_stream_transport_errors():
+    secret = "unexpected-stream-secret"
+
+    async def transport_error(request: httpx.Request):
+        raise RuntimeError(f"transport saw Authorization: Bearer {secret}")
+
+    provider = OpenAICompatibleProvider(
+        "http://127.0.0.1:8000/v1",
+        api_key=secret,
+        _transport=httpx.MockTransport(transport_error),
+    )
+
+    async def consume():
+        async for _event in provider.stream(req()):
+            pass
+
+    with pytest.raises(ProviderError) as caught:
+        asyncio.run(consume())
+    assert secret not in str(caught.value)
+    assert "[REDACTED]" in str(caught.value)
+
+
 @pytest.mark.parametrize(
     ("response", "expected"),
     [

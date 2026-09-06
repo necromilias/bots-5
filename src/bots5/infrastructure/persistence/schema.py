@@ -1,6 +1,19 @@
 from __future__ import annotations
 
-from sqlalchemy import Boolean, Column, ForeignKey, Index, Integer, MetaData, String, Table, Text, text
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    Column,
+    ForeignKey,
+    Index,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    Text,
+    UniqueConstraint,
+    text,
+)
 
 
 metadata = MetaData()
@@ -70,6 +83,8 @@ generation_attempts = Table(
     Column("total_tokens", Integer),
     Column("known_cost_usd", Text),
     Column("remote_outcome_unknown", Boolean),
+    Column("connection_id", String(64), ForeignKey("provider_connections.id", ondelete="RESTRICT")),
+    Column("model_entry_id", String(64), ForeignKey("model_catalogue_entries.id", ondelete="RESTRICT")),
     Index("ux_generation_attempts_assistant", "assistant_message_id", unique=True),
     Index(
         "ux_generation_attempts_active_chat",
@@ -77,6 +92,183 @@ generation_attempts = Table(
         unique=True,
         sqlite_where=text("state = 'running'"),
     ),
+)
+
+provider_connections = Table(
+    "provider_connections",
+    metadata,
+    Column("id", String(64), primary_key=True),
+    Column("name", Text, nullable=False),
+    Column("name_key", String(256), nullable=False, unique=True),
+    Column("backend_type", String(64), nullable=False),
+    Column("profile", String(64), nullable=False),
+    Column("endpoint", Text),
+    Column("credential_source", String(64), nullable=False),
+    Column("credential_reference", Text),
+    Column("enabled", Boolean, nullable=False, server_default=text("1")),
+    Column("retired", Boolean, nullable=False, server_default=text("0")),
+    Column("revision", Integer, nullable=False),
+    Column("catalogue_revision", Integer, nullable=False, server_default=text("0")),
+    Column("created_at", String(40), nullable=False),
+    Column("updated_at", String(40), nullable=False),
+    Index("ix_provider_connections_enabled", "enabled", "retired"),
+)
+
+catalogue_refresh_state = Table(
+    "catalogue_refresh_state",
+    metadata,
+    Column(
+        "connection_id",
+        String(64),
+        ForeignKey("provider_connections.id", ondelete="RESTRICT"),
+        primary_key=True,
+    ),
+    Column("status", String(32), nullable=False),
+    Column("refresh_revision", Integer, nullable=False),
+    Column("failure_class", String(32)),
+    Column("failure_message", Text),
+    Column("updated_at", String(40), nullable=False),
+    CheckConstraint(
+        "status IN ('never', 'succeeded', 'failed')",
+        name="ck_catalogue_refresh_status",
+    ),
+    CheckConstraint(
+        "refresh_revision >= 0",
+        name="ck_catalogue_refresh_revision",
+    ),
+    CheckConstraint(
+        "failure_class IS NULL OR failure_class IN ('transport', 'timeout', 'provider_http', 'protocol', 'unknown')",
+        name="ck_catalogue_refresh_failure_class",
+    ),
+    CheckConstraint(
+        "failure_message IS NULL OR failure_message IN ('provider is unreachable', 'provider discovery timed out', 'provider returned an HTTP error', 'provider returned an invalid model catalogue', 'provider discovery failed')",
+        name="ck_catalogue_refresh_failure_message",
+    ),
+    CheckConstraint(
+        "(status = 'failed' AND failure_class IS NOT NULL AND failure_message IS NOT NULL) "
+        "OR (status <> 'failed' AND failure_class IS NULL AND failure_message IS NULL)",
+        name="ck_catalogue_refresh_failure_consistency",
+    ),
+    CheckConstraint(
+        "(status = 'never' AND refresh_revision = 0) "
+        "OR (status <> 'never' AND refresh_revision > 0)",
+        name="ck_catalogue_refresh_revision_consistency",
+    ),
+    CheckConstraint(
+        "(failure_class = 'transport' AND failure_message = 'provider is unreachable') "
+        "OR (failure_class = 'timeout' AND failure_message = 'provider discovery timed out') "
+        "OR (failure_class = 'provider_http' AND failure_message = 'provider returned an HTTP error') "
+        "OR (failure_class = 'protocol' AND failure_message = 'provider returned an invalid model catalogue') "
+        "OR (failure_class = 'unknown' AND failure_message = 'provider discovery failed') "
+        "OR (failure_class IS NULL AND failure_message IS NULL)",
+        name="ck_catalogue_refresh_failure_diagnostic",
+    ),
+)
+
+model_catalogue_entries = Table(
+    "model_catalogue_entries",
+    metadata,
+    Column("id", String(64), primary_key=True),
+    Column("connection_id", String(64), ForeignKey("provider_connections.id", ondelete="RESTRICT"), nullable=False),
+    Column("provider_model_id", Text, nullable=False),
+    Column("display_name", Text, nullable=False),
+    Column("origin", String(64), nullable=False),
+    Column("availability", String(64), nullable=False),
+    Column("discovery_revision", Integer),
+    Column("discovered_at", String(40)),
+    Column("metadata_json", Text, nullable=False, server_default=text("'{}'")),
+    Column("revision", Integer, nullable=False),
+    Column("created_at", String(40), nullable=False),
+    Column("updated_at", String(40), nullable=False),
+    UniqueConstraint("connection_id", "provider_model_id", name="ux_model_catalogue_connection_model"),
+    Index("ix_model_catalogue_connection_availability", "connection_id", "availability"),
+)
+
+capability_facts = Table(
+    "capability_facts",
+    metadata,
+    Column("id", String(64), primary_key=True),
+    Column("model_entry_id", String(64), ForeignKey("model_catalogue_entries.id", ondelete="CASCADE"), nullable=False),
+    Column("capability_key", String(128), nullable=False),
+    Column("state", String(32), nullable=False),
+    Column("source", String(64), nullable=False),
+    Column("source_revision", Integer),
+    Column("value", Integer),
+    Column("provenance_json", Text, nullable=False, server_default=text("'{}'")),
+    Column("observed_at", String(40), nullable=False),
+    Index("ix_capability_facts_model_key", "model_entry_id", "capability_key"),
+)
+
+capability_overrides = Table(
+    "capability_overrides",
+    metadata,
+    Column("model_entry_id", String(64), ForeignKey("model_catalogue_entries.id", ondelete="CASCADE"), nullable=False),
+    Column("capability_key", String(128), nullable=False),
+    Column("state", String(32), nullable=False),
+    Column("value", Integer),
+    Column("reason", Text),
+    Column("revision", Integer, nullable=False),
+    Column("updated_at", String(40), nullable=False),
+    UniqueConstraint("model_entry_id", "capability_key", name="ux_capability_override_model_key"),
+)
+
+capability_observations = Table(
+    "capability_observations",
+    metadata,
+    Column("id", String(64), primary_key=True),
+    Column("model_entry_id", String(64), ForeignKey("model_catalogue_entries.id", ondelete="CASCADE"), nullable=False),
+    Column("capability_key", String(128), nullable=False),
+    Column("observed_state", String(32), nullable=False),
+    Column("detail", Text, nullable=False),
+    Column("observed_at", String(40), nullable=False),
+)
+
+application_generation_config = Table(
+    "application_generation_config",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("default_model_entry_id", String(64), ForeignKey("model_catalogue_entries.id", ondelete="RESTRICT")),
+    Column("temperature", Text, nullable=False),
+    Column("max_output_tokens", Integer, nullable=False),
+    Column("reasoning_effort", String(32)),
+    Column("timeout_seconds", Text),
+    Column("revision", Integer, nullable=False),
+    Column("updated_at", String(40), nullable=False),
+)
+
+model_generation_config = Table(
+    "model_generation_config",
+    metadata,
+    Column("model_entry_id", String(64), ForeignKey("model_catalogue_entries.id", ondelete="CASCADE"), primary_key=True),
+    Column("temperature", Text),
+    Column("max_output_tokens", Integer),
+    Column("reasoning_effort", String(32)),
+    Column("timeout_seconds", Text),
+    Column("revision", Integer, nullable=False),
+    Column("updated_at", String(40), nullable=False),
+)
+
+chat_model_generation_config = Table(
+    "chat_model_generation_config",
+    metadata,
+    Column("chat_id", String(64), ForeignKey("chats.id", ondelete="CASCADE"), primary_key=True),
+    Column("model_entry_id", String(64), ForeignKey("model_catalogue_entries.id", ondelete="CASCADE"), primary_key=True),
+    Column("temperature", Text),
+    Column("max_output_tokens", Integer),
+    Column("reasoning_effort", String(32)),
+    Column("timeout_seconds", Text),
+    Column("revision", Integer, nullable=False),
+    Column("updated_at", String(40), nullable=False),
+)
+
+chat_model_selection = Table(
+    "chat_model_selection",
+    metadata,
+    Column("chat_id", String(64), ForeignKey("chats.id", ondelete="CASCADE"), primary_key=True),
+    Column("model_entry_id", String(64), ForeignKey("model_catalogue_entries.id", ondelete="RESTRICT")),
+    Column("selection_required", Boolean, nullable=False),
+    Column("revision", Integer, nullable=False),
+    Column("updated_at", String(40), nullable=False),
 )
 
 workspace_windows = Table(
