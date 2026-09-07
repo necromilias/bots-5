@@ -33,7 +33,11 @@ from bots5.domain.clock import SystemClock
 from bots5.domain.ids import Uuid7Factory
 from bots5.domain.models import AttemptState, ChatActivity
 from bots5.infrastructure.generation.fake import FakeStreamingBackend
-from bots5.infrastructure.persistence import SQLiteAppStateStore, upgrade_database
+from tests._authority_test_support import (
+    SQLiteAppStateStore,
+    upgrade_database,
+    upgrade_to as authority_upgrade_to,
+)
 
 
 MIGRATIONS = Path(__file__).resolve().parents[1] / "src/bots5/infrastructure/persistence/migrations"
@@ -76,10 +80,7 @@ def _application(tmp_path: Path, backend) -> BotsApplication:
 
 
 def _upgrade_to(database: Path, revision: str) -> None:
-    config = Config()
-    config.set_main_option("script_location", str(MIGRATIONS))
-    config.set_main_option("sqlalchemy.url", f"sqlite:///{database}")
-    command.upgrade(config, revision)
+    authority_upgrade_to(database, revision)
 
 
 async def _wait_until(predicate, *, attempts: int = 100) -> None:

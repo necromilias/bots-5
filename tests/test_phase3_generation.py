@@ -37,7 +37,11 @@ from bots5.domain.models import (
 from bots5.errors import ProviderError, ProviderResponseError
 from bots5.infrastructure.generation.openai_compatible import OpenAICompatibleStreamingBackend
 from bots5.infrastructure.generation.fake import FakeStreamingBackend
-from bots5.infrastructure.persistence import SQLiteAppStateStore, upgrade_database
+from tests._authority_test_support import (
+    SQLiteAppStateStore,
+    upgrade_database,
+    upgrade_to as authority_upgrade_to,
+)
 from bots5.providers.base import CompletionRequest, CompletionStreamEvent
 from bots5.providers.openai_compatible import OpenAICompatibleProvider
 from bots5.providers.openrouter import OpenRouterProvider
@@ -48,10 +52,7 @@ MIGRATIONS = REPO / "src/bots5/infrastructure/persistence/migrations"
 
 
 def _upgrade_to(database: Path, revision: str) -> None:
-    config = Config()
-    config.set_main_option("script_location", str(MIGRATIONS))
-    config.set_main_option("sqlalchemy.url", f"sqlite:///{database}")
-    command.upgrade(config, revision)
+    authority_upgrade_to(database, revision)
 
 
 def test_default_fake_snapshot_preserves_phase1_shape(tmp_path: Path):
@@ -104,7 +105,7 @@ def test_phase3_outcome_columns_are_additive_and_nullable(tmp_path: Path):
         assert all(columns[name]["nullable"] for name in outcome_columns)
         with store.engine.connect() as connection:
             assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-                "0008_catalogue_refresh_outcomes"
+                "0009_phase6_context_attachments"
             )
     finally:
         store.close()

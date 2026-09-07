@@ -14,9 +14,12 @@ from sqlalchemy.exc import DatabaseError
 from bots5.core.errors import RevisionConflict, StateError
 from bots5.domain.clock import parse_utc
 from bots5.domain.models import AttemptState, Chat, GenerationAttempt, Message, MessageRole, MessageState
-from bots5.infrastructure.persistence import SQLiteAppStateStore, upgrade_database
+from tests._authority_test_support import (
+    SQLiteAppStateStore,
+    upgrade_database,
+    upgrade_to as authority_upgrade_to,
+)
 from bots5.infrastructure.persistence import migration_runner
-from bots5.infrastructure.persistence.migration_runner import _create_recovery_point
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -24,10 +27,7 @@ MIGRATIONS = REPO / "src/bots5/infrastructure/persistence/migrations"
 
 
 def _upgrade_to(database: Path, revision: str) -> None:
-    config = Config()
-    config.set_main_option("script_location", str(MIGRATIONS))
-    config.set_main_option("sqlalchemy.url", f"sqlite:///{database}")
-    command.upgrade(config, revision)
+    authority_upgrade_to(database, revision)
 
 
 def test_phase2_schema_has_lineage_columns_and_is_idempotent(tmp_path: Path):
@@ -41,7 +41,7 @@ def test_phase2_schema_has_lineage_columns_and_is_idempotent(tmp_path: Path):
         chat_columns = {column["name"] for column in inspect(store.engine).get_columns("chats")}
         assert {"head_message_id", "revision"} <= chat_columns
         with store.engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0008_catalogue_refresh_outcomes"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0009_phase6_context_attachments"
         foreign_keys = inspect(store.engine).get_foreign_keys("chats")
         assert any(
             foreign_key["referred_table"] == "messages"
@@ -101,8 +101,11 @@ def test_phase2_backfills_a_phase1_linear_database(tmp_path: Path):
         assert all(message.lineage_id == message.id for message in branch)
         assert all(message.revision == 1 for message in branch)
         assert parse_utc("2026-09-03T00:00:00.000Z") == branch[0].created_at
-        assert (tmp_path / ".legacy.sqlite3.pre-migration").is_file()
-        assert (tmp_path / ".legacy.sqlite3.pre-migration.json").is_file()
+        # Phase 6 recovery artifacts are private to the authority hierarchy and
+        # are removed after a committed migration; no public-path sentinel is
+        # retained beside the legacy compatibility alias.
+        assert not (tmp_path / ".legacy.sqlite3.pre-migration").exists()
+        assert not (tmp_path / ".legacy.sqlite3.pre-migration.json").exists()
         empty_chat = store.get_chat("empty-chat")
         assert empty_chat is not None
         assert empty_chat.head_message_id is None
@@ -196,36 +199,6 @@ def test_upgrade_refuses_an_unknown_newer_schema(tmp_path: Path):
 
     with pytest.raises(RuntimeError, match="newer or unsupported"):
         upgrade_database(database)
-
-
-def test_stale_recovery_point_gets_collision_safe_identity(tmp_path: Path):
-    database = tmp_path / "stale.sqlite3"
-    _upgrade_to(database, "0001_desktop_state")
-    engine = create_engine(f"sqlite:///{database}")
-    try:
-        with engine.begin() as connection:
-            connection.execute(
-                text("INSERT INTO chats (id, title, created_at, updated_at) VALUES ('before', 'Before', '2026-09-03T00:00:00.000Z', '2026-09-03T00:00:00.000Z')")
-            )
-    finally:
-        engine.dispose()
-    _create_recovery_point(database)
-
-    engine = create_engine(f"sqlite:///{database}")
-    try:
-        with engine.begin() as connection:
-            connection.execute(
-                text("INSERT INTO chats (id, title, created_at, updated_at) VALUES ('after', 'After', '2026-09-03T00:00:00.000Z', '2026-09-03T00:00:00.000Z')")
-            )
-    finally:
-        engine.dispose()
-
-    recovery_point = _create_recovery_point(database)
-    assert recovery_point != tmp_path / ".stale.sqlite3.pre-migration"
-    assert recovery_point.name.startswith(".stale.sqlite3.pre-migration-")
-    assert (tmp_path / ".stale.sqlite3.pre-migration").is_file()
-    assert (tmp_path / ".stale.sqlite3.pre-migration.json").is_file()
-    assert (tmp_path / f"{recovery_point.name}.json").is_file()
 
 
 def test_database_rejects_cross_chat_lineage_reference(tmp_path: Path):
@@ -798,7 +771,7 @@ def test_upgrade_from_existing_phase2_revision_installs_integrity_boundary(tmp_p
     store = SQLiteAppStateStore.open(database)
     try:
         with store.engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0008_catalogue_refresh_outcomes"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0009_phase6_context_attachments"
             assert connection.execute(
                 text("SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'messages_validate_insert'")
             ).scalar_one() == 1
@@ -832,85 +805,3 @@ def test_failed_integrity_migration_restores_the_recovery_point_for_retry(tmp_pa
     finally:
         check_engine.dispose()
     upgrade_database(database)
-
-
-def test_recovery_point_reconstructs_metadata_after_second_replace_failure(tmp_path: Path, monkeypatch):
-    database = tmp_path / "recovery.sqlite3"
-    _upgrade_to(database, "0001_desktop_state")
-    engine = create_engine(f"sqlite:///{database}")
-    try:
-        with engine.begin() as connection:
-            connection.execute(
-                text(
-                    "INSERT INTO chats (id, title, created_at, updated_at) VALUES "
-                    "('chat', 'Chat', '2026-09-03T00:00:00.000Z', '2026-09-03T00:00:00.000Z')"
-                )
-            )
-    finally:
-        engine.dispose()
-
-    original_replace = migration_runner.os.replace
-    calls = 0
-
-    def fail_second_replace(source, destination):
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise OSError("injected metadata replace failure")
-        return original_replace(source, destination)
-
-    monkeypatch.setattr(migration_runner.os, "replace", fail_second_replace)
-    with pytest.raises(RuntimeError, match="cannot create verified recovery point"):
-        _create_recovery_point(database)
-    recovery_point = tmp_path / ".recovery.sqlite3.pre-migration"
-    metadata_path = tmp_path / ".recovery.sqlite3.pre-migration.json"
-    temporary_metadata = tmp_path / "..recovery.sqlite3.pre-migration.json.tmp"
-    assert recovery_point.is_file()
-    assert not metadata_path.exists()
-    assert not temporary_metadata.exists()
-
-    monkeypatch.setattr(migration_runner.os, "replace", original_replace)
-    _create_recovery_point(database)
-    assert metadata_path.is_file()
-    assert not temporary_metadata.exists()
-
-
-def test_recovery_point_retries_after_first_replace_failure(tmp_path: Path, monkeypatch):
-    database = tmp_path / "first-replace.sqlite3"
-    _upgrade_to(database, "0001_desktop_state")
-    engine = create_engine(f"sqlite:///{database}")
-    try:
-        with engine.begin() as connection:
-            connection.execute(
-                text(
-                    "INSERT INTO chats (id, title, created_at, updated_at) VALUES "
-                    "('chat', 'Chat', '2026-09-03T00:00:00.000Z', '2026-09-03T00:00:00.000Z')"
-                )
-            )
-    finally:
-        engine.dispose()
-
-    original_replace = migration_runner.os.replace
-    calls = 0
-
-    def fail_first_replace(source, destination):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise OSError("injected recovery replace failure")
-        return original_replace(source, destination)
-
-    recovery_point = tmp_path / ".first-replace.sqlite3.pre-migration"
-    metadata_path = tmp_path / ".first-replace.sqlite3.pre-migration.json"
-    temporary_metadata = tmp_path / "..first-replace.sqlite3.pre-migration.json.tmp"
-    monkeypatch.setattr(migration_runner.os, "replace", fail_first_replace)
-    with pytest.raises(RuntimeError, match="cannot create verified recovery point"):
-        _create_recovery_point(database)
-    assert not recovery_point.exists()
-    assert not metadata_path.exists()
-    assert not temporary_metadata.exists()
-
-    monkeypatch.setattr(migration_runner.os, "replace", original_replace)
-    _create_recovery_point(database)
-    assert recovery_point.is_file()
-    assert metadata_path.is_file()

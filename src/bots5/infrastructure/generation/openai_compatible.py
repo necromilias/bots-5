@@ -114,7 +114,7 @@ class OpenAICompatibleStreamingBackend:
         yield GenerationDispatched(attempt_id=request.attempt_id)
         completion_request = CompletionRequest(
             model=request.model,
-            system="",
+            system=request.system_prompt or "",
             user=request.prompt,
             temperature=float((request.effective_settings or {}).get("temperature", self.temperature)),
             max_output_tokens=int((request.effective_settings or {}).get("max_output_tokens", self.max_output_tokens)),

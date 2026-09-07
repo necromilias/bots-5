@@ -15,7 +15,7 @@ from bots5.domain.clock import SystemClock
 from bots5.domain.ids import Uuid7Factory
 from bots5.domain.models import AttemptState, Chat, GenerationAttempt, Message, MessageRole, MessageState
 from bots5.infrastructure.generation.fake import FakeStreamingBackend
-from bots5.infrastructure.persistence import SQLiteAppStateStore, upgrade_database
+from tests._authority_test_support import SQLiteAppStateStore, upgrade_database
 
 
 def _application(tmp_path: Path) -> BotsApplication:

@@ -2,5 +2,18 @@
 
 from .application import BotsApplication
 from .events import CoreEvent, EventBus, EventSubscription
+from .context import (
+    ContextAccountingAdapter,
+    ContextBuildError,
+    ContextBuilder,
+    ContextPlan,
+    ContextSource,
+    DeterministicJsonAdapter,
+    phase6_snapshot,
+)
 
-__all__ = ["BotsApplication", "CoreEvent", "EventBus", "EventSubscription"]
+__all__ = [
+    "BotsApplication", "CoreEvent", "EventBus", "EventSubscription",
+    "ContextAccountingAdapter", "ContextBuildError", "ContextBuilder", "ContextPlan",
+    "ContextSource", "DeterministicJsonAdapter", "phase6_snapshot",
+]

@@ -7,6 +7,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QAction, QClipboard
 from PySide6.QtWidgets import (
     QDockWidget,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -187,10 +188,11 @@ class MainWindow(QMainWindow):
 
         composer_controls = QHBoxLayout()
         composer_controls.setSpacing(6)
-        self.attachment_button = self._disabled_composer_button(
-            "Attach",
-            "Attachments are not implemented in this UI slice.",
-        )
+        self.attachment_button = QToolButton(self.composer_frame)
+        self.attachment_button.setObjectName("attachmentAffordance")
+        self.attachment_button.setText("Attach")
+        self.attachment_button.setToolTip("Attach a UTF-8 text file to the next message")
+        self.attachment_button.clicked.connect(self._on_attach_file)
         composer_controls.addWidget(self.attachment_button)
 
         self.tool_button = self._disabled_composer_button(
@@ -307,6 +309,7 @@ class MainWindow(QMainWindow):
                 self._workspace.set_selected_chat(self._window_id, chat_id)
             self.rail.set_activity(self._activity, chat_id)
             self._schedule(self._refresh_transcript(self._current_chat_id))
+            self._schedule(self._refresh_pending_attachment_button(self._current_chat_id))
             self._schedule(self._refresh_phase5_state())
             self._schedule(self._sync_current_activity())
             self._schedule(self._save_workspace())
@@ -795,6 +798,47 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.statusBar().showMessage(str(exc))
 
+    def _on_attach_file(self) -> None:
+        if self._generation_busy or self._current_chat_id is None:
+            return
+        path, _filter = QFileDialog.getOpenFileName(
+            self,
+            "Attach file",
+            "",
+            "Text or data files (*)",
+        )
+        if path:
+            self._schedule(self._attach_file(path))
+
+    async def _attach_file(self, path: str) -> None:
+        chat_id = self._current_chat_id
+        if chat_id is None:
+            return
+        try:
+            attachment = await self._application.attach_file(path)
+            await self._application.stage_attachment(chat_id, attachment.id)
+            # Capture may finish after the user switches chats.  The staged
+            # attachment remains associated with the chat that initiated the
+            # command; the visible button must reflect the window's current
+            # chat, queried after the asynchronous capture completes.
+            current_chat_id = self._current_chat_id
+            if current_chat_id is not None:
+                await self._refresh_pending_attachment_button(current_chat_id)
+        except Exception as exc:
+            self.statusBar().showMessage(str(exc))
+
+    async def _refresh_pending_attachment_button(self, chat_id: str) -> None:
+        try:
+            pending = await self._application.pending_attachments(chat_id)
+        except Exception:
+            return
+        self.attachment_button.setText("Attach" if not pending else f"Attach ({len(pending)})")
+        self.attachment_button.setToolTip(
+            "Attach a UTF-8 text file to the next message"
+            if not pending
+            else "Selected for the next message: " + ", ".join(item.filename for item in pending)
+        )
+
     def _on_send(self) -> None:
         self._schedule(self._send_message())
 
@@ -941,6 +985,7 @@ class MainWindow(QMainWindow):
         self.chat_list.setEnabled(True)
         self.new_chat_button.setEnabled(True)
         self.send_button.setEnabled(not busy and bool(self.composer.toPlainText().strip()))
+        self.attachment_button.setEnabled(not busy and self._current_chat_id is not None)
         self.cancel_button.setEnabled(busy and self._active_attempt_id is not None)
         self.rail.chat_button.setEnabled(True)
         for row in self.transcript.message_rows.values():
@@ -950,6 +995,7 @@ class MainWindow(QMainWindow):
         self.send_button.setEnabled(
             not self._generation_busy and bool(self.composer.toPlainText().strip())
         )
+        self.attachment_button.setEnabled(not self._generation_busy and self._current_chat_id is not None)
         self.cancel_button.setEnabled(self._generation_busy and self._active_attempt_id is not None)
 
     def _on_event(self, event: CoreEvent) -> None:
@@ -1004,6 +1050,8 @@ class MainWindow(QMainWindow):
         if event.kind == "chat_created":
             chats = await self._application.list_chats()
             self._replace_chat_list(chats)
+        if event.kind == "pending_attachments_changed" and chat_id == self._current_chat_id:
+            await self._refresh_pending_attachment_button(self._current_chat_id)
         if event.kind in {
             "chat_model_selection_changed",
             "provider_connection_changed",

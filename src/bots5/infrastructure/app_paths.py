@@ -13,12 +13,9 @@ class AppPaths:
     state_root: Path
     cache_root: Path
     logs_root: Path
-    database: Path
-    authority_lock: Path
 
-    def ensure(self) -> None:
+    def ensure_non_authoritative(self) -> None:
         for path in (
-            self.data_root,
             self.config_root,
             self.state_root,
             self.cache_root,
@@ -29,7 +26,7 @@ class AppPaths:
 
 def resolve_app_paths(data_root: Path | None = None) -> AppPaths:
     if data_root is not None:
-        root = data_root.expanduser().resolve(strict=False)
+        root = data_root.expanduser().absolute()
         config = root / "config"
         state = root / "state"
         cache = root / "cache"
@@ -44,6 +41,4 @@ def resolve_app_paths(data_root: Path | None = None) -> AppPaths:
         state_root=state,
         cache_root=cache,
         logs_root=state / "logs",
-        database=root / "state.sqlite3",
-        authority_lock=root / "authority.lock",
     )

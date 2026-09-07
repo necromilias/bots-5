@@ -148,7 +148,6 @@ def validate_request_snapshot(
     if snapshot.get("snapshot_version") == 2:
         try:
             from .phase5_validation import validate_phase5_snapshot
-
             return validate_phase5_snapshot(
                 request_snapshot,
                 attempt_id=attempt_id,
@@ -160,7 +159,22 @@ def validate_request_snapshot(
                 user_message_content=user_message_content,
             )
         except ValueError as exc:
-            raise error_type(str(exc)) from None
+            raise error_type(str(exc)) from exc
+    if snapshot.get("snapshot_version") == 3:
+        try:
+            from .phase6_validation import validate_phase6_snapshot
+            return validate_phase6_snapshot(
+                request_snapshot,
+                attempt_id=attempt_id,
+                chat_id=chat_id,
+                user_message_id=user_message_id,
+                backend_id=backend_id,
+                model=model,
+                provider_id=provider_id,
+                user_message_content=user_message_content,
+            )
+        except ValueError as exc:
+            raise error_type(str(exc)) from exc
 
     expected = {
         "attempt_id": attempt_id,

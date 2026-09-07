@@ -7,6 +7,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     MetaData,
     String,
     Table,
@@ -260,6 +261,73 @@ chat_model_generation_config = Table(
     Column("revision", Integer, nullable=False),
     Column("updated_at", String(40), nullable=False),
 )
+
+# Phase 6: durable content-addressed attachment identity and frozen context
+# evidence.  These tables are additive; Phase 1-5 rows remain readable.
+attachment_blobs = Table(
+    "attachment_blobs",
+    metadata,
+    Column("digest", LargeBinary(32), primary_key=True),
+    Column("byte_size", Integer, nullable=False),
+    Column("state", String(16), nullable=False),
+    Column("operation_id", String(36)),
+    Column("stage_name", String(36)),
+    Column("gc_id", String(64)),
+    Column("created_at", String(40), nullable=False),
+)
+
+attachments = Table(
+    "attachments",
+    metadata,
+    Column("id", String(64), primary_key=True),
+    Column("blob_digest", LargeBinary(32), ForeignKey("attachment_blobs.digest", ondelete="RESTRICT"), nullable=False),
+    Column("filename", Text, nullable=False),
+    Column("source_kind", String(32), nullable=False),
+    Column("source_name", Text, nullable=False),
+    Column("text_representation_id", LargeBinary(32)),
+    Column("text_digest", LargeBinary(32)),
+    Column("ineligibility_reason", String(64)),
+    Column("created_at", String(40), nullable=False),
+)
+
+message_attachments = Table(
+    "message_attachments",
+    metadata,
+    Column("message_id", String(64), ForeignKey("messages.id", ondelete="RESTRICT"), primary_key=True),
+    Column("attachment_id", String(64), ForeignKey("attachments.id", ondelete="RESTRICT"), primary_key=True),
+    Column("ordinal", Integer, nullable=False),
+)
+
+attempt_attachments = Table(
+    "attempt_attachments",
+    metadata,
+    Column("attempt_id", String(64), ForeignKey("generation_attempts.id", ondelete="RESTRICT"), primary_key=True),
+    Column("attachment_id", String(64), ForeignKey("attachments.id", ondelete="RESTRICT"), primary_key=True),
+    Column("ordinal", Integer, nullable=False),
+)
+
+context_plans = Table(
+    "context_plans",
+    metadata,
+    Column("attempt_id", String(64), ForeignKey("generation_attempts.id", ondelete="RESTRICT"), primary_key=True),
+    Column("plan_version", Integer, nullable=False),
+    Column("canonical_representation", Text, nullable=False),
+    Column("canonical_digest", String(64), nullable=False),
+    Column("wire_representation_digest", String(64), nullable=False),
+    Column("budget_limit", Integer, nullable=False),
+    Column("budget_provenance", Text, nullable=False),
+    Column("budget_semantics", Text, nullable=False),
+    Column("adapter_id", Text, nullable=False),
+    Column("adapter_version", Text, nullable=False),
+    Column("input_counts", Text, nullable=False),
+    Column("envelope_overhead", Integer, nullable=False),
+    Column("output_reserve", Integer, nullable=False),
+    Column("input_units", Integer, nullable=False),
+    Column("total_units", Integer, nullable=False),
+    Column("headroom", Integer, nullable=False),
+    Column("created_at", String(40), nullable=False),
+)
+
 
 chat_model_selection = Table(
     "chat_model_selection",

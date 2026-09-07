@@ -40,6 +40,7 @@ from .generation import (
     GenerationMetadata,
     GenerationRequest,
 )
+from .context import ContextBuilder, ContextPlan, ContextSource
 from .ports import AppStateStore
 from .provider_configuration import ProviderConfiguration
 from .secrets import SecretStoreError, reject_secret_material, sanitize_secret_error
@@ -54,6 +55,7 @@ _FAKE_TRUSTED_CAPABILITIES = (
     (CapabilityKey.STREAMING.value, None),
     (CapabilityKey.TEMPERATURE.value, None),
     (CapabilityKey.MAX_OUTPUT_TOKENS.value, 16384),
+    (CapabilityKey.CONTEXT_TOKENS.value, 32768),
     (CapabilityKey.REASONING_NONE.value, None),
     (CapabilityKey.REQUEST_ID.value, None),
     (CapabilityKey.RETURNED_MODEL.value, None),
@@ -166,6 +168,7 @@ class BotsApplication:
         self._generation_tasks: dict[str, asyncio.Task[None]] = {}
         self._generation_terminal_events: dict[str, asyncio.Event] = {}
         self._cancel_requested: set[str] = set()
+        self._pending_attachment_ids: dict[str, tuple[str, ...]] = {}
         self._active_commands = 0
         self._commands_idle = asyncio.Event()
         self._commands_idle.set()
@@ -347,12 +350,216 @@ class BotsApplication:
             raise StateError(f"chat not found: {chat_id}")
         return self._store.list_generation_attempts(chat_id)
 
+    @_tracked_command
+    async def attach_file(self, source, *, filename: str | None = None):
+        """Capture a user file through the core-owned attachment boundary."""
+        self._ensure_open()
+        attachment = self._store.ingest_attachment(source, filename=filename)
+        await self._events.publish(
+            "attachment_created",
+            attachment_id=attachment.id,
+            blob_digest=attachment.blob_digest,
+            text_eligible=attachment.text_representation_id is not None,
+        )
+        return attachment
+
+    @_tracked_command
+    async def stage_attachment(self, chat_id: str, attachment_id: str) -> tuple[str, ...]:
+        self._ensure_open()
+        if self._store.get_chat(chat_id) is None:
+            raise StateError(f"chat not found: {chat_id}")
+        if self._store.get_attachment(attachment_id) is None:
+            raise StateError(f"attachment not found: {attachment_id}")
+        current = list(self._pending_attachment_ids.get(chat_id, ()))
+        if attachment_id not in current:
+            current.append(attachment_id)
+        self._pending_attachment_ids[chat_id] = tuple(current)
+        await self._events.publish(
+            "pending_attachments_changed",
+            chat_id=chat_id,
+            attachment_ids=tuple(current),
+        )
+        return tuple(current)
+
+    @_tracked_command
+    async def unstage_attachment(self, chat_id: str, attachment_id: str) -> tuple[str, ...]:
+        self._ensure_open()
+        current = tuple(item for item in self._pending_attachment_ids.get(chat_id, ()) if item != attachment_id)
+        if current:
+            self._pending_attachment_ids[chat_id] = current
+        else:
+            self._pending_attachment_ids.pop(chat_id, None)
+        await self._events.publish(
+            "pending_attachments_changed",
+            chat_id=chat_id,
+            attachment_ids=current,
+        )
+        return current
+
+    @_tracked_command
+    async def pending_attachments(self, chat_id: str):
+        self._ensure_open()
+        return tuple(
+            attachment
+            for attachment_id in self._pending_attachment_ids.get(chat_id, ())
+            if (attachment := self._store.get_attachment(attachment_id)) is not None
+        )
+
+    @_tracked_command
+    async def remove_attachment(self, attachment_id: str) -> None:
+        self._ensure_open()
+        self._store.delete_attachment(attachment_id)
+        await self._events.publish("attachment_removed", attachment_id=attachment_id)
+
+    @_tracked_command
+    async def build_context_plan(
+        self,
+        chat_id: str,
+        *,
+        parent_message_id: str | None,
+        current_user: ContextSource,
+        builder: ContextBuilder,
+        context_window: int,
+        context_window_provenance: str,
+        output_reserve: int,
+        selected_attachments: tuple[ContextSource, ...] = (),
+        bots_required_instructions: tuple[ContextSource, ...] = (),
+        envelope: dict[str, object] | None = None,
+    ) -> ContextPlan:
+        """Build from an explicit parent rather than the mutable chat head."""
+        self._ensure_open()
+        chat = self._store.get_chat(chat_id)
+        if chat is None:
+            raise StateError(f"chat not found: {chat_id}")
+        history: list[Message] = []
+        cursor = parent_message_id
+        visited: set[str] = set()
+        while cursor is not None:
+            if cursor in visited:
+                raise StateError("message lineage contains a cycle")
+            visited.add(cursor)
+            message = self._store.get_message(cursor)
+            if message is None or message.chat_id != chat_id:
+                raise StateError("context parent is not in the requested chat")
+            history.append(message)
+            cursor = message.parent_id
+        history.reverse()
+        turns: list[tuple[ContextSource, ...]] = []
+        pending: Message | None = None
+        for message in history:
+            if message.role is MessageRole.USER:
+                pending = message
+                continue
+            if (
+                pending is not None
+                and message.role is MessageRole.ASSISTANT
+                and message.parent_id == pending.id
+            ):
+                turns.append(
+                    (
+                        ContextSource(pending.id, "history", "user", pending.content, pending.state.value),
+                        ContextSource(message.id, "history", "assistant", message.content, message.state.value),
+                    )
+                )
+                pending = None
+        return builder.build(
+            current_user=current_user,
+            historical_turns=tuple(turns),
+            selected_attachments=selected_attachments,
+            bots_required_instructions=bots_required_instructions,
+            envelope=envelope,
+            context_window=context_window,
+            context_window_provenance=context_window_provenance,
+            output_reserve=output_reserve,
+            parent_id=parent_message_id,
+        )
+
     def _active_branch_contains(self, chat_id: str, message_id: str) -> Message:
         branch = self._store.list_branch_messages(chat_id)
         for message in branch:
             if message.id == message_id:
                 return message
         raise StateError(f"message is not on the active branch: {message_id}")
+
+    def _context_history(self, chat_id: str, parent_id: str | None) -> tuple[tuple[ContextSource, ...], ...]:
+        """Return explicit-parent active-lineage turns, never row-order history."""
+        chain: list[Message] = []
+        cursor = parent_id
+        visited: set[str] = set()
+        while cursor is not None:
+            if cursor in visited:
+                raise StateError("message lineage contains a cycle")
+            visited.add(cursor)
+            message = self._store.get_message(cursor)
+            if message is None or message.chat_id != chat_id:
+                raise StateError("context parent is not in the requested chat")
+            chain.append(message)
+            cursor = message.parent_id
+        chain.reverse()
+        turns: list[tuple[ContextSource, ...]] = []
+        pending: Message | None = None
+        for message in chain:
+            if message.role is MessageRole.USER:
+                pending = message
+                continue
+            if pending is None or message.role is not MessageRole.ASSISTANT or message.parent_id != pending.id:
+                continue
+            if message.state is MessageState.FAILED and not message.content:
+                pending = None
+                continue
+            turns.append(
+                (
+                    ContextSource(
+                        source_id=pending.id,
+                        kind="history",
+                        role="user",
+                        content=pending.content,
+                        state=pending.state.value,
+                    ),
+                    ContextSource(
+                        source_id=message.id,
+                        kind="history",
+                        role="assistant",
+                        content=message.content,
+                        state=message.state.value,
+                    ),
+                )
+            )
+            pending = None
+        return tuple(turns)
+
+    def _selected_attachment_sources(self, chat_id: str) -> tuple[ContextSource, ...]:
+        sources: list[ContextSource] = []
+        for attachment_id in self._pending_attachment_ids.get(chat_id, ()):
+            attachment = self._store.get_attachment(attachment_id)
+            if attachment is None:
+                raise StateError(f"selected attachment is missing: {attachment_id}")
+            eligible = attachment.text_representation_id is not None
+            if not eligible:
+                raise StateError(
+                    f"selected attachment is ineligible ({attachment.ineligibility_reason or 'not_text'}): {attachment_id}"
+                )
+            text = ""
+            if eligible:
+                try:
+                    text = self._store.read_attachment_bytes(attachment.id).decode("utf-8", errors="strict")
+                except (UnicodeDecodeError, StateError) as exc:
+                    raise StateError(f"selected attachment is not valid UTF-8: {attachment.id}") from exc
+            sources.append(
+                ContextSource(
+                    source_id=attachment.id,
+                    kind="attachment",
+                    role="user",
+                    content=text,
+                    state="complete",
+                    eligible=True,
+                    selected=True,
+                    reason=("selected" if eligible else (attachment.ineligibility_reason or "not_text")),
+                    representation_id=attachment.text_representation_id,
+                    representation_digest=attachment.text_digest,
+                )
+            )
+        return tuple(sources)
 
     def _request_and_attempt(
         self,
@@ -362,14 +569,34 @@ class BotsApplication:
         assistant_message: Message,
         attempt_id: str,
         now,
-    ) -> tuple[GenerationRequest, GenerationAttempt]:
+    ) -> tuple[GenerationRequest, GenerationAttempt, ContextPlan | None]:
+        context_plan: ContextPlan | None = None
+        if self._configuration is not None:
+            context_history = self._context_history(chat_id, user_message.parent_id)
+            selected_attachments = self._selected_attachment_sources(chat_id)
+            # ProviderConfiguration owns the frozen model/capability lookup and
+            # exact Phase 6 adapter; this call cannot be bypassed by UI state.
+            # The current desktop schema has one normal send contract: v3
+            # planning is attempted for every configured-model send.  The
+            # explicit phase6_enabled=False test/legacy mode is the only
+            # compatibility escape hatch for pre-Phase-6 callers.
+            phase6 = self._configuration.phase6_enabled
+        else:
+            context_history = ()
+            selected_attachments = ()
+            phase6 = False
         if self._configuration is not None:
             prepared, snapshot = self._configuration.prepare_generation(
                 chat_id=chat_id,
                 user_message_id=user_message.id,
                 prompt=user_message.content,
                 attempt_id=attempt_id,
+                context_history=context_history,
+                selected_attachments=selected_attachments,
+                parent_id=user_message.parent_id,
+                phase6=phase6,
             )
+            context_plan = prepared.context_plan
             request = prepared.request
             attempt = GenerationAttempt(
                 id=attempt_id,
@@ -386,7 +613,7 @@ class BotsApplication:
                 connection_id=prepared.attempt_connection_id,
                 model_entry_id=prepared.model_entry_id,
             )
-            return request, attempt
+            return request, attempt, context_plan
 
         request = GenerationRequest(
             attempt_id=attempt_id,
@@ -414,7 +641,7 @@ class BotsApplication:
             provider_id=self._provider_id,
             remote_outcome_unknown=False,
         )
-        return request, attempt
+        return request, attempt, None
 
     @_tracked_command
     async def list_provider_connections(self):
@@ -969,7 +1196,7 @@ class BotsApplication:
             sequence=user_message.sequence + 1,
             now=now,
         )
-        request, attempt = self._request_and_attempt(
+        request, attempt, context_plan = self._request_and_attempt(
             chat_id=chat_id,
             user_message=user_message,
             assistant_message=assistant_message,
@@ -987,7 +1214,10 @@ class BotsApplication:
             assistant_message,
             attempt,
             expected_chat_revision=chat.revision,
+            context_plan=context_plan,
+            attachment_ids=self._pending_attachment_ids.get(chat_id, ()),
         )
+        self._pending_attachment_ids.pop(chat_id, None)
         self._track_generation(assistant_message, attempt)
         await self._events.publish(
             "message_sent",
@@ -1042,7 +1272,7 @@ class BotsApplication:
             sequence=user_message.sequence + 1,
             now=now,
         )
-        request, attempt = self._request_and_attempt(
+        request, attempt, context_plan = self._request_and_attempt(
             chat_id=chat_id,
             user_message=user_message,
             assistant_message=assistant_message,
@@ -1061,7 +1291,10 @@ class BotsApplication:
             assistant_message,
             attempt,
             expected_chat_revision=chat.revision,
+            context_plan=context_plan,
+            attachment_ids=self._pending_attachment_ids.get(chat_id, ()),
         )
+        self._pending_attachment_ids.pop(chat_id, None)
         self._track_generation(assistant_message, attempt)
         await self._events.publish(
             "message_revision_created",
@@ -1107,6 +1340,10 @@ class BotsApplication:
         user_message = self._store.get_message(target.parent_id)
         if user_message is None or user_message.role != MessageRole.USER:
             raise StateError("assistant message has an invalid user parent")
+        if chat_id not in self._pending_attachment_ids:
+            self._pending_attachment_ids[chat_id] = tuple(
+                attachment.id for attachment in self._store.list_message_attachments(user_message.id)
+            )
         lineage_id = target.lineage_id or target.id
         revision = len(self._store.list_revisions(chat_id, lineage_id)) + 1
         now = self._clock.now()
@@ -1119,7 +1356,7 @@ class BotsApplication:
             revision=revision,
             supersedes_id=target.id,
         )
-        request, attempt = self._request_and_attempt(
+        request, attempt, context_plan = self._request_and_attempt(
             chat_id=chat_id,
             user_message=user_message,
             assistant_message=assistant_message,
@@ -1137,7 +1374,10 @@ class BotsApplication:
             assistant_message,
             attempt,
             expected_chat_revision=chat.revision,
+            context_plan=context_plan,
+            attachment_ids=self._pending_attachment_ids.get(chat_id, ()),
         )
+        self._pending_attachment_ids.pop(chat_id, None)
         self._track_generation(assistant_message, attempt)
         await self._events.publish(
             "message_revision_created",
@@ -1198,10 +1438,14 @@ class BotsApplication:
                         break
                 else:
                     remaining = deadline - asyncio.get_running_loop().time()
-                    if remaining <= 0:
-                        raise GenerationTimeout
                     next_event = asyncio.create_task(iterator.__anext__())
-                    deadline_wait = asyncio.create_task(asyncio.sleep(remaining))
+                    # Always give an already-available backend event one event
+                    # loop turn.  Durable local persistence can consume the
+                    # remaining wall-clock budget, but must not discard output
+                    # the backend had already produced before the deadline.
+                    deadline_wait = asyncio.create_task(
+                        asyncio.sleep(max(0.0, remaining))
+                    )
                     try:
                         done, _ = await asyncio.wait(
                             (next_event, deadline_wait),

@@ -16,7 +16,6 @@ from bots5.infrastructure.authority_lock import AuthorityLock
 from bots5.infrastructure.generation.fake import FakeStreamingBackend
 from bots5.infrastructure.generation.openai_compatible import OpenAICompatibleStreamingBackend
 from bots5.infrastructure.generation.router import BuiltinProviderRouter
-from bots5.infrastructure.persistence import SQLiteAppStateStore, upgrade_database
 from bots5.infrastructure.secrets import secret_store_for
 from bots5.providers.openai_compatible import OpenAICompatibleProvider
 from bots5.providers.base import ReasoningEffort
@@ -87,11 +86,10 @@ def build_runtime(
     reasoning_effort: ReasoningEffort | None = None,
 ) -> DesktopRuntime:
     paths = resolve_app_paths(data_root)
-    paths.ensure()
-    authority = AuthorityLock(paths.authority_lock).acquire()
+    authority = AuthorityLock(paths.data_root).acquire()
     try:
-        upgrade_database(paths.database)
-        store = SQLiteAppStateStore.open(paths.database)
+        paths.ensure_non_authoritative()
+        store = authority.open_store()
         clock = SystemClock()
         ids = Uuid7Factory()
         events = EventBus(clock, ids)

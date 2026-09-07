@@ -14,7 +14,7 @@ from bots5.domain.clock import SystemClock
 from bots5.domain.ids import Uuid7Factory
 from bots5.infrastructure.generation.fake import FakeStreamingBackend
 from bots5.infrastructure.generation.openai_compatible import OpenAICompatibleStreamingBackend
-from bots5.infrastructure.persistence import SQLiteAppStateStore, upgrade_database
+from tests._authority_test_support import SQLiteAppStateStore, upgrade_database
 from bots5.desktop.window import MainWindow
 from bots5.domain.models import MessageRole
 from bots5.bootstrap.desktop import _parser

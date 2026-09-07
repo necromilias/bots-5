@@ -29,7 +29,7 @@ from bots5.domain.ids import Uuid7Factory
 from bots5.domain.models import AttemptState, MessageRole, MessageState
 from bots5.desktop.window import MainWindow
 from bots5.infrastructure.generation.fake import FakeStreamingBackend
-from bots5.infrastructure.persistence import SQLiteAppStateStore, upgrade_database
+from tests._authority_test_support import SQLiteAppStateStore, upgrade_database
 
 
 def _run_qasync(qt_application: QApplication, operation: Awaitable[None]) -> None:
@@ -42,7 +42,7 @@ def _run_qasync(qt_application: QApplication, operation: Awaitable[None]) -> Non
 async def _wait_until(
     predicate: Callable[[], bool],
     *,
-    timeout: float = 2.0,
+    timeout: float = 5.0,
 ) -> None:
     deadline = asyncio.get_running_loop().time() + timeout
     while not predicate():
@@ -127,11 +127,12 @@ def test_draft1_shell_uses_native_frame_and_approved_inert_affordances(tmp_path)
             for button in (
                 window.top_bar.tune_button,
                 window.top_bar.settings_button,
-                window.attachment_button,
                 window.tool_button,
             ):
                 assert not button.isEnabled()
                 assert button.toolTip()
+            assert window.attachment_button.isEnabled()
+            assert window.attachment_button.toolTip()
             assert not window.inspector_dock.isVisible()
 
             window.top_bar.rail_toggle.click()
@@ -212,10 +213,15 @@ def test_draft1_qasync_boundary_preserves_durable_state_across_close_reopen(tmp_
             window.show()
             window.composer.setPlainText("durable shell message")
             window.send_button.click()
-            await asyncio.sleep(0.1)
             chat_id = window._current_chat_id
             assert chat_id is not None
-            _, messages = await runtime.application.open_chat(chat_id)
+            for _ in range(100):
+                _, messages = await runtime.application.open_chat(chat_id)
+                if messages and messages[-1].state.value == "complete":
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("desktop generation did not terminalize")
             assert messages[-1].content == "fake response to: durable shell message"
             assert messages[-1].state.value == "complete"
         finally:

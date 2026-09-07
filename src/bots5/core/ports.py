@@ -2,10 +2,22 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from bots5.domain.models import Chat, GenerationAttempt, Message, WorkspaceWindowState
+from bots5.domain.models import Attachment, Chat, GenerationAttempt, Message, WorkspaceWindowState
 
 
 class AppStateStore(Protocol):
+    def ingest_attachment(self, source, *, filename: str | None = None) -> Attachment:
+        ...
+
+    def get_attachment(self, attachment_id: str) -> Attachment | None:
+        ...
+
+    def list_attachments(self) -> tuple[Attachment, ...]:
+        ...
+
+    def delete_attachment(self, attachment_id: str) -> None:
+        ...
+
     def create_chat(self, chat: Chat) -> None:
         ...
 

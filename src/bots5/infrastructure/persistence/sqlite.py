@@ -1,22 +1,25 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sqlite3
-import tempfile
 
 from dataclasses import replace
 from decimal import Decimal, InvalidOperation
-from functools import cache
-from pathlib import Path
+from datetime import UTC, datetime
 
 from sqlalchemy import Engine, create_engine, delete, event, func, insert, select, text, update
+from sqlalchemy.pool import NullPool
+from sqlalchemy.exc import IntegrityError
 from uuid6 import uuid7
 
 from bots5.core.errors import RevisionConflict, StateError
 from bots5.domain.clock import parse_utc, utc_iso
 from bots5.domain.models import (
     AttemptState,
+    Attachment,
+    AttachmentBlob,
     Chat,
     GenerationAttempt,
     Message,
@@ -49,6 +52,11 @@ from .schema import (
     model_generation_config,
     provider_connections,
     workspace_windows,
+    attachment_blobs,
+    attachments,
+    message_attachments,
+    attempt_attachments,
+    context_plans,
 )
 from .phase3_validation import (
     PHASE3_BACKEND_ID,
@@ -59,7 +67,13 @@ from .phase3_validation import (
 )
 from .transition_guard import (
     arm_transition,
+    arm_phase6_attachment_delete,
+    arm_phase6_attachment_insert,
+    arm_phase6_blob_delete,
+    arm_phase6_blob_transition,
     clear_transition,
+    clear_phase6,
+    require_phase6_consumed,
     install_transition_guard,
 )
 from .phase5_store import (
@@ -70,6 +84,22 @@ from .phase5_store import (
     _model,
     _settings,
 )
+from .phase6_schema import validate_phase6_schema
+from bots5.infrastructure.attachments import (
+    AttachmentIntegrityError,
+    _open_attachment_fs,
+    digest_to_text,
+)
+
+
+_TEST_FAULT_HOOK = None
+
+
+def _fault(point: str) -> None:
+    hook = _TEST_FAULT_HOOK
+    if hook is not None:
+        hook(point)
+from bots5.infrastructure.data_root_authority import DataRootAuthority
 
 
 _MESSAGE_STATES = {state.value for state in MessageState}
@@ -472,28 +502,52 @@ def _check_expression(table_sql: str, constraint: str) -> str | None:
     return None
 
 
-@cache
-def _canonical_phase5_schema_sql() -> dict[str, str]:
-    """Build the migration-owned Phase 5 DDL used for stamped-schema checks."""
-    from alembic import command
-    from alembic.config import Config
-
-    with tempfile.TemporaryDirectory(prefix="bots5-phase5-schema-") as directory:
-        database = Path(directory) / "schema.sqlite3"
-        config = Config()
-        config.set_main_option(
-            "script_location",
-            str(Path(__file__).with_name("migrations")),
-        )
-        config.set_main_option("sqlalchemy.url", f"sqlite:///{database}")
-        command.upgrade(config, "0008_catalogue_refresh_outcomes")
-        with sqlite3.connect(database) as reference:
-            rows = reference.execute(
-                "SELECT name, sql FROM sqlite_master "
-                "WHERE name IN ({})".format(",".join("?" for _ in _PHASE5_SCHEMA_OBJECTS)),
-                _PHASE5_SCHEMA_OBJECTS,
-            ).fetchall()
-    return {str(name): _normalise_sql_fragment(str(sql or "")) for name, sql in rows}
+_PHASE5_SCHEMA_SHA256 = {
+    "application_generation_config": "24838857aacc21317eac1aa863996d839ed04553cefe0ad17f44523218f60cc7",
+    "capability_facts": "affb4a3d9ebd17196e6f44692c82b7d6acdfb98398b5139e0bf2b1df23728fe6",
+    "capability_observations": "85f8037280af9a0e4a113aecd85c6c29e6bd4bce0ea50d3afa2fdc4b90dd4b0b",
+    "capability_overrides": "e4e0c27cf04cd8a39ff1393447ac06657fec7392c30e5e69deaca896b0017ca9",
+    "catalogue_refresh_state": "01030b9386e41d2d7d5e4cc40b942e0ed974eb5696f6c2947376df00d1559f7a",
+    "chat_model_selection": "88e16544fdea1ca4b7986ee9566c94891969fbaf0ab37fe005add2ff4a3f978e",
+    "generation_attempt_phase5_completion_insert": "62784f9198898e5e7015711ab00ae25bef35879e66ec3d941c13f7f112b37ff3",
+    "generation_attempt_phase5_completion_update": "d849c6547dd03cd993c83e66ac5cf2bc8799f988b88110032af63172c751828a",
+    "model_catalogue_entries": "96b801e2b96fb5c6905364b81533039943a4a3ae51e4be68a6b32f77b639d7e8",
+    "phase5_application_default_model_validate_insert": "207c3c2daaae4579e7844a95e4d193703ff52477d05782a62e0c9a92f98ca9bb",
+    "phase5_application_default_model_validate_update": "03acd7e8fe3ff5ccd4cfac5595c46650bc1418a224bfa051b58aee9fbf641270",
+    "phase5_application_settings_validate_insert": "d45b517f05c6183044b9049c1ae2867c9d1d62a20706672d6270b6a57a60a333",
+    "phase5_application_settings_validate_update": "2f04af0ee5d4b5babbfe51c4d1ac8f6f678d7947541fa5d6d84735b68710e199",
+    "phase5_attempt_attribution_insert": "7c8c694d796a7e239c2afeae5cd4fcf8bbf01c314ffd8d4eea84afcc576476b6",
+    "phase5_attempt_attribution_update": "5ea29ad477a2081800047acbb1e1ea322696884cd0780113d5c06f2f4d9a6f4b",
+    "phase5_capability_fact_identity_insert": "21315d4401a57ed45a28d8ddc8a45630ea892c7f9a9c890ebd039d1b63361d12",
+    "phase5_capability_fact_identity_update": "772df4718eb7099e0581a3a647cd8151e9050bbb8f4ae071a9dbc699600e84b4",
+    "phase5_capability_fact_provenance_validate_insert": "86502b0c61f5294c73127de6b33adc546c3353f0d56a87ba3a3b4fd97f9cff65",
+    "phase5_capability_fact_provenance_validate_update": "983ea07f11c1711bc86c827554ff873ae298e386790ac43070c149f4f7d1a532",
+    "phase5_capability_fact_truth_validate_insert": "330a734e65207119ceddc23e7824134a7ce66ed4aeb4aec9dda787cfd44e0fed",
+    "phase5_capability_fact_truth_validate_update": "21e3223add32399c4b72706f227bf422857079263d55100006c1516beedc114d",
+    "phase5_capability_observation_truth_validate_insert": "146b616421603ec063f1918bec89805635bd1a9170da4248b05faa82ad696f35",
+    "phase5_capability_observation_truth_validate_update": "0a297ac6878d55a493d97a44e7e297ee0503cb1b526110bfb4ae4aea71eef58d",
+    "phase5_capability_override_truth_validate_insert": "6f3ca3581a56fdb04bb4efe40646dec8c43108fa33ef2b196c58f1ce8dd42ad4",
+    "phase5_capability_override_truth_validate_update": "757911b86803cab2bc8e4070c00cbbeda0a6451ef4f183942da1ad584e26e1a3",
+    "phase5_catalogue_refresh_revision_guard": "2b390f76fbf6742039417c7ed3594ad68703007f0a7a320d68ae68ec3d0f7246",
+    "phase5_catalogue_refresh_state_delete_guard": "5408083076fcd9f5af3c9692213faf4961c9f69e3a3876105a9e25cf82b91295",
+    "phase5_catalogue_refresh_state_insert": "c651dfb53770ff9296eb72f9d0cc3f2b355861644612371c85a331db6a2b2236",
+    "phase5_chat_model_settings_validate_insert": "3519374a89ff5a2972878082c1100ebc28700c73a62b93687ec0a0237d3a9148",
+    "phase5_chat_model_settings_validate_update": "e21dcb1d4f6874f82f7b6ca2dbae7760c855b0c31dfd6013282db795814d558a",
+    "phase5_model_catalogue_delete_referenced": "7ac64a45e6a37191416ef98f719420bc2008c394841229f8b5db1abcc96a4f3d",
+    "phase5_model_catalogue_identity_referenced": "eee48120fe3e5999788eb72e09a1a5b7686bdc4b9efbb59a4fac0a1327e38cad",
+    "phase5_model_catalogue_metadata_validate_insert": "d2e4be011c79316ccc454513ba3ec33dfb9963f3f589d688595570d22622ab7d",
+    "phase5_model_catalogue_metadata_validate_update": "ce11f19de46b477924cda9d2235c1673df56c9620dae28ecf6c7223bf39ffcc7",
+    "phase5_model_settings_validate_insert": "dbddc795705bba4ea94d4eb12389af11f0f358f9169c6d8057b40fd0cd9af710",
+    "phase5_model_settings_validate_update": "22592e9b57cc26092e7039c8aa9592c11ffbb12eecbf9891748be90dc0a35003",
+    "phase5_provider_connection_catalogue_revision_guard": "dbf71eddfb7504e3a06b3573b962a4eed40e16b25685e2d9492405176e2cfe3d",
+    "phase5_provider_connection_delete_referenced": "bcbf4a8a3c22a7da607f64a5b45b5f562ee6f223cd3ac8f02cedf59a35eb2d3b",
+    "phase5_provider_connection_identity_guard": "a65cf2c82a6499bae9fd2a6f227584f533ccba6ac98bdb7db2fae6afe12c74de",
+    "phase5_provider_connection_resurrection_guard": "b52fc7001a849427ad9b68da255fda1554d5116e81e2df8e96ca94ce584fcab7",
+    "phase5_provider_connection_retirement_guard": "ac43d8a74b3d5bcfe744e13b16b9e22ab75f0aef52599969d3ad0b2e57da6529",
+    "phase5_provider_connection_validate_insert": "bba8974c244355c3e1143de4c577f30602a1f94c2a801db8f0c3d86c30fa2ca7",
+    "phase5_provider_connection_validate_update": "7a070de7f673c756ced9e94ba509c727f9bfade1651ca5a719d3fb19081aad56",
+    "provider_connections": "9cf64f0bda172e5def4815b660ee326a207482f1da46b7bb347fc7832f8edd82",
+}
 
 
 def _validate_request_snapshot(
@@ -539,7 +593,11 @@ def _validate_attempt_outcome(
         outcome_error_type=attempt.error_type,
         outcome_error_message=attempt.error_message,
         phase3=phase3,
-        phase5=(_is_persisted_phase5_attempt(attempt) if phase5 is None else phase5),
+        phase5=(
+            (_is_persisted_phase5_attempt(attempt) or _is_persisted_phase6_attempt(attempt))
+            if phase5 is None
+            else phase5
+        ),
         error_type=StateError,
     )
 
@@ -567,20 +625,346 @@ def _is_persisted_phase5_attempt(attempt: GenerationAttempt) -> bool:
     return isinstance(snapshot, dict) and snapshot.get("snapshot_version") == 2
 
 
-def _engine(database: Path) -> Engine:
-    engine = create_engine(f"sqlite:///{database}", future=True)
+def _is_persisted_phase6_attempt(attempt: GenerationAttempt) -> bool:
+    try:
+        snapshot = json.loads(attempt.request_snapshot)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(snapshot, dict) and snapshot.get("snapshot_version") == 3
+
+
+def _validate_phase6_attempt_authority(connection, attempt: GenerationAttempt) -> None:
+    """CAS-check every durable fact used by a frozen v3 plan.
+
+    The request snapshot is built outside the persistence transaction.  A
+    connection/model check alone is insufficient: capability facts, manual
+    overrides, or any settings layer can change between planning and start.
+    Compare their resolved values and revisions while the start CAS is still
+    open so a stale plan rolls back before events or backend dispatch.
+    """
+    try:
+        snapshot = json.loads(attempt.request_snapshot)
+    except (TypeError, ValueError):
+        return
+    if not isinstance(snapshot, dict) or snapshot.get("snapshot_version") != 3:
+        return
+    connection_id = snapshot.get("connection_id")
+    model_entry_id = snapshot.get("model_entry_id")
+    if connection_id != attempt.connection_id or model_entry_id != attempt.model_entry_id:
+        raise StateError("Phase 6 request attribution is inconsistent")
+    row = connection.execute(
+        select(
+            provider_connections.c.id,
+            provider_connections.c.revision,
+            provider_connections.c.catalogue_revision,
+            provider_connections.c.profile,
+            provider_connections.c.endpoint,
+            provider_connections.c.credential_source,
+            provider_connections.c.credential_reference,
+            model_catalogue_entries.c.id.label("model_id"),
+            model_catalogue_entries.c.connection_id.label("model_connection_id"),
+            model_catalogue_entries.c.provider_model_id,
+        )
+        .select_from(
+            provider_connections.join(
+                model_catalogue_entries,
+                model_catalogue_entries.c.connection_id == provider_connections.c.id,
+            )
+        )
+        .where(provider_connections.c.id == connection_id, model_catalogue_entries.c.id == model_entry_id)
+    ).first()
+    if row is None:
+        raise StateError("Phase 6 selected provider/model disappeared before start")
+    mapping = row._mapping
+    expected = {
+        "connection_revision": mapping["revision"],
+        "catalogue_revision": mapping["catalogue_revision"],
+        "provider_profile": mapping["profile"],
+        "endpoint": mapping["endpoint"],
+        "credential_source": mapping["credential_source"],
+        "credential_reference": mapping["credential_reference"],
+        "model": mapping["provider_model_id"],
+    }
+    if any(snapshot.get(key) != value for key, value in expected.items()):
+        raise StateError("Phase 6 provider/model configuration changed before start")
+    selection = connection.execute(
+        select(chat_model_selection.c.model_entry_id, chat_model_selection.c.selection_required)
+        .where(chat_model_selection.c.chat_id == attempt.chat_id)
+    ).first()
+    if selection is None or selection.model_entry_id != model_entry_id or selection.selection_required:
+        raise StateError("Phase 6 chat model selection changed before start")
+
+    # Compare the effective settings plus each contributing layer revision.
+    app_row = connection.execute(
+        select(application_generation_config).where(application_generation_config.c.id == 1)
+    ).first()
+    model_row = connection.execute(
+        select(model_generation_config).where(model_generation_config.c.model_entry_id == model_entry_id)
+    ).first()
+    chat_row = connection.execute(
+        select(chat_model_generation_config).where(
+            chat_model_generation_config.c.chat_id == attempt.chat_id,
+            chat_model_generation_config.c.model_entry_id == model_entry_id,
+        )
+    ).first()
+    if app_row is None:
+        raise StateError("Phase 6 application settings disappeared before start")
+    app = app_row._mapping
+    model_settings = None if model_row is None else model_row._mapping
+    chat_settings = None if chat_row is None else chat_row._mapping
+    defaults = {
+        "temperature": 0.0,
+        "max_output_tokens": 1024,
+        "reasoning_effort": None,
+        "timeout_seconds": None,
+    }
+    effective: dict[str, object] = {}
+    provenance: dict[str, str] = {}
+    for key, default in defaults.items():
+        value = None
+        source = "application"
+        if chat_settings is not None and chat_settings[key] is not None:
+            value = chat_settings[key]
+            source = "chat_model"
+        elif model_settings is not None and model_settings[key] is not None:
+            value = model_settings[key]
+            source = "model"
+        elif app[key] is not None:
+            value = app[key]
+        else:
+            value = default
+        if key in {"temperature", "timeout_seconds"} and value is not None:
+            value = float(value)
+        effective[key] = value
+        provenance[key] = source
+    expected_settings = snapshot.get("effective_settings")
+    expected_provenance = snapshot.get("settings_provenance")
+    if expected_settings != effective or expected_provenance != provenance:
+        raise StateError("Phase 6 generation settings changed before start")
+    expected_revisions = snapshot.get("settings_revisions")
+    actual_revisions = {
+        "application": int(app["revision"]),
+        "model": None if model_settings is None else int(model_settings["revision"]),
+        "chat": None if chat_settings is None else int(chat_settings["revision"]),
+    }
+    if expected_revisions != actual_revisions:
+        raise StateError("Phase 6 generation settings revision changed before start")
+
+    # Resolve the closed capability vocabulary in the same precedence order as
+    # ProviderConfiguration, then compare both truth and provenance.  This
+    # intentionally reads the rows inside the start transaction rather than
+    # trusting an object retained by the caller.
+    precedence = {
+        "manual": 0,
+        "confirmed_endpoint": 1,
+        "provider_metadata": 2,
+        "trusted_registry": 3,
+        "heuristic": 4,
+        "unknown": 5,
+    }
+    catalogue_revision = int(mapping["catalogue_revision"])
+    facts = []
+    for fact_row in connection.execute(
+        select(capability_facts).where(capability_facts.c.model_entry_id == model_entry_id)
+    ).fetchall():
+        fact = fact_row._mapping
+        source = str(fact["source"])
+        if source in {"confirmed_endpoint", "provider_metadata"} and fact["source_revision"] is not None and int(fact["source_revision"]) != catalogue_revision:
+            continue
+        provenance_value = json.loads(fact["provenance_json"] or "{}")
+        facts.append((
+            fact,
+            provenance_value,
+            (
+                precedence[source],
+                0 if fact["source_revision"] is not None else 1,
+                -(int(fact["source_revision"]) if fact["source_revision"] is not None else 0),
+                json.dumps(provenance_value, sort_keys=True, separators=(",", ":")),
+                str(fact["state"]),
+                fact["value"] is None,
+                -1 if fact["value"] is None else int(fact["value"]),
+            ),
+        ))
+    overrides = {
+        str(row._mapping["capability_key"]): row._mapping
+        for row in connection.execute(
+            select(capability_overrides).where(capability_overrides.c.model_entry_id == model_entry_id)
+        ).fetchall()
+    }
+    resolved = []
+    for key in sorted(CAPABILITY_KEYS):
+        override = overrides.get(key)
+        if override is not None:
+            state = str(override["state"])
+            source = "manual"
+            source_revision = int(override["revision"])
+            value = override["value"]
+            provenance_value = {"reason": override["reason"] or "manual override"}
+        else:
+            candidates = [item for item in facts if str(item[0]["capability_key"]) == key]
+            if not candidates:
+                state, source, source_revision, value, provenance_value = "unknown", "unknown", None, None, {}
+            else:
+                fact, provenance_value, _sort_key = min(candidates, key=lambda item: item[2])
+                state = str(fact["state"])
+                source = str(fact["source"])
+                source_revision = None if fact["source_revision"] is None else int(fact["source_revision"])
+                value = fact["value"]
+        resolved.append({
+            "key": key,
+            "state": state,
+            "source": source,
+            "source_revision": source_revision,
+            "value": value,
+        })
+    if snapshot.get("capabilities") != resolved:
+        raise StateError("Phase 6 capability facts changed before start")
+    expected_provenance = snapshot.get("capability_provenance")
+    actual_provenance = {
+        item["key"]: {"source": item["source"], **(
+            ({"reason": overrides[item["key"]]["reason"] or "manual override"}
+             if item["key"] in overrides else next(
+                (candidate[1] for candidate in facts if str(candidate[0]["capability_key"]) == item["key"] and candidate[0]["source"] == item["source"] and candidate[0]["source_revision"] == item["source_revision"]),
+                {},
+            ))
+        )}
+        for item in resolved
+    }
+    if expected_provenance != actual_provenance:
+        raise StateError("Phase 6 capability provenance changed before start")
+    expected_overrides = snapshot.get("manual_overrides")
+    actual_overrides = {
+        key: {
+            "state": str(value["state"]),
+            "value": value["value"],
+            "revision": int(value["revision"]),
+        }
+        for key, value in overrides.items()
+    }
+    if expected_overrides != actual_overrides:
+        raise StateError("Phase 6 capability overrides changed before start")
+
+
+def _engine(authority: DataRootAuthority) -> Engine:
+    authority.assert_live()
+    vfs = authority._open_rooted_vfs()
+    engine = create_engine(
+        "sqlite://",
+        creator=vfs.connect,
+        poolclass=NullPool,
+        future=True,
+    )
 
     @event.listens_for(engine, "connect")
     def _configure_sqlite(dbapi_connection, connection_record):
+        dbapi_connection.enable_load_extension(False)
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA journal_mode=DELETE")
+        cursor.execute("PRAGMA synchronous=FULL")
+        cursor.execute("PRAGMA temp_store=MEMORY")
         cursor.execute("PRAGMA busy_timeout=5000")
         cursor.close()
         install_transition_guard(dbapi_connection, connection_record)
+        dbapi_connection.set_authorizer(_authorise_application_sql)
+
+    @event.listens_for(engine, "checkout")
+    def _admit_connection(dbapi_connection, connection_record, connection_proxy):
+        del dbapi_connection, connection_record, connection_proxy
+        authority._connection_checkout()
+
+    @event.listens_for(engine, "checkin")
+    def _release_connection(dbapi_connection, connection_record):
+        del dbapi_connection, connection_record
+        authority._connection_checkin()
 
     return engine
+
+
+_SCHEMA_AUTHOR_ACTIONS = frozenset(
+    value
+    for value in (
+        getattr(sqlite3, "SQLITE_CREATE_INDEX", None),
+        getattr(sqlite3, "SQLITE_CREATE_TABLE", None),
+        getattr(sqlite3, "SQLITE_CREATE_TEMP_INDEX", None),
+        getattr(sqlite3, "SQLITE_CREATE_TEMP_TABLE", None),
+        getattr(sqlite3, "SQLITE_CREATE_TEMP_TRIGGER", None),
+        getattr(sqlite3, "SQLITE_CREATE_TEMP_VIEW", None),
+        getattr(sqlite3, "SQLITE_CREATE_TRIGGER", None),
+        getattr(sqlite3, "SQLITE_CREATE_VIEW", None),
+        getattr(sqlite3, "SQLITE_DROP_INDEX", None),
+        getattr(sqlite3, "SQLITE_DROP_TABLE", None),
+        getattr(sqlite3, "SQLITE_DROP_TEMP_INDEX", None),
+        getattr(sqlite3, "SQLITE_DROP_TEMP_TABLE", None),
+        getattr(sqlite3, "SQLITE_DROP_TEMP_TRIGGER", None),
+        getattr(sqlite3, "SQLITE_DROP_TEMP_VIEW", None),
+        getattr(sqlite3, "SQLITE_DROP_TRIGGER", None),
+        getattr(sqlite3, "SQLITE_DROP_VIEW", None),
+        getattr(sqlite3, "SQLITE_ALTER_TABLE", None),
+        getattr(sqlite3, "SQLITE_REINDEX", None),
+        getattr(sqlite3, "SQLITE_ANALYZE", None),
+        getattr(sqlite3, "SQLITE_ATTACH", None),
+        getattr(sqlite3, "SQLITE_DETACH", None),
+    )
+    if value is not None
+)
+_MUTATING_PRAGMAS = frozenset(
+    {
+        "foreign_keys",
+        "journal_mode",
+        "legacy_alter_table",
+        "locking_mode",
+        "query_only",
+        "synchronous",
+        "temp_store",
+        "temp_store_directory",
+        "trusted_schema",
+        "wal_autocheckpoint",
+        "writable_schema",
+    }
+)
+
+
+def _authorise_application_sql(
+    action: int,
+    arg1: str | None,
+    arg2: str | None,
+    database_name: str | None,
+    trigger_name: str | None,
+) -> int:
+    del database_name, trigger_name
+    if action in _SCHEMA_AUTHOR_ACTIONS:
+        return sqlite3.SQLITE_DENY
+    if action == sqlite3.SQLITE_PRAGMA:
+        pragma = "" if arg1 is None else arg1.casefold()
+        if pragma in _MUTATING_PRAGMAS and arg2 is not None:
+            return sqlite3.SQLITE_DENY
+    if (
+        action == sqlite3.SQLITE_FUNCTION
+        and (arg2 or arg1 or "").casefold() == "load_extension"
+    ):
+        return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+
+
+def _validate_open_connection(
+    connection, *, expected_revision: str, destructive_phase6: bool = True
+) -> None:
+    """Validate the exact authoritative schema and destructive guard behavior."""
+    integrity = __import__(
+        "bots5.infrastructure.persistence.migrations.versions.0003_integrity_boundaries",
+        fromlist=["_validate_existing_state"],
+    )
+    integrity._validate_existing_state(connection)
+    revision = connection.exec_driver_sql(
+        "SELECT version_num FROM alembic_version"
+    ).scalar_one_or_none()
+    if revision != expected_revision:
+        raise RuntimeError("current database revision is not authoritative")
+    _validate_phase4_schema(connection)
+    _validate_phase5_schema(connection)
+    _validate_phase5_trigger_behavior(connection)
+    validate_phase6_schema(connection, destructive=destructive_phase6)
 
 
 def _chat(row) -> Chat:
@@ -712,6 +1096,37 @@ def _workspace_window(row) -> WorkspaceWindowState:
         raise StateError("workspace window state is malformed") from exc
 
 
+def _attachment(row) -> Attachment:
+    mapping = row._mapping
+    try:
+        value = Attachment(
+            id=mapping["id"],
+            blob_digest=digest_to_text(mapping["blob_digest"]),
+            filename=mapping["filename"],
+            source_kind=mapping["source_kind"],
+            source_name=mapping["source_name"],
+            text_representation_id=(
+                None
+                if mapping["text_representation_id"] is None
+                else digest_to_text(mapping["text_representation_id"])
+            ),
+            text_digest=(
+                None
+                if mapping["text_digest"] is None
+                else digest_to_text(mapping["text_digest"])
+            ),
+            ineligibility_reason=mapping["ineligibility_reason"],
+            created_at=parse_utc(mapping["created_at"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise StateError("attachment record is malformed") from exc
+    if len(value.blob_digest) != 64 or len(value.filename) > 255:
+        raise StateError("attachment record is malformed")
+    if value.text_representation_id is not None and value.text_digest is None:
+        raise StateError("attachment text representation is malformed")
+    return value
+
+
 def _validate_phase4_schema(connection) -> None:
     table_exists = connection.exec_driver_sql(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'workspace_windows'"
@@ -804,9 +1219,10 @@ def _validate_phase4_schema(connection) -> None:
 
 
 def _validate_phase5_schema(connection) -> None:
-    canonical_schema = _canonical_phase5_schema_sql()
     current_schema = {
-        str(name): _normalise_sql_fragment(str(sql or ""))
+        str(name): hashlib.sha256(
+            _normalise_sql_fragment(str(sql or "")).encode("utf-8")
+        ).hexdigest()
         for name, sql in connection.exec_driver_sql(
             "SELECT name, sql FROM sqlite_master "
             "WHERE name IN ({})".format(",".join("?" for _ in _PHASE5_SCHEMA_OBJECTS)),
@@ -814,7 +1230,7 @@ def _validate_phase5_schema(connection) -> None:
         ).fetchall()
     }
     for name in _PHASE5_SCHEMA_OBJECTS:
-        if current_schema.get(name) != canonical_schema.get(name):
+        if current_schema.get(name) != _PHASE5_SCHEMA_SHA256.get(name):
             kind = "trigger" if name in _PHASE5_TRIGGER_MARKERS else "table"
             raise RuntimeError(
                 f"current Phase 5 schema {kind} is not migration-authoritative: {name}"
@@ -1287,14 +1703,14 @@ def _validate_phase5_rows(connection) -> None:
     inconsistent_attempts = connection.execute(
         text(
             "SELECT COUNT(*) FROM generation_attempts AS a "
-            "WHERE (json_extract(a.request_snapshot, '$.snapshot_version') = 2 "
+                "WHERE (json_extract(a.request_snapshot, '$.snapshot_version') IN (2, 3) "
             "AND (a.connection_id IS NULL OR a.model_entry_id IS NULL OR NOT EXISTS ("
             "SELECT 1 FROM model_catalogue_entries AS m "
             "JOIN provider_connections AS p ON p.id = m.connection_id "
             "WHERE m.id = a.model_entry_id AND m.connection_id = a.connection_id "
             "AND m.provider_model_id = json_extract(a.request_snapshot, '$.model') "
             "AND p.id = json_extract(a.request_snapshot, '$.connection_id')"
-            "))) OR (COALESCE(json_extract(a.request_snapshot, '$.snapshot_version'), 0) <> 2 "
+                "))) OR (COALESCE(json_extract(a.request_snapshot, '$.snapshot_version'), 0) NOT IN (2, 3) "
             "AND (a.connection_id IS NOT NULL OR a.model_entry_id IS NOT NULL))"
         )
     ).scalar_one()
@@ -1449,14 +1865,39 @@ def _validate_phase5_trigger_behavior(connection) -> None:
 
 
 class SQLiteAppStateStore(Phase5StoreMixin):
-    def __init__(self, engine: Engine):
+    _CONSTRUCTION_KEY = object()
+
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        authority: DataRootAuthority,
+        _construction_key: object,
+    ):
+        if _construction_key is not self._CONSTRUCTION_KEY:
+            raise TypeError("SQLiteAppStateStore is constructed only by DataRootAuthority")
         self._engine = engine
         self._closed = False
+        self._poisoned = False
+        self._authority = authority
+        self._attachment_manager = _open_attachment_fs(authority)
+        authority.register_store(self)
 
     @classmethod
-    def open(cls, database: Path) -> SQLiteAppStateStore:
-        engine = _engine(database)
+    def open(cls, *args, **kwargs) -> SQLiteAppStateStore:
+        del args, kwargs
+        raise TypeError("open stores through DataRootAuthority.open_store()")
+
+    @classmethod
+    def _open_from_authority(
+        cls, authority: DataRootAuthority
+    ) -> SQLiteAppStateStore:
+        authority.assert_live()
+        authority._claim_database()
+        lease = authority
+        engine = _engine(authority)
         try:
+            lease.assert_live()
             with engine.begin() as connection:
                 integrity = __import__(
                     "bots5.infrastructure.persistence.migrations.versions.0003_integrity_boundaries",
@@ -1521,26 +1962,58 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     _validate_phase4_schema(connection)
                     _validate_phase5_schema(connection)
                     _validate_phase5_trigger_behavior(connection)
+                if revision == "0009_phase6_context_attachments":
+                    _validate_phase4_schema(connection)
+                    _validate_phase5_schema(connection)
+                    _validate_phase5_trigger_behavior(connection)
+                    validate_phase6_schema(connection)
                 if "provider_id" in columns:
                     outcomes = __import__(
                         "bots5.infrastructure.persistence.migrations.versions.0005_generation_outcomes",
-                        fromlist=["_validate_outcome_rows", "_replace_attempt_triggers"],
+                        fromlist=["_validate_outcome_rows"],
                     )
                     outcomes._validate_outcome_rows(connection)
-                    outcomes._replace_attempt_triggers(connection)
         except BaseException:
             engine.dispose()
             raise
-        return cls(engine)
-
-    @property
-    def engine(self) -> Engine:
-        self._ensure_open()
-        return self._engine
+        try:
+            store = cls(
+                engine,
+                authority=lease,
+                _construction_key=cls._CONSTRUCTION_KEY,
+            )
+        except BaseException:
+            engine.dispose()
+            raise
+        try:
+            with engine.connect() as connection:
+                phase6_tables = connection.exec_driver_sql(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN "
+                    "('attachment_blobs','attachments','message_attachments','attempt_attachments','context_plans')"
+                ).scalar_one()
+            if phase6_tables:
+                store._reconcile_attachments_startup()
+        except BaseException as exc:
+            store._close_under_authority()
+            raise RuntimeError("durable Phase 6 attachment storage failed verification") from exc
+        lease.publish_ready(store)
+        return store
 
     def _ensure_open(self) -> None:
         if self._closed:
             raise StateError("state store is closed")
+        if self._poisoned:
+            raise StateError("state store is poisoned; restart recovery is required")
+
+    def _ensure_phase6(self) -> None:
+        """Require the normal Phase 6 current schema; never repair lazily."""
+        with self._engine.connect() as connection:
+            revision = connection.exec_driver_sql(
+                "SELECT version_num FROM alembic_version"
+            ).scalar_one_or_none()
+            if revision != "0009_phase6_context_attachments":
+                raise StateError("Phase 6 persistence schema is not current")
+            validate_phase6_schema(connection)
 
     def create_chat(self, chat: Chat) -> None:
         self._ensure_open()
@@ -1557,6 +2030,558 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     revision=chat.revision,
                 )
             )
+
+    # ------------------------------------------------------------------
+    # Phase 6 attachment authority
+    def ingest_attachment(self, source, *, filename: str | None = None) -> Attachment:
+        """Capture once, durably stage, publish, and create one reusable identity."""
+        self._ensure_open()
+        with self._authority.transition():
+            try:
+                captured = self._attachment_manager.capture(source, filename=filename)
+            except AttachmentIntegrityError as exc:
+                raise StateError(str(exc)) from exc
+            created_at = utc_iso(datetime.now(UTC))
+            attachment_id = str(uuid7())
+            # The non-reentrant transition gate is owned continuously from
+            # source capture through the final durable lifecycle commit.
+            with __import__("contextlib").nullcontext():
+                with self._engine.connect() as connection:
+                    connection.exec_driver_sql("BEGIN IMMEDIATE")
+                    existing = connection.execute(
+                        select(attachment_blobs).where(
+                            attachment_blobs.c.digest == captured.digest
+                        )
+                    ).first()
+                    if existing is not None:
+                        if existing.state != "ready" or int(existing.byte_size) != captured.byte_size:
+                            connection.rollback()
+                            self._poisoned = True
+                            self._authority.poison("live attachment lifecycle row is not ready")
+                            raise StateError("attachment lifecycle requires restart recovery")
+                        self._attachment_manager.read_verified(
+                            captured.digest, expected_size=captured.byte_size
+                        )
+                        arm_phase6_attachment_insert(connection, attachment_id)
+                        try:
+                            result = connection.execute(
+                                insert(attachments).values(
+                                    id=attachment_id,
+                                    blob_digest=captured.digest,
+                                    filename=captured.filename,
+                                    source_kind="filesystem",
+                                    source_name=captured.filename,
+                                    text_representation_id=captured.representation_id,
+                                    text_digest=captured.representation_id,
+                                    ineligibility_reason=captured.ineligibility_reason,
+                                    created_at=created_at,
+                                )
+                            )
+                            require_phase6_consumed(connection)
+                            if result.rowcount != 1:
+                                raise StateError("attachment insertion did not affect one row")
+                        finally:
+                            clear_phase6(connection)
+                        connection.commit()
+                        try:
+                            self._attachment_manager.discard_capture(captured.operation_id)
+                        except BaseException as exc:
+                            self._poisoned = True
+                            self._authority.poison(
+                                "deduplicated attachment cleanup failed after commit"
+                            )
+                            raise StateError(
+                                "attachment cleanup failed; restart recovery is required"
+                            ) from exc
+                        row = connection.execute(
+                            select(attachments).where(attachments.c.id == attachment_id)
+                        ).first()
+                        return _attachment(row)
+                    arm_phase6_blob_transition(
+                        connection,
+                        captured.digest,
+                        "",
+                        "staging",
+                        operation_id=captured.operation_id,
+                        stage_name=captured.operation_id,
+                        byte_size=captured.byte_size,
+                    )
+                    try:
+                        result = connection.execute(
+                            insert(attachment_blobs).values(
+                                digest=captured.digest,
+                                byte_size=captured.byte_size,
+                                state="staging",
+                                operation_id=captured.operation_id,
+                                stage_name=captured.operation_id,
+                                gc_id=None,
+                                created_at=created_at,
+                            )
+                        )
+                        require_phase6_consumed(connection)
+                        if result.rowcount != 1:
+                            raise StateError("blob staging did not affect one row")
+                    finally:
+                        clear_phase6(connection)
+                    connection.commit()
+            _fault("after-staging-row-commit")
+            try:
+                self._attachment_manager.capture_to_stage(captured.operation_id)
+                try:
+                    self._attachment_manager.stage_to_object(
+                        captured.operation_id, captured.digest
+                    )
+                except FileExistsError:
+                    self._attachment_manager.read_verified(
+                        captured.digest, expected_size=captured.byte_size
+                    )
+                    self._attachment_manager.verify_stage(
+                        captured.operation_id, captured.digest, captured.byte_size
+                    )
+                    self._attachment_manager.discard_stage(captured.operation_id)
+                with self._engine.begin() as connection:
+                    arm_phase6_blob_transition(
+                        connection,
+                        captured.digest,
+                        "staging",
+                        "ready",
+                        byte_size=captured.byte_size,
+                    )
+                    try:
+                        result = connection.execute(
+                            update(attachment_blobs)
+                            .where(
+                                attachment_blobs.c.digest == captured.digest,
+                                attachment_blobs.c.state == "staging",
+                                attachment_blobs.c.operation_id == captured.operation_id,
+                            )
+                            .values(
+                                state="ready",
+                                operation_id=None,
+                                stage_name=None,
+                                gc_id=None,
+                            )
+                        )
+                        require_phase6_consumed(connection)
+                        if result.rowcount != 1:
+                            raise StateError("blob publication did not affect one row")
+                    finally:
+                        clear_phase6(connection)
+                    arm_phase6_attachment_insert(connection, attachment_id)
+                    try:
+                        result = connection.execute(
+                            insert(attachments).values(
+                                id=attachment_id,
+                                blob_digest=captured.digest,
+                                filename=captured.filename,
+                                source_kind="filesystem",
+                                source_name=captured.filename,
+                                text_representation_id=captured.representation_id,
+                                text_digest=captured.representation_id,
+                                ineligibility_reason=captured.ineligibility_reason,
+                                created_at=created_at,
+                            )
+                        )
+                        require_phase6_consumed(connection)
+                        if result.rowcount != 1:
+                            raise StateError("attachment insertion did not affect one row")
+                    finally:
+                        clear_phase6(connection)
+                    row = connection.execute(
+                        select(attachments).where(attachments.c.id == attachment_id)
+                    ).first()
+                    _fault("before-ready-commit")
+                _fault("after-ready-commit")
+            except BaseException as exc:
+                self._poisoned = True
+                self._authority.poison("attachment publication failed after durable staging")
+                raise StateError(
+                    "attachment publication failed; restart recovery is required"
+                ) from exc
+        return _attachment(row)
+
+    def get_attachment(self, attachment_id: str) -> Attachment | None:
+        self._ensure_open()
+        with self._authority.operation(), self._engine.connect() as connection:
+            row = connection.execute(
+                select(attachments).where(attachments.c.id == attachment_id)
+            ).first()
+        return None if row is None else _attachment(row)
+
+    def list_attachments(self) -> tuple[Attachment, ...]:
+        self._ensure_open()
+        with self._authority.operation(), self._engine.connect() as connection:
+            rows = connection.execute(select(attachments).order_by(attachments.c.created_at, attachments.c.id)).fetchall()
+        return tuple(_attachment(row) for row in rows)
+
+    def delete_attachment(self, attachment_id: str) -> None:
+        self._ensure_open()
+        with self._authority.transition():
+            with self._engine.begin() as connection:
+                refs = connection.execute(
+                    select(message_attachments.c.message_id).where(message_attachments.c.attachment_id == attachment_id)
+                ).first()
+                attempt_ref = connection.execute(
+                    select(attempt_attachments.c.attempt_id).where(attempt_attachments.c.attachment_id == attachment_id)
+                ).first()
+                if refs is not None or attempt_ref is not None:
+                    raise StateError("attachment has durable historical references")
+                arm_phase6_attachment_delete(connection, attachment_id)
+                try:
+                    result = connection.execute(
+                        delete(attachments).where(attachments.c.id == attachment_id)
+                    )
+                    require_phase6_consumed(connection)
+                finally:
+                    clear_phase6(connection)
+                if result.rowcount != 1:
+                    raise StateError(f"attachment not found: {attachment_id}")
+
+    def read_attachment_bytes(self, attachment_id: str) -> bytes:
+        self._ensure_open()
+        with self._authority.transition():
+            with self._engine.connect() as connection:
+                row = connection.execute(
+                    select(attachments.c.blob_digest, attachment_blobs.c.byte_size)
+                    .select_from(attachments.join(attachment_blobs, attachments.c.blob_digest == attachment_blobs.c.digest))
+                    .where(attachments.c.id == attachment_id)
+                ).first()
+            if row is None:
+                raise StateError(f"attachment not found: {attachment_id}")
+            try:
+                return self._attachment_manager.read_verified(
+                    row.blob_digest, expected_size=row.byte_size
+                )
+            except AttachmentIntegrityError as exc:
+                raise StateError(str(exc)) from exc
+
+    def list_message_attachments(self, message_id: str) -> tuple[Attachment, ...]:
+        self._ensure_open()
+        with self._authority.operation(), self._engine.connect() as connection:
+            rows = connection.execute(
+                select(attachments)
+                .select_from(message_attachments.join(attachments, message_attachments.c.attachment_id == attachments.c.id))
+                .where(message_attachments.c.message_id == message_id)
+                .order_by(message_attachments.c.ordinal)
+            ).fetchall()
+        return tuple(_attachment(row) for row in rows)
+
+    def list_attempt_attachments(self, attempt_id: str) -> tuple[Attachment, ...]:
+        self._ensure_open()
+        with self._authority.operation(), self._engine.connect() as connection:
+            rows = connection.execute(
+                select(attachments)
+                .select_from(attempt_attachments.join(attachments, attempt_attachments.c.attachment_id == attachments.c.id))
+                .where(attempt_attachments.c.attempt_id == attempt_id)
+                .order_by(attempt_attachments.c.ordinal)
+            ).fetchall()
+        return tuple(_attachment(row) for row in rows)
+
+    def gc_attachments(self) -> tuple[str, ...]:
+        """Linearize deletion, durably mark deleting, then remove bytes."""
+        self._ensure_open()
+        removed: list[str] = []
+        with self._authority.transition():
+            rows = self._enumerate_unreferenced_blobs()
+            for row in rows:
+                gc_id = str(uuid7())
+                with self._engine.connect() as connection:
+                    connection.exec_driver_sql("BEGIN IMMEDIATE")
+                    current = connection.execute(
+                        select(attachment_blobs.c.state, attachment_blobs.c.byte_size)
+                        .where(attachment_blobs.c.digest == row.digest)
+                    ).first()
+                    if current is None or current.state != "ready" or connection.execute(
+                        select(attachments.c.id).where(attachments.c.blob_digest == row.digest)
+                    ).first() is not None:
+                        connection.rollback()
+                        continue
+                    self._attachment_manager.read_verified(
+                        row.digest, expected_size=int(row.byte_size)
+                    )
+                    arm_phase6_blob_transition(
+                        connection,
+                        row.digest,
+                        "ready",
+                        "deleting",
+                        gc_id=gc_id,
+                        byte_size=int(row.byte_size),
+                    )
+                    try:
+                        result = connection.execute(
+                            update(attachment_blobs)
+                            .where(attachment_blobs.c.digest == row.digest)
+                            .values(
+                                state="deleting",
+                                operation_id=None,
+                                stage_name=None,
+                                gc_id=gc_id,
+                            )
+                        )
+                        require_phase6_consumed(connection)
+                        if result.rowcount != 1:
+                            raise StateError("GC intent did not affect one row")
+                    finally:
+                        clear_phase6(connection)
+                    _fault("before-gc-deleting-commit")
+                    connection.commit()
+                    _fault("after-gc-deleting-commit")
+                try:
+                    self._attachment_manager.create_tombstone(gc_id, row.digest)
+                    self._attachment_manager.exchange_object_to_gc(row.digest, gc_id)
+                    self._attachment_manager.verify_gc_payload(
+                        gc_id, row.digest, int(row.byte_size)
+                    )
+                    _fault("after-gc-payload-verification")
+                    self._attachment_manager.delete_gc_payload(gc_id)
+                    if not self._attachment_manager.canonical_tombstone_present(
+                        gc_id, row.digest
+                    ):
+                        raise AttachmentIntegrityError("canonical GC tombstone is invalid")
+                    self._attachment_manager.delete_canonical_tombstone(row.digest)
+                    with self._engine.connect() as connection:
+                        connection.exec_driver_sql("BEGIN IMMEDIATE")
+                        current = connection.execute(
+                            select(attachment_blobs.c.state, attachment_blobs.c.gc_id)
+                            .where(attachment_blobs.c.digest == row.digest)
+                        ).first()
+                        if (
+                            current is None
+                            or current.state != "deleting"
+                            or current.gc_id != gc_id
+                        ):
+                            connection.rollback()
+                            raise StateError("attachment garbage collection state changed")
+                        if connection.execute(
+                            select(attachments.c.id).where(
+                                attachments.c.blob_digest == row.digest
+                            )
+                        ).first() is not None:
+                            connection.rollback()
+                            raise StateError("attachment appeared after GC authorization")
+                        arm_phase6_blob_delete(connection, row.digest, gc_id)
+                        try:
+                            _fault("before-gc-row-delete")
+                            result = connection.execute(
+                                delete(attachment_blobs).where(
+                                    attachment_blobs.c.digest == row.digest
+                                )
+                            )
+                            require_phase6_consumed(connection)
+                            if result.rowcount != 1:
+                                raise StateError(
+                                    "attachment garbage collection completion lost its row"
+                                )
+                        finally:
+                            clear_phase6(connection)
+                        _fault("before-gc-row-delete-commit")
+                        connection.commit()
+                        _fault("after-gc-row-delete-commit")
+                except BaseException as exc:
+                    self._poisoned = True
+                    self._authority.poison(
+                        "attachment garbage collection failed after deleting intent"
+                    )
+                    raise StateError(
+                        "attachment garbage collection failed; deleting intent retained"
+                    ) from exc
+                removed.append(digest_to_text(row.digest))
+        return tuple(removed)
+
+    def _enumerate_unreferenced_blobs(self):
+        """Return a disposable candidate set without retaining a read snapshot."""
+        with self._engine.connect() as connection:
+            return connection.execute(
+                select(attachment_blobs.c.digest, attachment_blobs.c.byte_size)
+                .where(attachment_blobs.c.state == "ready")
+                .where(~attachment_blobs.c.digest.in_(select(attachments.c.blob_digest)))
+            ).fetchall()
+
+    def _reconcile_attachments_startup(self) -> tuple[str, ...]:
+        """Private pre-READY recovery; never exposed as a second manager."""
+        with self._authority._transition_gate:
+            return self._reconcile_attachments_locked()
+
+    def _reconcile_attachments_locked(self) -> tuple[str, ...]:
+        with self._engine.connect() as connection:
+            rows = connection.execute(select(attachment_blobs)).fetchall()
+        try:
+            self._recover_attachment_rows(rows)
+            self._validate_attachment_payload_rows()
+            return ()
+        except AttachmentIntegrityError as exc:
+            raise StateError(str(exc)) from exc
+
+    def _recover_attachment_rows(self, rows) -> None:
+        expected_operations = {
+            str(row.operation_id) for row in rows if row.state == "staging"
+        }
+        for name in self._attachment_manager.inventory("captures"):
+            if name not in expected_operations:
+                self._attachment_manager.discard_capture(name)
+        for row in rows:
+            digest = bytes(row.digest)
+            size = int(row.byte_size)
+            if row.state == "ready":
+                self._attachment_manager.read_verified(digest, expected_size=size)
+                continue
+            if row.state == "staging":
+                operation_id = str(row.operation_id)
+                capture = self._attachment_manager.capture_present(operation_id)
+                stage = self._attachment_manager.stage_present(operation_id)
+                canonical = self._attachment_manager.object_present(digest)
+                if sum((capture, stage, canonical)) != 1 and not (stage and canonical and not capture):
+                    raise AttachmentIntegrityError("staging attachment state is ambiguous")
+                if capture:
+                    self._attachment_manager.verify_capture(operation_id, digest, size)
+                    self._attachment_manager.capture_to_stage(operation_id)
+                    stage = True
+                if stage and not canonical:
+                    self._attachment_manager.verify_stage(operation_id, digest, size)
+                    self._attachment_manager.stage_to_object(operation_id, digest)
+                elif stage and canonical:
+                    self._attachment_manager.verify_stage(operation_id, digest, size)
+                    self._attachment_manager.read_verified(digest, expected_size=size)
+                    self._attachment_manager.discard_stage(operation_id)
+                self._attachment_manager.read_verified(digest, expected_size=size)
+                with self._engine.begin() as connection:
+                    arm_phase6_blob_transition(
+                        connection, digest, "staging", "ready", byte_size=size
+                    )
+                    try:
+                        result = connection.execute(
+                            update(attachment_blobs)
+                            .where(
+                                attachment_blobs.c.digest == digest,
+                                attachment_blobs.c.operation_id == operation_id,
+                            )
+                            .values(
+                                state="ready", operation_id=None, stage_name=None, gc_id=None
+                            )
+                        )
+                        require_phase6_consumed(connection)
+                        if result.rowcount != 1:
+                            raise AttachmentIntegrityError(
+                                "staging recovery did not affect one row"
+                            )
+                    finally:
+                        clear_phase6(connection)
+                continue
+            if row.state == "deleting":
+                self._recover_deleting_blob(digest, size, str(row.gc_id))
+        with self._engine.connect() as connection:
+            ready = {
+                digest_to_text(bytes(row.digest))
+                for row in connection.execute(
+                    select(attachment_blobs.c.digest).where(
+                        attachment_blobs.c.state == "ready"
+                    )
+                )
+            }
+        if set(self._attachment_manager.inventory("objects")) != ready:
+            raise AttachmentIntegrityError("attachment object inventory is not authoritative")
+        if self._attachment_manager.inventory("staging"):
+            raise AttachmentIntegrityError("attachment staging inventory is not empty")
+        if self._attachment_manager.inventory("captures"):
+            raise AttachmentIntegrityError("attachment capture inventory is not empty")
+        if self._attachment_manager.inventory("gc"):
+            raise AttachmentIntegrityError("attachment GC inventory is not empty")
+
+    def _recover_deleting_blob(self, digest: bytes, size: int, gc_id: str) -> None:
+        object_present = self._attachment_manager.object_present(digest)
+        gc_present = self._attachment_manager.gc_payload_present(gc_id)
+        canonical_marker = (
+            object_present
+            and self._attachment_manager.canonical_tombstone_present(gc_id, digest)
+        )
+        if object_present and not canonical_marker:
+            self._attachment_manager.read_verified(digest, expected_size=size)
+            if not gc_present:
+                self._attachment_manager.create_tombstone(gc_id, digest)
+            elif not self._attachment_manager.tombstone_present(gc_id, digest):
+                raise AttachmentIntegrityError("GC leaf is not the authorized tombstone")
+            self._attachment_manager.exchange_object_to_gc(digest, gc_id)
+            canonical_marker = True
+            gc_present = True
+        if canonical_marker:
+            if gc_present:
+                self._attachment_manager.verify_gc_payload(gc_id, digest, size)
+                self._attachment_manager.delete_gc_payload(gc_id)
+            self._attachment_manager.delete_canonical_tombstone(digest)
+        elif gc_present:
+            raise AttachmentIntegrityError("GC payload exists without canonical tombstone")
+        with self._engine.connect() as connection:
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+            current = connection.execute(
+                select(attachment_blobs.c.state, attachment_blobs.c.gc_id).where(
+                    attachment_blobs.c.digest == digest
+                )
+            ).first()
+            if current is None or current.state != "deleting" or current.gc_id != gc_id:
+                connection.rollback()
+                raise AttachmentIntegrityError("GC durable identity changed")
+            if connection.execute(
+                select(attachments.c.id).where(attachments.c.blob_digest == digest)
+            ).first() is not None:
+                connection.rollback()
+                raise AttachmentIntegrityError("deleting blob gained an attachment")
+            arm_phase6_blob_delete(connection, digest, gc_id)
+            try:
+                result = connection.execute(
+                    delete(attachment_blobs).where(attachment_blobs.c.digest == digest)
+                )
+                require_phase6_consumed(connection)
+                if result.rowcount != 1:
+                    raise AttachmentIntegrityError(
+                        "GC recovery did not affect one row"
+                    )
+            finally:
+                clear_phase6(connection)
+            connection.commit()
+
+    def _validate_attachment_payload_rows(self) -> None:
+        """Verify representation identity/eligibility against the owned bytes."""
+        with self._engine.connect() as connection:
+            rows = connection.execute(
+                select(
+                    attachments.c.blob_digest,
+                    attachments.c.text_representation_id,
+                    attachments.c.text_digest,
+                    attachments.c.ineligibility_reason,
+                    attachment_blobs.c.byte_size,
+                ).select_from(
+                    attachments.join(
+                        attachment_blobs,
+                        attachments.c.blob_digest == attachment_blobs.c.digest,
+                    )
+                )
+            ).fetchall()
+        for row in rows:
+            try:
+                raw = self._attachment_manager.read_verified(
+                    row.blob_digest,
+                    expected_size=int(row.byte_size),
+                )
+            except AttachmentIntegrityError as exc:
+                raise StateError("durable attachment payload integrity failed") from exc
+            try:
+                decoded = raw.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                if row.text_representation_id is not None or row.ineligibility_reason != "invalid_utf8":
+                    raise StateError("durable attachment UTF-8 representation is malformed")
+                continue
+            if b"\x00" in raw:
+                if row.text_representation_id is not None or row.ineligibility_reason != "contains_nul":
+                    raise StateError("durable attachment NUL representation is malformed")
+                continue
+            digest = hashlib.sha256(raw).digest()
+            if (
+                row.text_representation_id != digest
+                or row.text_digest != digest
+                or row.ineligibility_reason is not None
+                or decoded.encode("utf-8") != raw
+            ):
+                raise StateError("durable attachment representation is malformed")
 
     def list_chats(self) -> tuple[Chat, ...]:
         self._ensure_open()
@@ -1798,6 +2823,7 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         if assistant_message.parent_id != user_message.id:
             raise StateError("generation attempt assistant must belong to its user turn")
         _validate_request_snapshot(attempt, user_message.content)
+        _validate_phase6_attempt_authority(connection, attempt)
         _validate_attempt_outcome(attempt)
 
         active_id = connection.execute(
@@ -1892,6 +2918,118 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         if result.rowcount != 1:
             raise RevisionConflict(f"chat revision changed: {chat.id}")
 
+    def _persist_phase6_evidence(
+        self,
+        connection,
+        *,
+        attempt_id: str,
+        message_id: str,
+        context_plan,
+        attachment_ids: tuple[str, ...],
+        reuse_message_attachments: bool = False,
+    ) -> None:
+        if context_plan is None and not attachment_ids:
+            return
+        if context_plan is None:
+            raise StateError("Phase 6 attachment selection requires a frozen context plan")
+        try:
+            wire_digest = hashlib.sha256(context_plan.wire_representation).hexdigest()
+            connection.execute(
+                insert(context_plans).values(
+                    attempt_id=attempt_id,
+                    plan_version=context_plan.version,
+                    canonical_representation=context_plan.canonical_representation,
+                    canonical_digest=context_plan.canonical_digest,
+                    wire_representation_digest=wire_digest,
+                    budget_limit=context_plan.budget.limit,
+                    budget_provenance=context_plan.budget.provenance,
+                    budget_semantics=context_plan.budget.semantics,
+                    adapter_id=context_plan.budget.adapter_id,
+                    adapter_version=context_plan.budget.adapter_version,
+                    input_counts=json.dumps(context_plan.input_counts, sort_keys=True, separators=(",", ":")),
+                    envelope_overhead=context_plan.budget.envelope_overhead,
+                    output_reserve=context_plan.budget.output_reserve,
+                    input_units=context_plan.budget.input_units,
+                    total_units=context_plan.budget.total_units,
+                    headroom=context_plan.budget.headroom,
+                    created_at=utc_iso(datetime.now(UTC)),
+                )
+            )
+            source_by_id = {source.source_id: source for source in context_plan.sources}
+            for ordinal, attachment_id in enumerate(attachment_ids):
+                source = source_by_id.get(attachment_id)
+                if source is None or source.kind != "attachment" or not source.selected:
+                    raise StateError("selected attachment is not part of the frozen context plan")
+                attachment_row = connection.execute(
+                    select(
+                        attachments.c.blob_digest,
+                        attachments.c.text_representation_id,
+                        attachments.c.text_digest,
+                        attachment_blobs.c.byte_size,
+                    )
+                    .select_from(
+                        attachments.join(
+                            attachment_blobs,
+                            attachments.c.blob_digest == attachment_blobs.c.digest,
+                        )
+                    )
+                    .where(attachments.c.id == attachment_id)
+                ).first()
+                if attachment_row is None:
+                    raise StateError(f"selected attachment is missing: {attachment_id}")
+                try:
+                    raw = self._attachment_manager.read_verified(
+                        attachment_row.blob_digest,
+                        expected_size=attachment_row.byte_size,
+                    )
+                except AttachmentIntegrityError as exc:
+                    raise StateError("selected attachment payload integrity failed") from exc
+                if attachment_row.text_representation_id is None or attachment_row.text_digest is None:
+                    raise StateError(f"selected attachment is not context-eligible: {attachment_id}")
+                try:
+                    text_content = raw.decode("utf-8", errors="strict")
+                except UnicodeDecodeError as exc:
+                    raise StateError(f"selected attachment is not valid UTF-8: {attachment_id}") from exc
+                if hashlib.sha256(text_content.encode("utf-8")).digest() != attachment_row.text_digest:
+                    raise StateError("selected attachment text representation digest mismatches its payload")
+                if (
+                    source.representation_id
+                    != digest_to_text(attachment_row.text_representation_id)
+                    or source.content != text_content
+                ):
+                    raise StateError("selected attachment changed while context was being prepared")
+                if not reuse_message_attachments:
+                    connection.execute(
+                        insert(message_attachments).values(
+                            message_id=message_id,
+                            attachment_id=attachment_id,
+                            ordinal=ordinal,
+                        )
+                    )
+                else:
+                    existing_message_refs = connection.execute(
+                        select(message_attachments.c.attachment_id, message_attachments.c.ordinal)
+                        .where(message_attachments.c.message_id == message_id)
+                        .order_by(message_attachments.c.ordinal)
+                    ).fetchall()
+                    expected_message_refs = tuple(
+                        (item.attachment_id, int(item.ordinal))
+                        for item in existing_message_refs
+                    )
+                    if expected_message_refs != tuple(
+                        (value, index) for index, value in enumerate(attachment_ids)
+                    ):
+                        raise StateError("regenerated attachment references do not match the frozen context plan")
+                connection.execute(
+                    insert(attempt_attachments).values(
+                        attempt_id=attempt_id,
+                        attachment_id=attachment_id,
+                        ordinal=ordinal,
+                    )
+                )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise StateError("frozen Phase 6 context evidence is malformed") from exc
+
     def persist_generation_start(
         self,
         chat: Chat,
@@ -1900,20 +3038,33 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         attempt: GenerationAttempt,
         *,
         expected_chat_revision: int | None = None,
+        context_plan=None,
+        attachment_ids: tuple[str, ...] = (),
     ) -> None:
         self._ensure_open()
-        with self._engine.begin() as connection:
-            self._insert_messages_and_attempt(
-                connection,
-                (user_message, assistant_message),
-                attempt,
-            )
-            self._advance_chat(
-                connection,
-                chat,
-                assistant_message.id,
-                expected_chat_revision,
-            )
+        # Acquire the attachment transition gate before opening the SQLite
+        # write transaction.  This ordering prevents GC (gate -> BEGIN
+        # IMMEDIATE) from deadlocking generation (BEGIN -> gate).
+        with self._authority.transition():
+            with self._engine.begin() as connection:
+                self._insert_messages_and_attempt(
+                    connection,
+                    (user_message, assistant_message),
+                    attempt,
+                )
+                self._persist_phase6_evidence(
+                    connection,
+                    attempt_id=attempt.id,
+                    message_id=user_message.id,
+                    context_plan=context_plan,
+                    attachment_ids=attachment_ids,
+                )
+                self._advance_chat(
+                    connection,
+                    chat,
+                    assistant_message.id,
+                    expected_chat_revision,
+                )
 
     def persist_regeneration_start(
         self,
@@ -1922,16 +3073,27 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         attempt: GenerationAttempt,
         *,
         expected_chat_revision: int | None = None,
+        context_plan=None,
+        attachment_ids: tuple[str, ...] = (),
     ) -> None:
         self._ensure_open()
-        with self._engine.begin() as connection:
-            self._insert_messages_and_attempt(connection, (assistant_message,), attempt)
-            self._advance_chat(
-                connection,
-                chat,
-                assistant_message.id,
-                expected_chat_revision,
-            )
+        with self._authority.transition():
+            with self._engine.begin() as connection:
+                self._insert_messages_and_attempt(connection, (assistant_message,), attempt)
+                self._persist_phase6_evidence(
+                    connection,
+                    attempt_id=attempt.id,
+                    message_id=attempt.user_message_id,
+                    context_plan=context_plan,
+                    attachment_ids=attachment_ids,
+                    reuse_message_attachments=True,
+                )
+                self._advance_chat(
+                    connection,
+                    chat,
+                    assistant_message.id,
+                    expected_chat_revision,
+                )
 
     def update_streaming_message(self, message: Message) -> None:
         self._ensure_open()
@@ -2020,30 +3182,35 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                 raise StateError("message identity is immutable")
             arm_transition(connection, message.id, attempt.id, "finalize")
             try:
-                attempt_result = connection.execute(
-                    update(generation_attempts)
-                    .where(generation_attempts.c.id == attempt.id)
-                    .values(
-                        state=attempt.state.value,
-                        ended_at=None if attempt.ended_at is None else utc_iso(attempt.ended_at),
-                        error_type=attempt.error_type,
-                        error_message=attempt.error_message,
-                        provider_id=attempt.provider_id,
-                        returned_model=attempt.returned_model,
-                        request_id=attempt.request_id,
-                        finish_reason=attempt.finish_reason,
-                        prompt_tokens=attempt.prompt_tokens,
-                        completion_tokens=attempt.completion_tokens,
-                        reasoning_tokens=attempt.reasoning_tokens,
-                        total_tokens=attempt.total_tokens,
-                        known_cost_usd=(
-                            None
-                            if attempt.known_cost_usd is None
-                            else str(attempt.known_cost_usd)
-                        ),
-                        remote_outcome_unknown=attempt.remote_outcome_unknown,
+                try:
+                    attempt_result = connection.execute(
+                        update(generation_attempts)
+                        .where(generation_attempts.c.id == attempt.id)
+                        .values(
+                            state=attempt.state.value,
+                            ended_at=None if attempt.ended_at is None else utc_iso(attempt.ended_at),
+                            error_type=attempt.error_type,
+                            error_message=attempt.error_message,
+                            provider_id=attempt.provider_id,
+                            returned_model=attempt.returned_model,
+                            request_id=attempt.request_id,
+                            finish_reason=attempt.finish_reason,
+                            prompt_tokens=attempt.prompt_tokens,
+                            completion_tokens=attempt.completion_tokens,
+                            reasoning_tokens=attempt.reasoning_tokens,
+                            total_tokens=attempt.total_tokens,
+                            known_cost_usd=(
+                                None
+                                if attempt.known_cost_usd is None
+                                else str(attempt.known_cost_usd)
+                            ),
+                            remote_outcome_unknown=attempt.remote_outcome_unknown,
+                        )
                     )
-                )
+                except IntegrityError as exc:
+                    if "finish_reason" in str(exc):
+                        raise StateError("generation finish_reason is inconsistent with state") from None
+                    raise
                 if attempt_result.rowcount != 1:
                     raise StateError(f"generation attempt not found: {attempt.id}")
                 message_result = connection.execute(
@@ -2209,7 +3376,23 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                 delete(workspace_windows).where(workspace_windows.c.window_id == window_id)
             )
 
-    def close(self) -> None:
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def _close_under_authority(self) -> None:
         if not self._closed:
             self._closed = True
-            self._engine.dispose()
+            try:
+                with self._engine.connect() as connection:
+                    mode = str(
+                        connection.exec_driver_sql("PRAGMA journal_mode").scalar_one()
+                    ).casefold()
+                    if mode != "delete":
+                        raise StateError("steady SQLite journal mode changed before close")
+            finally:
+                self._attachment_manager.close()
+                self._engine.dispose()
+
+    def close(self) -> None:
+        self._authority.close()

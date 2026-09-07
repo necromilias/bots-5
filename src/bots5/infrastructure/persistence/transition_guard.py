@@ -26,7 +26,15 @@ def install_transition_guard(dbapi_connection: Any, connection_record: Any | Non
         "user_message_id": None,
         "phase5_connection_identity_update": None,
         "phase5_catalogue_refresh": None,
+        "phase6": None,
+        "phase6_consumed": False,
     }
+
+    def consume_phase6(expected: tuple[object, ...]) -> int:
+        if state["phase6"] != expected or state["phase6_consumed"]:
+            return 0
+        state["phase6_consumed"] = True
+        return 1
 
     def internal_transition(message_id: str | None, attempt_id: str | None, phase: str) -> int:
         if state["phase"] == "start":
@@ -208,6 +216,30 @@ def install_transition_guard(dbapi_connection: Any, connection_record: Any | Non
     dbapi_connection.create_function(
         "bots5_valid_remote_outcome_transition", 6, valid_remote_outcome_transition
     )
+    dbapi_connection.create_function(
+        "bots5_phase6_blob_transition_allowed", 7,
+        lambda digest, old_state, new_state, operation_id, stage_name, gc_id, byte_size: consume_phase6(
+            (
+                "blob", bytes(digest), old_state or "", new_state,
+                operation_id or "", stage_name or "", gc_id or "", byte_size,
+            )
+        ),
+    )
+    dbapi_connection.create_function(
+        "bots5_phase6_blob_delete_allowed", 2,
+        lambda digest, gc_id: consume_phase6(
+            ("blob-delete", bytes(digest), gc_id or "")
+        ),
+    )
+    dbapi_connection.create_function(
+        "bots5_phase6_attachment_insert_allowed", 1,
+        lambda attachment_id: consume_phase6(("attachment-insert", attachment_id)),
+    )
+    dbapi_connection.create_function(
+        "bots5_phase6_attachment_delete_allowed",
+        1,
+        lambda attachment_id: consume_phase6(("attachment-delete", attachment_id)),
+    )
     if connection_record is not None:
         connection_record.info[_STATE_KEY] = state
 
@@ -244,6 +276,64 @@ def clear_transition(connection: Any) -> None:
                 "user_message_id": None,
             }
         )
+
+
+def arm_phase6_blob_transition(
+    connection: Any,
+    digest: bytes,
+    old_state: str,
+    new_state: str,
+    *,
+    operation_id: str | None = None,
+    stage_name: str | None = None,
+    gc_id: str | None = None,
+    byte_size: int,
+) -> None:
+    state = connection.info.get(_STATE_KEY)
+    if state is None:
+        raise RuntimeError("SQLite transition guard is not installed")
+    state["phase6"] = (
+        "blob", bytes(digest), old_state, new_state, operation_id or "",
+        stage_name or "", gc_id or "", byte_size,
+    )
+    state["phase6_consumed"] = False
+
+
+def arm_phase6_blob_delete(connection: Any, digest: bytes, gc_id: str) -> None:
+    state = connection.info.get(_STATE_KEY)
+    if state is None:
+        raise RuntimeError("SQLite transition guard is not installed")
+    state["phase6"] = ("blob-delete", bytes(digest), gc_id)
+    state["phase6_consumed"] = False
+
+
+def arm_phase6_attachment_insert(connection: Any, attachment_id: str) -> None:
+    state = connection.info.get(_STATE_KEY)
+    if state is None:
+        raise RuntimeError("SQLite transition guard is not installed")
+    state["phase6"] = ("attachment-insert", attachment_id)
+    state["phase6_consumed"] = False
+
+
+def arm_phase6_attachment_delete(connection: Any, attachment_id: str) -> None:
+    state = connection.info.get(_STATE_KEY)
+    if state is None:
+        raise RuntimeError("SQLite transition guard is not installed")
+    state["phase6"] = ("attachment-delete", attachment_id)
+    state["phase6_consumed"] = False
+
+
+def require_phase6_consumed(connection: Any) -> None:
+    state = connection.info.get(_STATE_KEY)
+    if state is None or not state["phase6_consumed"]:
+        raise RuntimeError("SQLite Phase 6 transition arm was not consumed exactly once")
+
+
+def clear_phase6(connection: Any) -> None:
+    state = connection.info.get(_STATE_KEY)
+    if state is not None:
+        state["phase6"] = None
+        state["phase6_consumed"] = False
 
 
 def arm_phase5_connection_identity_update(

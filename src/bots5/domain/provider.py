@@ -331,3 +331,4 @@ class PreparedGeneration:
     catalogue_revision: int
     capabilities: tuple[ResolvedCapability, ...]
     settings: ResolvedGenerationSettings
+    context_plan: Any = None

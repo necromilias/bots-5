@@ -8,7 +8,7 @@ from sqlalchemy import inspect, text
 
 from bots5.domain.clock import parse_utc, utc_iso
 from bots5.domain.models import Chat
-from bots5.infrastructure.persistence import SQLiteAppStateStore, upgrade_database
+from tests._authority_test_support import SQLiteAppStateStore, upgrade_database
 
 
 def test_real_migration_creates_state_schema_and_enables_sqlite_safety(tmp_path: Path):
@@ -31,12 +31,17 @@ def test_real_migration_creates_state_schema_and_enables_sqlite_safety(tmp_path:
             "model_generation_config",
             "provider_connections",
             "catalogue_refresh_state",
+            "attachment_blobs",
+            "attachments",
+            "message_attachments",
+            "attempt_attachments",
+            "context_plans",
             "workspace_windows",
         }
         with store.engine.connect() as connection:
             assert connection.execute(text("PRAGMA foreign_keys")).scalar_one() == 1
-            assert connection.execute(text("PRAGMA journal_mode")).scalar_one().lower() == "wal"
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0008_catalogue_refresh_outcomes"
+            assert connection.execute(text("PRAGMA journal_mode")).scalar_one().lower() == "delete"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0009_phase6_context_attachments"
 
         now = datetime.now(timezone.utc)
         chat = Chat(str(uuid4()), "Test", now, now)

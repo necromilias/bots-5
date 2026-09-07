@@ -100,6 +100,28 @@ class GenerationAttempt:
 
 
 @dataclass(frozen=True, slots=True)
+class AttachmentBlob:
+    digest: str
+    size: int
+    state: str
+    gc_id: str | None
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class Attachment:
+    id: str
+    blob_digest: str
+    filename: str
+    source_kind: str
+    source_name: str
+    text_representation_id: str | None
+    text_digest: str | None
+    ineligibility_reason: str | None
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class ChatActivity:
     """Session-derived activity for one chat; never persisted as domain truth."""
 

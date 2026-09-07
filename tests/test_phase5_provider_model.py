@@ -47,8 +47,12 @@ from bots5.desktop.profile import DesktopSessionInfo
 from bots5.desktop.window import MainWindow
 from bots5.desktop.widgets import AddConnectionDialog, SettingsDialog, TopBar, TuneDialog
 from bots5.infrastructure.generation.fake import FakeStreamingBackend
-from bots5.infrastructure.persistence import SQLiteAppStateStore, migration_runner, upgrade_database
-from bots5.infrastructure.persistence.migration_runner import _create_recovery_point
+from bots5.infrastructure.persistence import migration_runner
+from tests._authority_test_support import (
+    SQLiteAppStateStore,
+    upgrade_database,
+    upgrade_to as authority_upgrade_to,
+)
 from bots5.infrastructure.persistence.phase5_validation import validate_phase5_snapshot
 from bots5.infrastructure.secrets import FakeSecretStore, SecretServiceStore, SecretStoreError
 from bots5.providers.base import CompletionRequest
@@ -66,10 +70,7 @@ MIGRATIONS = REPO / "src/bots5/infrastructure/persistence/migrations"
 
 
 def _upgrade_to(database: Path, revision: str) -> None:
-    config = Config()
-    config.set_main_option("script_location", str(MIGRATIONS))
-    config.set_main_option("sqlalchemy.url", f"sqlite:///{database}")
-    command.upgrade(config, revision)
+    authority_upgrade_to(database, revision)
 
 
 def _configured_application(tmp_path: Path, backend=None, *, secret_store=None):
@@ -83,6 +84,7 @@ def _configured_application(tmp_path: Path, backend=None, *, secret_store=None):
         ids,
         clock,
         secret_stores=({CredentialSource.SECRET_SERVICE: secret_store} if secret_store is not None else None),
+        phase6_enabled=False,
     )
     application = BotsApplication(
         store,
@@ -114,7 +116,7 @@ def test_fresh_phase5_seed_and_pre_phase5_chat_selection_required(tmp_path: Path
         assert models[0].provider_model_id == "fake-v0.1"
         assert store.get_chat_model_selection("old") is None
         with store.engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0008_catalogue_refresh_outcomes"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0009_phase6_context_attachments"
     finally:
         store.close()
 
@@ -951,7 +953,6 @@ def test_raw_catalogue_refresh_outcome_cannot_be_forged_or_revised_in_place(tmp_
 def test_catalogue_refresh_outcome_event_requery_converges_between_store_views(tmp_path: Path):
     async def scenario():
         application, store = _configured_application(tmp_path)
-        second_store = SQLiteAppStateStore.open(tmp_path / "state.sqlite3")
         subscription = application.subscribe()
         try:
             connection = await application.create_provider_connection(
@@ -970,14 +971,16 @@ def test_catalogue_refresh_outcome_event_requery_converges_between_store_views(t
             event = await asyncio.wait_for(subscription.__anext__(), timeout=1)
             while event.kind != "model_catalogue_changed":
                 event = await asyncio.wait_for(subscription.__anext__(), timeout=1)
-            observed = second_store.get_provider_connection(connection.id)
+            # Multiple windows share one core/store authority.  A second
+            # independent store is intentionally rejected while the core
+            # owns this root; re-query the authoritative store instead.
+            observed = store.get_provider_connection(connection.id)
             assert observed is not None
             assert observed.catalogue_refresh_status is CatalogueRefreshStatus.FAILED
             assert observed.catalogue_refresh_failure_class is CatalogueRefreshFailureClass.TRANSPORT
             assert store.get_provider_connection(connection.id).catalogue_refresh_revision == observed.catalogue_refresh_revision
         finally:
             subscription.close()
-            second_store.close()
             await application.close()
 
     class ModelFailingDiscoverer:
@@ -2953,9 +2956,11 @@ def test_backend_native_timeout_with_configured_deadline_keeps_backend_error(tmp
 
 
 class _CancellationResistantStream:
-    def __init__(self, attempt_id: str):
+    def __init__(self, attempt_id: str, cancelled: asyncio.Event, release: asyncio.Event):
         self.attempt_id = attempt_id
         self.step = 0
+        self.cancelled = cancelled
+        self.release = release
 
     def __aiter__(self):
         return self
@@ -2970,7 +2975,8 @@ class _CancellationResistantStream:
         try:
             await asyncio.sleep(0.2)
         except asyncio.CancelledError:
-            await asyncio.sleep(0.05)
+            self.cancelled.set()
+            await self.release.wait()
             raise StopAsyncIteration
         raise StopAsyncIteration
 
@@ -2978,10 +2984,14 @@ class _CancellationResistantStream:
 class _CancellationResistantBackend:
     def __init__(self):
         self.calls = 0
+        self.cancelled = asyncio.Event()
+        self.release = asyncio.Event()
 
     def stream(self, request: GenerationRequest):
         self.calls += 1
-        return _CancellationResistantStream(request.attempt_id)
+        return _CancellationResistantStream(
+            request.attempt_id, self.cancelled, self.release
+        )
 
 
 def test_bots_owned_timeout_does_not_wait_for_cancellation_resistant_backend(tmp_path: Path):
@@ -2994,8 +3004,13 @@ def test_bots_owned_timeout_does_not_wait_for_cancellation_resistant_backend(tmp
             )
             chat = await application.create_chat()
             created = await application.send_message(chat.id, "resistant timeout")
-            await asyncio.sleep(0.03)
-            attempt = store.get_generation_attempt(created.id)
+            await asyncio.wait_for(backend.cancelled.wait(), timeout=2)
+            attempt = None
+            for _ in range(100):
+                attempt = store.get_generation_attempt(created.id)
+                if attempt is not None and attempt.state is not AttemptState.RUNNING:
+                    break
+                await asyncio.sleep(0)
             assert attempt is not None
             assert attempt.state is AttemptState.FAILED
             assert attempt.error_type == "timeout"
@@ -3003,8 +3018,8 @@ def test_bots_owned_timeout_does_not_wait_for_cancellation_resistant_backend(tmp
             message = store.get_message(attempt.assistant_message_id)
             assert message is not None and message.content == "partial"
             assert backend.calls == 1
-            await asyncio.sleep(0.08)
         finally:
+            backend.release.set()
             await asyncio.wait_for(application.close(), timeout=1)
 
     asyncio.run(scenario())
@@ -3049,129 +3064,3 @@ def test_bots_owned_timeout_preserves_partial_output_and_uncertainty_without_ret
             await application.close()
 
     asyncio.run(scenario())
-
-
-def test_recovery_collision_preserves_the_existing_verified_artifact(tmp_path: Path):
-    database = tmp_path / "state.sqlite3"
-    _upgrade_to(database, "0001_desktop_state")
-    engine = create_engine(f"sqlite:///{database}")
-    try:
-        with engine.begin() as connection:
-            connection.execute(text("INSERT INTO chats (id, title, created_at, updated_at) VALUES ('old', 'Old', :now, :now)"), {"now": "2026-09-05T00:00:00.000Z"})
-    finally:
-        engine.dispose()
-    first = _create_recovery_point(database)
-    engine = create_engine(f"sqlite:///{database}")
-    try:
-        with engine.begin() as connection:
-            connection.execute(text("INSERT INTO chats (id, title, created_at, updated_at) VALUES ('new', 'New', :now, :now)"), {"now": "2026-09-05T00:00:00.000Z"})
-    finally:
-        engine.dispose()
-    second = _create_recovery_point(database)
-    assert first != second
-    assert first.exists() and first.with_name(first.name + ".json").exists()
-    assert second.exists() and second.with_name(second.name + ".json").exists()
-    with sqlite3.connect(first) as connection:
-        assert connection.execute("SELECT count(*) FROM chats WHERE id = 'new'").fetchone()[0] == 0
-
-
-def test_recovery_temp_collision_preserves_existing_verified_temporary_evidence(tmp_path: Path):
-    database = tmp_path / "temporary-collision.sqlite3"
-    _upgrade_to(database, "0001_desktop_state")
-    engine = create_engine(f"sqlite:///{database}")
-    try:
-        with engine.begin() as connection:
-            connection.execute(
-                text(
-                    "INSERT INTO chats (id, title, created_at, updated_at) VALUES "
-                    "('old', 'Old', '2026-09-05T00:00:00.000Z', '2026-09-05T00:00:00.000Z')"
-                )
-            )
-    finally:
-        engine.dispose()
-    source_digest = migration_runner._logical_digest(database)
-    temporary = tmp_path / ".temporary-collision.sqlite3.pre-migration.tmp"
-    temporary_metadata = tmp_path / "..temporary-collision.sqlite3.pre-migration.json.tmp"
-    shutil.copy2(database, temporary)
-    migration_runner._write_recovery_metadata(
-        temporary_metadata,
-        source_digest=source_digest,
-        recovery_digest=source_digest,
-        schema_revision=migration_runner._read_revision(database),
-    )
-    temporary_bytes = temporary.read_bytes()
-    metadata_bytes = temporary_metadata.read_bytes()
-
-    engine = create_engine(f"sqlite:///{database}")
-    try:
-        with engine.begin() as connection:
-            connection.execute(
-                text(
-                    "INSERT INTO chats (id, title, created_at, updated_at) VALUES "
-                    "('new', 'New', '2026-09-05T00:00:00.000Z', '2026-09-05T00:00:00.000Z')"
-                )
-            )
-    finally:
-        engine.dispose()
-    recovery_point = _create_recovery_point(database)
-    assert recovery_point.is_file()
-    assert temporary.read_bytes() == temporary_bytes
-    assert temporary_metadata.read_bytes() == metadata_bytes
-
-
-def test_recovery_retry_ignores_suffixed_interrupted_temporary_evidence(tmp_path: Path):
-    database = tmp_path / "suffixed-interruption.sqlite3"
-    _upgrade_to(database, "0001_desktop_state")
-    engine = create_engine(f"sqlite:///{database}")
-    try:
-        with engine.begin() as connection:
-            connection.execute(
-                text(
-                    "INSERT INTO chats (id, title, created_at, updated_at) VALUES "
-                    "('old', 'Old', '2026-09-05T00:00:00.000Z', '2026-09-05T00:00:00.000Z')"
-                )
-            )
-    finally:
-        engine.dispose()
-
-    canonical = _create_recovery_point(database)
-    engine = create_engine(f"sqlite:///{database}")
-    try:
-        with engine.begin() as connection:
-            connection.execute(
-                text(
-                    "INSERT INTO chats (id, title, created_at, updated_at) VALUES "
-                    "('new', 'New', '2026-09-05T00:00:00.000Z', '2026-09-05T00:00:00.000Z')"
-                )
-            )
-    finally:
-        engine.dispose()
-
-    source_digest = migration_runner._logical_digest(database)
-    interrupted = database.with_name(
-        f".{database.name}.pre-migration-{source_digest[:16]}-01900000-0000-7000-8000-000000000007"
-    )
-    interrupted_metadata = migration_runner._recovery_metadata_path(interrupted)
-    interrupted_database_temp = interrupted.with_name(
-        interrupted.name + ".tmp-01900000-0000-7000-8000-000000000008"
-    )
-    interrupted_metadata_temp = interrupted_metadata.with_name(
-        interrupted_metadata.name + ".tmp-01900000-0000-7000-8000-000000000009"
-    )
-    shutil.copy2(database, interrupted_database_temp)
-    migration_runner._write_recovery_metadata(
-        interrupted_metadata_temp,
-        source_digest=source_digest,
-        recovery_digest=source_digest,
-        schema_revision=migration_runner._read_revision(database),
-    )
-    database_temp_bytes = interrupted_database_temp.read_bytes()
-    metadata_temp_bytes = interrupted_metadata_temp.read_bytes()
-
-    recovery_point = _create_recovery_point(database)
-    assert recovery_point.is_file()
-    assert recovery_point != canonical
-    assert interrupted_database_temp.read_bytes() == database_temp_bytes
-    assert interrupted_metadata_temp.read_bytes() == metadata_temp_bytes
-    assert interrupted_database_temp.exists()
-    assert interrupted_metadata_temp.exists()

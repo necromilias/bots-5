@@ -36,6 +36,11 @@ class GenerationRequest(BaseModel):
     manual_overrides: dict[str, object] | None = None
     omitted_settings: dict[str, str] | None = None
     timeout_seconds: float | None = None
+    # Phase 6: already-built adapter-owned request material.  Providers must
+    # use this verbatim; the field is optional for Phase 1-5 compatibility.
+    system_prompt: str | None = None
+    wire_representation: bytes | None = None
+    context_plan_digest: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
