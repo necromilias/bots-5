@@ -47,7 +47,19 @@ The existing CLI, runner, filesystem campaign persistence, manifest semantics, a
 `Provider.complete()` seam remain preserved. Later Linux v0.1 phases remain future work and are not
 advanced by this candidate.
 
-For opt-in local Phase 3 desktop testing, supply the backend, endpoint, and model explicitly:
+The current uncommitted Phase 6 durability candidate also implements one
+data-root authority/effect-grant protocol across public application commands,
+direct and inherited SQLite store calls, EventBus delivery, attachment and GC
+effects, startup/migration/recovery, native VFS outcome handoff, and terminal
+teardown.  Invalidation closes new admission immediately, revokes the
+discovering grant, and publishes the terminal state only after unrelated
+admitted grants, already-issued deliveries, and owned database resources
+settle.  See `docs/UNIFIED_AUTHORITY_EFFECT_INVENTORY.md`; this is technical
+candidate evidence, not Phase 6 acceptance or closure.
+
+For opt-in local Phase 3 desktop testing, supply the backend, endpoint, and model explicitly. This
+`local_openai` route is an explicit Phase 3 legacy compatibility mode: it is Phase 6 disabled, makes
+no Phase 6 planning/accounting/provenance claim, and does not permit selecting attachments.
 
 ```bash
 bots5-desktop --backend local_openai \

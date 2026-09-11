@@ -5,8 +5,10 @@
 #include <fcntl.h>
 #include <linux/openat2.h>
 #include <linux/stat.h>
+#include <limits.h>
 #include <pthread.h>
 #include <sqlite3.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +43,35 @@
 #define BOTS5_CLOSE_RELEASED 1
 #define BOTS5_CLOSE_UNKNOWN 2
 
+#define BOTS5_FILE_OTHER 0
+#define BOTS5_FILE_MAIN 1
+#define BOTS5_FILE_MAIN_JOURNAL 2
+#define BOTS5_FILE_WAL 3
+#define BOTS5_FILE_TEMP 4
+
+#define BOTS5_TRACE_MAIN_WRITE 1
+#define BOTS5_TRACE_MAIN_SYNC 2
+#define BOTS5_TRACE_JOURNAL_SYNC 3
+#define BOTS5_TRACE_WAL_SYNC 4
+#define BOTS5_TRACE_CREATE_PARENT_SYNC 5
+#define BOTS5_TRACE_JOURNAL_DELETE 6
+#define BOTS5_TRACE_WAL_DELETE 7
+#define BOTS5_TRACE_DELETE_PARENT_SYNC 8
+#define BOTS5_TRACE_DELETE_PROOF_CLOSE 9
+#define BOTS5_TRACE_JOURNAL_OPEN_CREATE 10
+#define BOTS5_TRACE_WAL_OPEN_CREATE 11
+#define BOTS5_TRACE_INVALID_SYNC 12
+#define BOTS5_TRACE_CAPACITY 256
+
+#define BOTS5_CLEANUP_XOPEN_REJECT 1
+#define BOTS5_CLEANUP_XDELETE_REJECT 2
+#define BOTS5_CLEANUP_AUXILIARY 3
+#define BOTS5_CLEANUP_TEMP 4
+#define BOTS5_CLEANUP_XDELETE_PROOF 5
+#define BOTS5_CLEANUP_REGISTER_DB_DIR 6
+#define BOTS5_CLEANUP_REGISTER_MAIN 7
+#define BOTS5_CLEANUP_REGISTER_TEMP 8
+
 typedef struct BotsVfs BotsVfs;
 
 typedef struct BotsFile {
@@ -50,6 +81,9 @@ typedef struct BotsFile {
     int lock_level;
     int delete_on_close;
     int is_main;
+    int file_class;
+    int open_flags;
+    int needs_parent_sync;
     void *shm;
     size_t shm_size;
     struct BotsFile *next_open;
@@ -73,6 +107,13 @@ struct BotsVfs {
     int registered;
     int test_close_fault_slot;
     int test_close_fault_mode;
+    int test_io_fault_event;
+    int test_cleanup_close_site;
+    int test_cleanup_close_mode;
+    int test_last_cleanup_fd;
+    int trace[BOTS5_TRACE_CAPACITY];
+    int trace_count;
+    atomic_uint unknown_close_generation;
     BotsFile *files;
     pthread_mutex_t mutex;
     BotsVfs *next;
@@ -81,6 +122,17 @@ struct BotsVfs {
 static BotsVfs *g_vfs_list = NULL;
 static pthread_mutex_t g_vfs_mutex = PTHREAD_MUTEX_INITIALIZER;
 static _Thread_local char g_error[256];
+#define BOTS5_THREAD_VFS_SLOTS 64
+#define BOTS5_VFS_NAME_CAPACITY 64
+typedef struct ThreadUnknownClose {
+    char name[BOTS5_VFS_NAME_CAPACITY];
+    unsigned int generation;
+} ThreadUnknownClose;
+static _Thread_local ThreadUnknownClose
+    g_thread_unknown_close[BOTS5_THREAD_VFS_SLOTS];
+static _Thread_local unsigned int g_thread_unknown_close_next = 0U;
+static int g_test_registration_cleanup_slot = 0;
+static int g_test_registration_cleanup_mode = 0;
 
 static int set_error(const char *message) {
     snprintf(g_error, sizeof(g_error), "%s", message ? message : "native helper failure");
@@ -99,6 +151,74 @@ int bots5_runtime_sqlite_matches(void) {
 
 static int owner_ok(BotsVfs *vfs) {
     return vfs != NULL && vfs->owner_pid == getpid();
+}
+
+static int cleanup_fault_armed(BotsVfs *vfs, int site) {
+    return vfs != NULL && vfs->test_cleanup_close_site == site;
+}
+
+static void record_unknown_close(BotsVfs *vfs) {
+    if (vfs != NULL) {
+        unsigned int i;
+        ThreadUnknownClose *entry = NULL;
+        (void)atomic_fetch_add_explicit(
+            &vfs->unknown_close_generation, 1U, memory_order_release
+        );
+        for (i = 0U; i < BOTS5_THREAD_VFS_SLOTS; i++) {
+            if (g_thread_unknown_close[i].name[0] != '\0' &&
+                strcmp(g_thread_unknown_close[i].name, vfs->name) == 0) {
+                entry = &g_thread_unknown_close[i];
+                break;
+            }
+        }
+        if (entry == NULL) {
+            entry = &g_thread_unknown_close[
+                g_thread_unknown_close_next++ % BOTS5_THREAD_VFS_SLOTS
+            ];
+            (void)snprintf(entry->name, sizeof(entry->name), "%s", vfs->name);
+            entry->generation = 0U;
+        }
+        entry->generation++;
+    }
+}
+
+static int close_untracked_fd(BotsVfs *vfs, int *owned_fd, int site) {
+    int fd;
+    int mode = 0;
+    int result;
+    if (owned_fd == NULL || *owned_fd < 0) return 0;
+    fd = *owned_fd;
+    *owned_fd = -1;
+    if (vfs != NULL) vfs->test_last_cleanup_fd = fd;
+    if (cleanup_fault_armed(vfs, site)) {
+        mode = vfs->test_cleanup_close_mode;
+        vfs->test_cleanup_close_site = 0;
+        vfs->test_cleanup_close_mode = 0;
+    } else if (vfs != NULL && site == BOTS5_CLEANUP_XDELETE_PROOF &&
+               vfs->test_io_fault_event == BOTS5_TRACE_DELETE_PROOF_CLOSE) {
+        mode = 1;
+    }
+    if (mode == 1) {
+        record_unknown_close(vfs);
+        errno = EIO;
+        return -1;
+    }
+    result = close(fd);
+    if (mode == 2) {
+        record_unknown_close(vfs);
+        errno = EINTR;
+        return -1;
+    }
+    if (result != 0) record_unknown_close(vfs);
+    return result;
+}
+
+static void trace_event(BotsVfs *vfs, int event) {
+    if (vfs == NULL || event == 0) return;
+    pthread_mutex_lock(&vfs->mutex);
+    if (vfs->trace_count < BOTS5_TRACE_CAPACITY)
+        vfs->trace[vfs->trace_count++] = event;
+    pthread_mutex_unlock(&vfs->mutex);
 }
 
 static int component_ok(const char *name) {
@@ -171,6 +291,20 @@ int bots5_open_component(int parent_fd, const char *name, int flags,
     return fd;
 }
 
+int bots5_open_fresh_directory(int retained_fd) {
+    struct open_how how;
+    int fd;
+    memset(&how, 0, sizeof(how));
+    how.flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC;
+    how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS |
+                  RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV;
+    fd = (int)syscall(SYS_openat2, retained_fd, ".", &how, sizeof(how));
+    if (fd < 0) {
+        snprintf(g_error, sizeof(g_error), "openat2(.): %s", strerror(errno));
+    }
+    return fd;
+}
+
 int bots5_renameat2(int old_fd, const char *old_name, int new_fd,
                     const char *new_name, unsigned int flags) {
     if (!component_ok(old_name) || !component_ok(new_name)) {
@@ -233,6 +367,23 @@ static int bots_close(sqlite3_file *file) {
     BotsFile *f = (BotsFile *)file;
     BotsVfs *vfs = f->owner;
     int result = SQLITE_OK;
+    if (f->shm != NULL && f->shm_size != 0) {
+        if (munmap(f->shm, f->shm_size) != 0) result = SQLITE_IOERR_SHMMAP;
+        f->shm = NULL;
+        f->shm_size = 0;
+    }
+    if (f->fd >= 0) {
+        int fd = f->fd;
+        f->fd = -1;
+        (void)ofd_lock(fd, F_UNLCK, BOTS5_PENDING_BYTE, BOTS5_SHARED_SIZE + 2);
+        if (close(fd) != 0) {
+            result = SQLITE_IOERR_CLOSE;
+            record_unknown_close(vfs);
+        }
+    }
+    /* Keep the VFS visibly busy until every consequential close outcome has
+       been classified.  unregister therefore cannot free vfs while xClose
+       still needs to record an UNKNOWN result. */
     if (vfs != NULL) {
         BotsFile **cursor;
         pthread_mutex_lock(&vfs->mutex);
@@ -243,17 +394,6 @@ static int bots_close(sqlite3_file *file) {
         pthread_mutex_unlock(&vfs->mutex);
         f->owner = NULL;
         f->next_open = NULL;
-    }
-    if (f->shm != NULL && f->shm_size != 0) {
-        if (munmap(f->shm, f->shm_size) != 0) result = SQLITE_IOERR_SHMMAP;
-        f->shm = NULL;
-        f->shm_size = 0;
-    }
-    if (f->fd >= 0) {
-        int fd = f->fd;
-        f->fd = -1;
-        (void)ofd_lock(fd, F_UNLCK, BOTS5_PENDING_BYTE, BOTS5_SHARED_SIZE + 2);
-        if (close(fd) != 0) result = SQLITE_IOERR_CLOSE;
     }
     memset(file, 0, sizeof(BotsFile));
     return result;
@@ -280,6 +420,8 @@ static int bots_write(sqlite3_file *file, const void *buffer, int amount, sqlite
     BotsFile *f = (BotsFile *)file;
     ssize_t total = 0;
     if (!owner_ok(f->owner) || f->fd < 0) return SQLITE_IOERR_WRITE;
+    if (f->file_class == BOTS5_FILE_MAIN)
+        trace_event(f->owner, BOTS5_TRACE_MAIN_WRITE);
     while (total < amount) {
         ssize_t wrote = pwrite(f->fd, (const char *)buffer + total,
                                (size_t)(amount - total), offset + total);
@@ -299,10 +441,30 @@ static int bots_truncate(sqlite3_file *file, sqlite3_int64 size) {
 static int bots_sync(sqlite3_file *file, int flags) {
     BotsFile *f = (BotsFile *)file;
     int rc;
-    (void)flags;
     if (!owner_ok(f->owner) || f->fd < 0) return SQLITE_IOERR_FSYNC;
+    if (flags != SQLITE_SYNC_NORMAL && flags != SQLITE_SYNC_FULL &&
+        flags != (SQLITE_SYNC_NORMAL | SQLITE_SYNC_DATAONLY) &&
+        flags != (SQLITE_SYNC_FULL | SQLITE_SYNC_DATAONLY)) {
+        trace_event(f->owner, BOTS5_TRACE_INVALID_SYNC);
+        return SQLITE_IOERR_FSYNC;
+    }
     do { rc = fsync(f->fd); } while (rc != 0 && errno == EINTR);
-    return rc == 0 ? SQLITE_OK : SQLITE_IOERR_FSYNC;
+    if (rc != 0) return SQLITE_IOERR_FSYNC;
+    trace_event(
+        f->owner,
+        f->file_class == BOTS5_FILE_MAIN ? BOTS5_TRACE_MAIN_SYNC :
+        f->file_class == BOTS5_FILE_MAIN_JOURNAL ? BOTS5_TRACE_JOURNAL_SYNC :
+        f->file_class == BOTS5_FILE_WAL ? BOTS5_TRACE_WAL_SYNC : 0
+    );
+    if (f->needs_parent_sync) {
+        trace_event(f->owner, BOTS5_TRACE_CREATE_PARENT_SYNC);
+        if (f->owner->test_io_fault_event == BOTS5_TRACE_CREATE_PARENT_SYNC)
+            return SQLITE_IOERR_DIR_FSYNC;
+        do { rc = fsync(f->owner->db_dir_fd); } while (rc != 0 && errno == EINTR);
+        if (rc != 0) return SQLITE_IOERR_DIR_FSYNC;
+        f->needs_parent_sync = 0;
+    }
+    return SQLITE_OK;
 }
 
 static int bots_file_size(sqlite3_file *file, sqlite3_int64 *size) {
@@ -459,8 +621,9 @@ static int random_temp_fd(BotsVfs *vfs) {
 #ifdef O_TMPFILE
     fd = openat(vfs->temp_dir_fd, ".", O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
     if (fd >= 0) {
-        if (fchmod(fd, 0600) == 0) return fd;
-        close(fd);
+        if (!cleanup_fault_armed(vfs, BOTS5_CLEANUP_TEMP) &&
+            fchmod(fd, 0600) == 0) return fd;
+        (void)close_untracked_fd(vfs, &fd, BOTS5_CLEANUP_TEMP);
         return -1;
     }
 #endif
@@ -475,8 +638,16 @@ static int random_temp_fd(BotsVfs *vfs) {
         fd = openat(vfs->temp_dir_fd, name,
                     O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
         if (fd >= 0) {
-            if (fchmod(fd, 0600) != 0) { close(fd); return -1; }
-            if (unlinkat(vfs->temp_dir_fd, name, 0) != 0) { close(fd); return -1; }
+            if (cleanup_fault_armed(vfs, BOTS5_CLEANUP_TEMP) ||
+                fchmod(fd, 0600) != 0) {
+                (void)close_untracked_fd(vfs, &fd, BOTS5_CLEANUP_TEMP);
+                (void)unlinkat(vfs->temp_dir_fd, name, 0);
+                return -1;
+            }
+            if (unlinkat(vfs->temp_dir_fd, name, 0) != 0) {
+                (void)close_untracked_fd(vfs, &fd, BOTS5_CLEANUP_TEMP);
+                return -1;
+            }
             return fd;
         }
         if (errno != EEXIST) return -1;
@@ -493,8 +664,10 @@ static int open_auxiliary(BotsVfs *vfs, const char *leaf) {
     fd = openat(vfs->db_dir_fd, leaf,
                 O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd >= 0) created = 1;
-    if (fd >= 0 && fchmod(fd, 0600) != 0) {
-        close(fd);
+    if (fd >= 0 &&
+        (cleanup_fault_armed(vfs, BOTS5_CLEANUP_AUXILIARY) ||
+         fchmod(fd, 0600) != 0)) {
+        (void)close_untracked_fd(vfs, &fd, BOTS5_CLEANUP_AUXILIARY);
         if (created) (void)unlinkat(vfs->db_dir_fd, leaf, 0);
         return -1;
     }
@@ -532,8 +705,13 @@ static int bots_xopen(sqlite3_vfs *base, const char *name, sqlite3_file *file,
                      vfs->main_claim_fd) >= (int)sizeof(capability))
             return SQLITE_CANTOPEN;
         fd = open(capability, O_RDWR | O_CLOEXEC);
-        if (fd < 0 || !same_file(fd, vfs->main_claim_fd) || validate_regular(vfs, fd, 0600) != 0) {
-            if (fd >= 0) close(fd);
+        if (fd < 0 || cleanup_fault_armed(vfs, BOTS5_CLEANUP_XOPEN_REJECT) ||
+            !same_file(fd, vfs->main_claim_fd) ||
+            validate_regular(vfs, fd, 0600) != 0) {
+            if (fd >= 0)
+                (void)close_untracked_fd(
+                    vfs, &fd, BOTS5_CLEANUP_XOPEN_REJECT
+                );
             return SQLITE_CANTOPEN;
         }
     } else if (is_journal) {
@@ -542,7 +720,10 @@ static int bots_xopen(sqlite3_vfs *base, const char *name, sqlite3_file *file,
             return SQLITE_CANTOPEN;
         fd = open_auxiliary(vfs, vfs->journal_leaf);
         if (fd < 0 || validate_regular(vfs, fd, 0600) != 0) {
-            if (fd >= 0) close(fd);
+            if (fd >= 0)
+                (void)close_untracked_fd(
+                    vfs, &fd, BOTS5_CLEANUP_XOPEN_REJECT
+                );
             return SQLITE_CANTOPEN;
         }
     } else if (is_wal && vfs->intake_wal) {
@@ -556,13 +737,19 @@ static int bots_xopen(sqlite3_vfs *base, const char *name, sqlite3_file *file,
         fd = open_auxiliary(vfs, leaf);
         sqlite3_free(leaf);
         if (fd < 0 || validate_regular(vfs, fd, 0600) != 0) {
-            if (fd >= 0) close(fd);
+            if (fd >= 0)
+                (void)close_untracked_fd(
+                    vfs, &fd, BOTS5_CLEANUP_XOPEN_REJECT
+                );
             return SQLITE_CANTOPEN;
         }
     } else if (is_temp && name == NULL && (flags & SQLITE_OPEN_DELETEONCLOSE)) {
         fd = random_temp_fd(vfs);
         if (fd < 0 || validate_regular(vfs, fd, 0600) != 0) {
-            if (fd >= 0) close(fd);
+            if (fd >= 0)
+                (void)close_untracked_fd(
+                    vfs, &fd, BOTS5_CLEANUP_XOPEN_REJECT
+                );
             return SQLITE_CANTOPEN;
         }
         f->delete_on_close = 1;
@@ -574,11 +761,24 @@ static int bots_xopen(sqlite3_vfs *base, const char *name, sqlite3_file *file,
     f->fd = fd;
     f->lock_level = SQLITE_LOCK_NONE;
     f->is_main = is_main;
+    f->file_class = is_main ? BOTS5_FILE_MAIN :
+                    is_journal ? BOTS5_FILE_MAIN_JOURNAL :
+                    is_wal ? BOTS5_FILE_WAL :
+                    is_temp ? BOTS5_FILE_TEMP : BOTS5_FILE_OTHER;
+    f->open_flags = flags;
+    f->needs_parent_sync =
+        (flags & SQLITE_OPEN_CREATE) != 0 && (is_journal || is_wal);
     pthread_mutex_lock(&vfs->mutex);
     f->next_open = vfs->files;
     vfs->files = f;
     vfs->open_count++;
     pthread_mutex_unlock(&vfs->mutex);
+    if (f->needs_parent_sync)
+        trace_event(
+            vfs,
+            is_journal ? BOTS5_TRACE_JOURNAL_OPEN_CREATE :
+            BOTS5_TRACE_WAL_OPEN_CREATE
+        );
     if (out_flags) *out_flags = flags;
     return SQLITE_OK;
 }
@@ -613,6 +813,9 @@ static int bots_xdelete(sqlite3_vfs *base, const char *name, int sync_dir) {
     char *leaf;
     int fd;
     struct stat opened, named;
+    int close_failed = 0;
+    int sync_failed = 0;
+    (void)sync_dir;
     if (!owner_ok(vfs)) return SQLITE_IOERR_DELETE;
     leaf = physical_aux_leaf(vfs, name);
     if (leaf == NULL) return SQLITE_IOERR_DELETE;
@@ -620,24 +823,45 @@ static int bots_xdelete(sqlite3_vfs *base, const char *name, int sync_dir) {
                 O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0 && errno == ENOENT) {
         sqlite3_free(leaf);
-        return SQLITE_OK;
+        trace_event(vfs, BOTS5_TRACE_DELETE_PARENT_SYNC);
+        if (vfs->test_io_fault_event == BOTS5_TRACE_DELETE_PARENT_SYNC)
+            return SQLITE_IOERR_DIR_FSYNC;
+        do { fd = fsync(vfs->db_dir_fd); } while (fd != 0 && errno == EINTR);
+        return fd == 0 ? SQLITE_OK : SQLITE_IOERR_DIR_FSYNC;
     }
-    if (fd < 0 || validate_regular(vfs, fd, 0600) != 0 ||
+    if (fd < 0 || cleanup_fault_armed(vfs, BOTS5_CLEANUP_XDELETE_REJECT) ||
+        validate_regular(vfs, fd, 0600) != 0 ||
         fstat(fd, &opened) != 0 ||
         fstatat(vfs->db_dir_fd, leaf, &named, AT_SYMLINK_NOFOLLOW) != 0 ||
         opened.st_dev != named.st_dev || opened.st_ino != named.st_ino) {
-        if (fd >= 0) close(fd);
+        if (fd >= 0)
+            (void)close_untracked_fd(
+                vfs, &fd, BOTS5_CLEANUP_XDELETE_REJECT
+            );
         sqlite3_free(leaf);
         return SQLITE_IOERR_DELETE;
     }
     if (unlinkat(vfs->db_dir_fd, leaf, 0) != 0) {
-        close(fd);
+        (void)close_untracked_fd(vfs, &fd, BOTS5_CLEANUP_XDELETE_REJECT);
         sqlite3_free(leaf);
         return SQLITE_IOERR_DELETE;
     }
-    close(fd);
+    trace_event(vfs, journal_name(vfs, name) ? BOTS5_TRACE_JOURNAL_DELETE :
+                                            BOTS5_TRACE_WAL_DELETE);
+    trace_event(vfs, BOTS5_TRACE_DELETE_PROOF_CLOSE);
+    if (close_untracked_fd(vfs, &fd, BOTS5_CLEANUP_XDELETE_PROOF) != 0) {
+        close_failed = 1;
+    }
     sqlite3_free(leaf);
-    if (sync_dir && fsync(vfs->db_dir_fd) != 0) return SQLITE_IOERR_DIR_FSYNC;
+    trace_event(vfs, BOTS5_TRACE_DELETE_PARENT_SYNC);
+    if (vfs->test_io_fault_event == BOTS5_TRACE_DELETE_PARENT_SYNC)
+        sync_failed = 1;
+    else {
+    do { fd = fsync(vfs->db_dir_fd); } while (fd != 0 && errno == EINTR);
+    if (fd != 0) sync_failed = 1;
+    }
+    if (sync_failed) return SQLITE_IOERR_DIR_FSYNC;
+    if (close_failed) return SQLITE_IOERR_CLOSE;
     return SQLITE_OK;
 }
 
@@ -696,6 +920,167 @@ static BotsVfs *find_vfs(const char *name) {
     return NULL;
 }
 
+int bots5_vfs_test_reset_trace(const char *name) {
+    BotsVfs *vfs;
+    pthread_mutex_lock(&g_vfs_mutex);
+    vfs = find_vfs(name);
+    if (vfs == NULL || !owner_ok(vfs)) {
+        pthread_mutex_unlock(&g_vfs_mutex);
+        return set_error("unknown rooted VFS for trace reset");
+    }
+    pthread_mutex_lock(&vfs->mutex);
+    vfs->trace_count = 0;
+    vfs->test_io_fault_event = 0;
+    pthread_mutex_unlock(&vfs->mutex);
+    pthread_mutex_unlock(&g_vfs_mutex);
+    return 0;
+}
+
+int bots5_vfs_test_trace(const char *name, int *events, int capacity) {
+    BotsVfs *vfs;
+    int count;
+    if (events == NULL || capacity < 0)
+        return set_error("invalid rooted VFS trace buffer");
+    pthread_mutex_lock(&g_vfs_mutex);
+    vfs = find_vfs(name);
+    if (vfs == NULL || !owner_ok(vfs)) {
+        pthread_mutex_unlock(&g_vfs_mutex);
+        return set_error("unknown rooted VFS for trace read");
+    }
+    pthread_mutex_lock(&vfs->mutex);
+    count = vfs->trace_count < capacity ? vfs->trace_count : capacity;
+    if (count > 0) memcpy(events, vfs->trace, (size_t)count * sizeof(int));
+    pthread_mutex_unlock(&vfs->mutex);
+    pthread_mutex_unlock(&g_vfs_mutex);
+    return count;
+}
+
+int bots5_vfs_test_inject_io_fault(const char *name, int event) {
+    BotsVfs *vfs;
+    if (event != 0 && event != BOTS5_TRACE_CREATE_PARENT_SYNC &&
+        event != BOTS5_TRACE_DELETE_PARENT_SYNC &&
+        event != BOTS5_TRACE_DELETE_PROOF_CLOSE)
+        return set_error("invalid rooted VFS I/O fault");
+    pthread_mutex_lock(&g_vfs_mutex);
+    vfs = find_vfs(name);
+    if (vfs == NULL || !owner_ok(vfs)) {
+        pthread_mutex_unlock(&g_vfs_mutex);
+        return set_error("unknown rooted VFS for I/O fault");
+    }
+    vfs->test_io_fault_event = event;
+    pthread_mutex_unlock(&g_vfs_mutex);
+    return 0;
+}
+
+int bots5_vfs_test_delete_journal(const char *name) {
+    BotsVfs *vfs;
+    char *synthetic_journal;
+    int result;
+    pthread_mutex_lock(&g_vfs_mutex);
+    vfs = find_vfs(name);
+    if (vfs == NULL || !owner_ok(vfs)) {
+        pthread_mutex_unlock(&g_vfs_mutex);
+        return set_error("unknown rooted VFS for journal delete");
+    }
+    synthetic_journal = sqlite3_mprintf("%s-journal", vfs->synthetic);
+    pthread_mutex_unlock(&g_vfs_mutex);
+    if (synthetic_journal == NULL) return SQLITE_NOMEM;
+    result = bots_xdelete(&vfs->base, synthetic_journal, 0);
+    sqlite3_free(synthetic_journal);
+    return result;
+}
+
+int bots5_vfs_test_inject_untracked_close_fault(const char *name, int site,
+                                                 int mode) {
+    BotsVfs *vfs;
+    if (site < BOTS5_CLEANUP_XOPEN_REJECT || site > BOTS5_CLEANUP_TEMP ||
+        mode < 1 || mode > 2)
+        return set_error("invalid untracked-close fault");
+    pthread_mutex_lock(&g_vfs_mutex);
+    vfs = find_vfs(name);
+    if (vfs == NULL || !owner_ok(vfs)) {
+        pthread_mutex_unlock(&g_vfs_mutex);
+        return set_error("unknown rooted VFS for untracked-close fault");
+    }
+    vfs->test_cleanup_close_site = site;
+    vfs->test_cleanup_close_mode = mode;
+    pthread_mutex_unlock(&g_vfs_mutex);
+    return 0;
+}
+
+int bots5_vfs_test_last_untracked_fd(const char *name) {
+    BotsVfs *vfs;
+    int fd;
+    pthread_mutex_lock(&g_vfs_mutex);
+    vfs = find_vfs(name);
+    if (vfs == NULL || !owner_ok(vfs)) {
+        pthread_mutex_unlock(&g_vfs_mutex);
+        return set_error("unknown rooted VFS for last untracked descriptor");
+    }
+    fd = vfs->test_last_cleanup_fd;
+    pthread_mutex_unlock(&g_vfs_mutex);
+    if (fd < 0) return set_error("no untracked descriptor has been closed");
+    return fd;
+}
+
+int bots5_vfs_test_open_cleanup_path(const char *name, int site) {
+    BotsVfs *vfs;
+    BotsFile file;
+    char *opened_name = NULL;
+    int flags;
+    int result;
+    pthread_mutex_lock(&g_vfs_mutex);
+    vfs = find_vfs(name);
+    if (vfs == NULL || !owner_ok(vfs)) {
+        pthread_mutex_unlock(&g_vfs_mutex);
+        return set_error("unknown rooted VFS for cleanup-path open");
+    }
+    if (site == BOTS5_CLEANUP_XOPEN_REJECT) {
+        opened_name = sqlite3_mprintf("%s", vfs->synthetic);
+        flags = SQLITE_OPEN_MAIN_DB | SQLITE_OPEN_READWRITE;
+    } else if (site == BOTS5_CLEANUP_AUXILIARY) {
+        opened_name = sqlite3_mprintf("%s-journal", vfs->synthetic);
+        flags = SQLITE_OPEN_MAIN_JOURNAL | SQLITE_OPEN_READWRITE |
+                SQLITE_OPEN_CREATE;
+    } else if (site == BOTS5_CLEANUP_TEMP) {
+        flags = SQLITE_OPEN_TEMP_DB | SQLITE_OPEN_READWRITE |
+                SQLITE_OPEN_CREATE | SQLITE_OPEN_DELETEONCLOSE;
+    } else {
+        pthread_mutex_unlock(&g_vfs_mutex);
+        return set_error("unsupported cleanup-path open");
+    }
+    pthread_mutex_unlock(&g_vfs_mutex);
+    if (site != BOTS5_CLEANUP_TEMP && opened_name == NULL)
+        return SQLITE_NOMEM;
+    result = bots_xopen(
+        &vfs->base,
+        opened_name,
+        (sqlite3_file *)&file,
+        flags,
+        NULL
+    );
+    sqlite3_free(opened_name);
+    if (result == SQLITE_OK) {
+        (void)bots_close((sqlite3_file *)&file);
+        return set_error("cleanup-path open unexpectedly succeeded");
+    }
+    return result;
+}
+
+int bots5_vfs_test_inject_registration_cleanup_fault(int slot, int mode) {
+    if (slot < 1 || slot > 3 || mode < 1 || mode > 2)
+        return set_error("invalid registration-cleanup fault");
+    pthread_mutex_lock(&g_vfs_mutex);
+    if (g_test_registration_cleanup_slot != 0) {
+        pthread_mutex_unlock(&g_vfs_mutex);
+        return set_error("registration-cleanup fault is already armed");
+    }
+    g_test_registration_cleanup_slot = slot;
+    g_test_registration_cleanup_mode = mode;
+    pthread_mutex_unlock(&g_vfs_mutex);
+    return 0;
+}
+
 int bots5_vfs_register(const char *name, const char *synthetic,
                        int db_dir_fd, int main_claim_fd, int temp_dir_fd,
                        const char *main_leaf, const char *journal_leaf,
@@ -703,6 +1088,9 @@ int bots5_vfs_register(const char *name, const char *synthetic,
                        int intake_wal) {
     BotsVfs *vfs;
     sqlite3_vfs *delegate;
+    int force_cleanup_unwind = 0;
+    int mutex_initialized = 0;
+    int cleanup_unknown = 0;
     if (!component_ok(name) || !component_ok(synthetic) ||
         !component_ok(main_leaf) || !component_ok(journal_leaf))
         return set_error("invalid rooted VFS name");
@@ -716,6 +1104,21 @@ int bots5_vfs_register(const char *name, const char *synthetic,
     }
     vfs = calloc(1, sizeof(*vfs));
     if (vfs == NULL) { pthread_mutex_unlock(&g_vfs_mutex); return set_error("out of memory"); }
+    vfs->db_dir_fd = -1;
+    vfs->main_claim_fd = -1;
+    vfs->temp_dir_fd = -1;
+    vfs->test_last_cleanup_fd = -1;
+    atomic_init(&vfs->unknown_close_generation, 0U);
+    vfs->owner_pid = owner_pid;
+    if (g_test_registration_cleanup_slot != 0) {
+        vfs->test_cleanup_close_site =
+            BOTS5_CLEANUP_REGISTER_DB_DIR +
+            (g_test_registration_cleanup_slot - 1);
+        vfs->test_cleanup_close_mode = g_test_registration_cleanup_mode;
+        g_test_registration_cleanup_slot = 0;
+        g_test_registration_cleanup_mode = 0;
+        force_cleanup_unwind = 1;
+    }
     vfs->name = strdup(name);
     vfs->synthetic = strdup(synthetic);
     vfs->main_leaf = strdup(main_leaf);
@@ -729,12 +1132,18 @@ int bots5_vfs_register(const char *name, const char *synthetic,
         set_error("cannot duplicate rooted VFS capabilities");
         goto fail;
     }
+    if (force_cleanup_unwind) {
+        pthread_mutex_unlock(&g_vfs_mutex);
+        set_error("injected rooted VFS registration unwind");
+        goto fail;
+    }
     vfs->delegate = delegate;
     vfs->mount_id = mount_id;
     vfs->euid = geteuid();
     vfs->owner_pid = owner_pid;
     vfs->intake_wal = intake_wal != 0;
     pthread_mutex_init(&vfs->mutex, NULL);
+    mutex_initialized = 1;
     vfs->base.iVersion = 3;
     vfs->base.szOsFile = sizeof(BotsFile);
     vfs->base.mxPathname = 255;
@@ -768,10 +1177,24 @@ int bots5_vfs_register(const char *name, const char *synthetic,
     return 0;
 fail:
     if (vfs) {
-        if (vfs->db_dir_fd >= 0) close(vfs->db_dir_fd);
-        if (vfs->main_claim_fd >= 0) close(vfs->main_claim_fd);
-        if (vfs->temp_dir_fd >= 0) close(vfs->temp_dir_fd);
+        (void)close_untracked_fd(
+            vfs, &vfs->db_dir_fd, BOTS5_CLEANUP_REGISTER_DB_DIR
+        );
+        (void)close_untracked_fd(
+            vfs, &vfs->main_claim_fd, BOTS5_CLEANUP_REGISTER_MAIN
+        );
+        (void)close_untracked_fd(
+            vfs, &vfs->temp_dir_fd, BOTS5_CLEANUP_REGISTER_TEMP
+        );
+        cleanup_unknown = atomic_load_explicit(
+            &vfs->unknown_close_generation, memory_order_acquire
+        ) != 0U;
+        if (mutex_initialized) pthread_mutex_destroy(&vfs->mutex);
         free(vfs->name); free(vfs->synthetic); free(vfs->main_leaf); free(vfs->journal_leaf); free(vfs);
+    }
+    if (cleanup_unknown) {
+        set_error("rooted VFS registration cleanup incomplete");
+        return -2;
     }
     return -1;
 }
@@ -788,6 +1211,46 @@ int bots5_vfs_open_count(const char *name) {
     }
     pthread_mutex_unlock(&g_vfs_mutex);
     return count;
+}
+
+unsigned int bots5_vfs_unknown_close_generation(const char *name) {
+    BotsVfs *vfs;
+    unsigned int generation = UINT_MAX;
+    pthread_mutex_lock(&g_vfs_mutex);
+    vfs = find_vfs(name);
+    if (vfs != NULL && owner_ok(vfs)) {
+        generation = atomic_load_explicit(
+            &vfs->unknown_close_generation, memory_order_acquire
+        );
+    }
+    pthread_mutex_unlock(&g_vfs_mutex);
+    if (generation == UINT_MAX) {
+        (void)set_error("unknown rooted VFS for close outcome");
+    }
+    return generation;
+}
+
+unsigned int bots5_vfs_thread_unknown_close_generation(const char *name) {
+    BotsVfs *vfs;
+    unsigned int generation = UINT_MAX;
+    unsigned int i;
+    pthread_mutex_lock(&g_vfs_mutex);
+    vfs = find_vfs(name);
+    if (vfs != NULL && owner_ok(vfs)) {
+        generation = 0U;
+        for (i = 0U; i < BOTS5_THREAD_VFS_SLOTS; i++) {
+            if (g_thread_unknown_close[i].name[0] != '\0' &&
+                strcmp(g_thread_unknown_close[i].name, name) == 0) {
+                generation = g_thread_unknown_close[i].generation;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_vfs_mutex);
+    if (generation == UINT_MAX) {
+        (void)set_error("unknown rooted VFS for thread close outcome");
+    }
+    return generation;
 }
 
 int bots5_vfs_test_private_fd(const char *name, int slot) {
@@ -836,18 +1299,21 @@ static int close_private_fd(BotsVfs *vfs, int fd, int slot) {
 }
 
 int bots5_vfs_unregister(const char *name, int *db_dir_status,
-                         int *main_claim_status, int *temp_dir_status) {
+                         int *main_claim_status, int *temp_dir_status,
+                         int *native_open_status) {
     BotsVfs **cursor;
     BotsVfs *vfs;
     int db_dir_fd;
     int main_claim_fd;
     int temp_dir_fd;
     int failed = 0;
-    if (db_dir_status == NULL || main_claim_status == NULL || temp_dir_status == NULL)
+    if (db_dir_status == NULL || main_claim_status == NULL ||
+        temp_dir_status == NULL || native_open_status == NULL)
         return set_error("rooted VFS close inventory is required");
     *db_dir_status = BOTS5_CLOSE_HELD;
     *main_claim_status = BOTS5_CLOSE_HELD;
     *temp_dir_status = BOTS5_CLOSE_HELD;
+    *native_open_status = BOTS5_CLOSE_HELD;
     pthread_mutex_lock(&g_vfs_mutex);
     cursor = &g_vfs_list;
     while (*cursor != NULL && strcmp((*cursor)->name, name) != 0) cursor = &(*cursor)->next;
@@ -891,16 +1357,25 @@ int bots5_vfs_unregister(const char *name, int *db_dir_status,
         *temp_dir_status = BOTS5_CLOSE_UNKNOWN;
         failed = 1;
     }
+    if (atomic_load_explicit(
+            &vfs->unknown_close_generation, memory_order_acquire
+        ) != 0U) {
+        *native_open_status = BOTS5_CLOSE_UNKNOWN;
+        failed = 1;
+    } else {
+        *native_open_status = BOTS5_CLOSE_RELEASED;
+    }
     pthread_mutex_destroy(&vfs->mutex);
     free(vfs->name); free(vfs->synthetic); free(vfs->main_leaf); free(vfs->journal_leaf); free(vfs);
     if (failed) {
         snprintf(
             g_error,
             sizeof(g_error),
-            "rooted VFS private close incomplete: database-directory=%s, main-claim=%s, temp-directory=%s",
+            "rooted VFS private close incomplete: database-directory=%s, main-claim=%s, temp-directory=%s, native-open-files=%s",
             *db_dir_status == BOTS5_CLOSE_RELEASED ? "RELEASED" : "UNKNOWN",
             *main_claim_status == BOTS5_CLOSE_RELEASED ? "RELEASED" : "UNKNOWN",
-            *temp_dir_status == BOTS5_CLOSE_RELEASED ? "RELEASED" : "UNKNOWN"
+            *temp_dir_status == BOTS5_CLOSE_RELEASED ? "RELEASED" : "UNKNOWN",
+            *native_open_status == BOTS5_CLOSE_RELEASED ? "RELEASED" : "UNKNOWN"
         );
         return -1;
     }

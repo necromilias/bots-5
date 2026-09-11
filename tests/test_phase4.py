@@ -18,7 +18,7 @@ from PySide6.QtWidgets import QApplication
 
 from bots5.bootstrap.desktop import build_runtime
 from bots5.core.application import BotsApplication
-from bots5.core.errors import StateError
+from bots5.core.errors import AuthorityError, StateError
 from bots5.core.events import EventBus
 from bots5.core.generation import (
     GenerationCompleted,
@@ -33,6 +33,7 @@ from bots5.domain.clock import SystemClock
 from bots5.domain.ids import Uuid7Factory
 from bots5.domain.models import AttemptState, ChatActivity
 from bots5.infrastructure.generation.fake import FakeStreamingBackend
+from bots5.infrastructure.data_root_authority import AuthorityState
 from tests._authority_test_support import (
     SQLiteAppStateStore,
     upgrade_database,
@@ -259,13 +260,14 @@ def test_phase4_migrates_legacy_same_chat_active_attempts_before_index(tmp_path)
         assert messages[1].state.value == "aborted"
         assert messages[1].content == "partial-one"
         assert attempts[1].state is AttemptState.RUNNING
-        with store.engine.connect() as connection:
-            indexes = connection.exec_driver_sql(
-                "PRAGMA index_list(generation_attempts)"
-            ).fetchall()
-            active = next(row for row in indexes if row[1] == "ux_generation_attempts_active_chat")
-            assert active[2] == 1
-            assert active[4] == 1
+        with store.command_admission():
+            with store.engine.connect() as connection:
+                indexes = connection.exec_driver_sql(
+                    "PRAGMA index_list(generation_attempts)"
+                ).fetchall()
+                active = next(row for row in indexes if row[1] == "ux_generation_attempts_active_chat")
+                assert active[2] == 1
+                assert active[4] == 1
     finally:
         store.close()
 
@@ -404,10 +406,11 @@ def test_phase4_workspace_state_and_malformed_rows_fall_back_safely(tmp_path):
             assert saved.geometry == (10, 20, 900, 700)
             assert (await application.list_workspace_windows())[0].selected_chat_id == chat.id
             database = tmp_path / "state.sqlite3"
-            with application._store.engine.begin() as connection:
-                connection.exec_driver_sql(
-                    "UPDATE workspace_windows SET geometry_json = '{broken' WHERE window_id = 'window-a'"
-                )
+            with application._store.command_admission():
+                with application._store.engine.begin() as connection:
+                    connection.exec_driver_sql(
+                        "UPDATE workspace_windows SET geometry_json = '{broken' WHERE window_id = 'window-a'"
+                    )
             assert await application.list_workspace_windows() == ()
         finally:
             await application.close()
@@ -611,6 +614,8 @@ def test_phase4_immediate_restart_restores_two_production_windows(tmp_path):
 
 def test_phase4_final_window_close_preserves_restore_entry(tmp_path):
     qt_application = QApplication.instance() or QApplication([])
+    original_quit = qt_application.quitOnLastWindowClosed()
+    qt_application.setQuitOnLastWindowClosed(False)
 
     async def scenario():
         runtime = build_runtime(tmp_path / "data")
@@ -630,5 +635,164 @@ def test_phase4_final_window_close_preserves_restore_entry(tmp_path):
 
     event_loop = QEventLoop(qt_application)
     asyncio.set_event_loop(event_loop)
+    try:
+        with event_loop:
+            event_loop.run_until_complete(scenario())
+    finally:
+        qt_application.setQuitOnLastWindowClosed(original_quit)
+
+
+def test_a5_qasync_runtime_close_survives_waiter_cancellation_and_closes_once(
+    tmp_path, monkeypatch
+):
+    qt_application = QApplication.instance() or QApplication([])
+
+    async def scenario():
+        runtime = build_runtime(tmp_path / "data")
+        entered = asyncio.Event()
+        release_workspace = asyncio.Event()
+        counts = {"application": 0, "authority": 0}
+        original_application_close = runtime.application.close
+        original_authority_release = runtime.authority.release
+
+        async def failed_workspace_close():
+            entered.set()
+            await release_workspace.wait()
+            raise RuntimeError("workspace custom payload must not escape")
+
+        async def counted_application_close():
+            counts["application"] += 1
+            await original_application_close()
+
+        def counted_authority_release():
+            counts["authority"] += 1
+            return original_authority_release()
+
+        monkeypatch.setattr(runtime.workspace, "close", failed_workspace_close)
+        monkeypatch.setattr(runtime.application, "close", counted_application_close)
+        monkeypatch.setattr(runtime.authority, "release", counted_authority_release)
+
+        cancelled = asyncio.create_task(runtime.close())
+        await entered.wait()
+        joiner = asyncio.create_task(runtime.close())
+        cancelled.cancel()
+        cancelled_result = (
+            await asyncio.gather(cancelled, return_exceptions=True)
+        )[0]
+        assert isinstance(cancelled_result, asyncio.CancelledError)
+        assert not joiner.done()
+        assert asyncio.get_running_loop().is_running()
+        release_workspace.set()
+        with pytest.raises(StateError) as failure:
+            await joiner
+        assert str(failure.value) == "desktop runtime close failed during workspace"
+        assert counts == {"application": 1, "authority": 1}
+        assert runtime.authority.state is AuthorityState.CLOSED
+        assert runtime._close_task is None
+        assert runtime._close_result is not None
+        assert runtime._close_result.errors[0].stage == "workspace"
+        with pytest.raises(StateError) as replay:
+            await runtime.close()
+        assert str(replay.value) == str(failure.value)
+        assert counts == {"application": 1, "authority": 1}
+
+    from qasync import QEventLoop
+
+    event_loop = QEventLoop(qt_application)
+    asyncio.set_event_loop(event_loop)
     with event_loop:
         event_loop.run_until_complete(scenario())
+
+
+def test_r4_qasync_real_session_bridge_close_is_shared_and_ordered(
+    tmp_path, monkeypatch
+):
+    qt_application = QApplication.instance() or QApplication([])
+    original_quit = qt_application.quitOnLastWindowClosed()
+    qt_application.setQuitOnLastWindowClosed(False)
+
+    async def scenario():
+        data_root = tmp_path / "data"
+        runtime = build_runtime(data_root)
+        runtime.workspace.start()
+        entered = asyncio.Event()
+        release_bridge = asyncio.Event()
+        counts = {"bridge": 0, "application": 0, "authority": 0}
+        original_bridge_stop = runtime.workspace.bridge.stop_async
+        original_application_close = runtime.application.close
+        original_authority_release = runtime.authority.release
+
+        async def paused_failed_bridge_stop():
+            counts["bridge"] += 1
+            entered.set()
+            await release_bridge.wait()
+            await original_bridge_stop()
+            raise RuntimeError("private bridge payload must not escape")
+
+        async def counted_application_close():
+            counts["application"] += 1
+            await original_application_close()
+
+        def counted_authority_release():
+            counts["authority"] += 1
+            return original_authority_release()
+
+        monkeypatch.setattr(
+            runtime.workspace.bridge,
+            "stop_async",
+            paused_failed_bridge_stop,
+        )
+        monkeypatch.setattr(
+            runtime.application,
+            "close",
+            counted_application_close,
+        )
+        monkeypatch.setattr(
+            runtime.authority,
+            "release",
+            counted_authority_release,
+        )
+
+        cancelled = asyncio.create_task(runtime.close())
+        await entered.wait()
+        joiner = asyncio.create_task(runtime.close())
+        cancelled.cancel()
+        cancelled_result = (
+            await asyncio.gather(cancelled, return_exceptions=True)
+        )[0]
+        assert isinstance(cancelled_result, asyncio.CancelledError)
+        assert not joiner.done()
+        with pytest.raises(AuthorityError):
+            build_runtime(data_root)
+
+        release_bridge.set()
+        with pytest.raises(StateError) as failure:
+            await joiner
+        assert str(failure.value) == "desktop runtime close failed during workspace"
+        assert counts == {"bridge": 1, "application": 1, "authority": 1}
+        assert runtime.workspace._close_result is False
+        assert runtime.application._close_result is not None
+        assert runtime.application._close_result.succeeded
+        assert runtime.authority.state is AuthorityState.CLOSED
+        assert runtime._close_result is not None
+        assert tuple(error.stage for error in runtime._close_result.errors) == (
+            "workspace",
+        )
+        with pytest.raises(StateError) as replay:
+            await runtime.close()
+        assert str(replay.value) == str(failure.value)
+        assert counts == {"bridge": 1, "application": 1, "authority": 1}
+
+        replacement = build_runtime(data_root)
+        await replacement.close()
+        assert replacement.authority.state is AuthorityState.CLOSED
+
+    from qasync import QEventLoop
+
+    event_loop = QEventLoop(qt_application)
+    asyncio.set_event_loop(event_loop)
+    try:
+        with event_loop:
+            event_loop.run_until_complete(scenario())
+    finally:
+        qt_application.setQuitOnLastWindowClosed(original_quit)

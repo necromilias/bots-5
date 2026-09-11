@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-from contextlib import asynccontextmanager
-from dataclasses import replace
+from contextlib import asynccontextmanager, contextmanager, nullcontext
+from dataclasses import dataclass, replace
+from enum import Enum
 from functools import wraps
 
 from bots5.domain.clock import Clock, SystemClock
@@ -28,7 +29,7 @@ from bots5.domain.provider import (
 )
 from bots5.errors import ProviderError
 
-from .errors import RevisionConflict, StateError
+from .errors import AuthorityError, RevisionConflict, StateError
 from .events import EventBus, EventSubscription
 from .execution import ExecutionManager
 from .generation import (
@@ -49,6 +50,55 @@ from bots5.providers.discovery import ModelDiscoveryError
 
 class GenerationTimeout(Exception):
     """A B.O.T.S.-owned generation deadline expired after request preparation."""
+
+
+class ApplicationCloseState(str, Enum):
+    OPEN = "OPEN"
+    CLOSING = "CLOSING"
+    CLOSED = "CLOSED"
+    FAILED = "FAILED"
+
+
+class GenerationMode(str, Enum):
+    CONFIGURED = "CONFIGURED"
+    LEGACY_PHASE3_LOCAL_OPENAI = "LEGACY_PHASE3_LOCAL_OPENAI"
+    LEGACY_CORE_COMPATIBILITY = "LEGACY_CORE_COMPATIBILITY"
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalCloseError:
+    stage: str
+    code: str
+    public_kind: str
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalCloseResult:
+    errors: tuple[TerminalCloseError, ...] = ()
+
+    @property
+    def succeeded(self) -> bool:
+        return not self.errors
+
+
+_CLOSE_PRECEDENCE = {
+    "store": 0,
+    "execution": 1,
+    "reconciliation": 2,
+    "events": 3,
+}
+
+
+def _close_error(stage: str, *, authority: bool = False) -> TerminalCloseError:
+    # Fixed text deliberately excludes exception type, args, custom payload,
+    # cause/context, traceback locals, and unknown secret-shaped material.
+    return TerminalCloseError(
+        stage=stage,
+        code=f"close_{stage}_failed",
+        public_kind="authority" if authority else "state",
+        message=f"application close failed during {stage}",
+    )
 
 
 _FAKE_TRUSTED_CAPABILITIES = (
@@ -150,6 +200,7 @@ class BotsApplication:
         base_url: str | None = None,
         api_key_env: str | None = None,
         configuration: ProviderConfiguration | None = None,
+        generation_mode: GenerationMode | str | None = None,
     ) -> None:
         self._store = store
         self._events = events
@@ -163,7 +214,48 @@ class BotsApplication:
         self._base_url = base_url
         self._api_key_env = api_key_env
         self._configuration = configuration
-        self._closed = False
+        if generation_mode is None:
+            generation_mode = (
+                GenerationMode.CONFIGURED
+                if configuration is not None
+                else GenerationMode.LEGACY_CORE_COMPATIBILITY
+            )
+        try:
+            self._generation_mode = GenerationMode(generation_mode)
+        except ValueError as exc:
+            raise StateError("unknown generation mode") from exc
+        if self._generation_mode is GenerationMode.CONFIGURED:
+            if configuration is None:
+                raise StateError("configured generation mode requires provider configuration")
+        elif configuration is not None:
+            raise StateError("legacy generation mode cannot carry provider configuration")
+        elif self._generation_mode is GenerationMode.LEGACY_PHASE3_LOCAL_OPENAI:
+            if (
+                provider_id != "local_openai"
+                or backend_id != "openai_compatible_http"
+                or not base_url
+                or getattr(backend, "provider_id", None) != "local_openai"
+                or getattr(backend, "base_url", None) != base_url
+                or not hasattr(backend, "api_key_env")
+                or getattr(backend, "api_key_env", None) != api_key_env
+            ):
+                raise StateError("legacy local generation mode binding is inconsistent")
+        elif (
+            backend_id == "openai_compatible_http"
+            or backend.__class__.__module__
+            == "bots5.infrastructure.generation.openai_compatible"
+            or any(value is not None for value in (provider_id, base_url, api_key_env))
+            or hasattr(backend, "provider_id")
+            or hasattr(backend, "base_url")
+            or hasattr(backend, "api_key_env")
+        ):
+            raise StateError(
+                "core compatibility mode cannot carry a real provider or HTTP backend"
+            )
+        self._close_state = ApplicationCloseState.OPEN
+        self._close_loop: asyncio.AbstractEventLoop | None = None
+        self._close_task: asyncio.Task[TerminalCloseResult] | None = None
+        self._close_result: TerminalCloseResult | None = None
         self._pending_generations: dict[str, tuple[Message, GenerationAttempt]] = {}
         self._generation_tasks: dict[str, asyncio.Task[None]] = {}
         self._generation_terminal_events: dict[str, asyncio.Event] = {}
@@ -172,23 +264,52 @@ class BotsApplication:
         self._active_commands = 0
         self._commands_idle = asyncio.Event()
         self._commands_idle.set()
+        self._events.bind_effect_authority(
+            self._store.event_admission,
+            self._store.issued_event_effect,
+        )
         self._store.reconcile_interrupted_generations(self._clock.now())
+
+    @property
+    def generation_mode(self) -> GenerationMode:
+        return self._generation_mode
+
+    @property
+    def phase6_enabled(self) -> bool:
+        return self._generation_mode is GenerationMode.CONFIGURED and bool(
+            self._configuration and self._configuration.phase6_enabled
+        )
 
     @asynccontextmanager
     async def _command_scope(self):
-        self._ensure_open()
-        self._active_commands += 1
-        self._commands_idle.clear()
-        try:
+        if self._close_state is not ApplicationCloseState.OPEN:
+            raise StateError("application is closed")
+        with self._application_effect_scope():
+            self._ensure_open()
+            self._active_commands += 1
+            self._commands_idle.clear()
+            try:
+                yield
+            finally:
+                self._active_commands -= 1
+                if self._active_commands == 0:
+                    self._commands_idle.set()
+
+    @contextmanager
+    def _application_effect_scope(self, *, independent: bool = False):
+        """Order one application mutation/publication effect before poison."""
+        with self._store.command_admission(independent=independent):
             yield
-        finally:
-            self._active_commands -= 1
-            if self._active_commands == 0:
-                self._commands_idle.set()
 
     def _ensure_open(self) -> None:
-        if self._closed:
+        if self._close_state is not ApplicationCloseState.OPEN:
             raise StateError("application is closed")
+        self._store.assert_admitting()
+
+    @property
+    def _closed(self) -> bool:
+        """Compatibility predicate; close admission is owned by the state machine."""
+        return self._close_state is not ApplicationCloseState.OPEN
 
     def _track_generation(
         self,
@@ -219,12 +340,13 @@ class BotsApplication:
         try:
             await self._events.publish(kind, **payload)
         except StateError:
-            if not self._closed:
+            if self._close_state is ApplicationCloseState.OPEN:
                 raise
 
     def subscribe(self) -> EventSubscription:
-        self._ensure_open()
-        return self._events.subscribe()
+        with self._application_effect_scope():
+            self._ensure_open()
+            return self._events.subscribe()
 
     def has_active_generations(self) -> bool:
         return bool(self._pending_generations) or bool(
@@ -366,6 +488,10 @@ class BotsApplication:
     @_tracked_command
     async def stage_attachment(self, chat_id: str, attachment_id: str) -> tuple[str, ...]:
         self._ensure_open()
+        if self._generation_mode is GenerationMode.LEGACY_PHASE3_LOCAL_OPENAI:
+            raise StateError(
+                "attachments are unavailable in the Phase 3 local_openai compatibility mode"
+            )
         if self._store.get_chat(chat_id) is None:
             raise StateError(f"chat not found: {chat_id}")
         if self._store.get_attachment(attachment_id) is None:
@@ -428,6 +554,8 @@ class BotsApplication:
     ) -> ContextPlan:
         """Build from an explicit parent rather than the mutable chat head."""
         self._ensure_open()
+        if self._generation_mode is not GenerationMode.CONFIGURED:
+            raise StateError("Phase 6 context planning is unavailable in legacy generation mode")
         chat = self._store.get_chat(chat_id)
         if chat is None:
             raise StateError(f"chat not found: {chat_id}")
@@ -543,7 +671,7 @@ class BotsApplication:
             if eligible:
                 try:
                     text = self._store.read_attachment_bytes(attachment.id).decode("utf-8", errors="strict")
-                except (UnicodeDecodeError, StateError) as exc:
+                except UnicodeDecodeError as exc:
                     raise StateError(f"selected attachment is not valid UTF-8: {attachment.id}") from exc
             sources.append(
                 ContextSource(
@@ -571,7 +699,7 @@ class BotsApplication:
         now,
     ) -> tuple[GenerationRequest, GenerationAttempt, ContextPlan | None]:
         context_plan: ContextPlan | None = None
-        if self._configuration is not None:
+        if self._generation_mode is GenerationMode.CONFIGURED:
             context_history = self._context_history(chat_id, user_message.parent_id)
             selected_attachments = self._selected_attachment_sources(chat_id)
             # ProviderConfiguration owns the frozen model/capability lookup and
@@ -585,7 +713,7 @@ class BotsApplication:
             context_history = ()
             selected_attachments = ()
             phase6 = False
-        if self._configuration is not None:
+        if self._generation_mode is GenerationMode.CONFIGURED:
             prepared, snapshot = self._configuration.prepare_generation(
                 chat_id=chat_id,
                 user_message_id=user_message.id,
@@ -615,6 +743,10 @@ class BotsApplication:
             )
             return request, attempt, context_plan
 
+        if self._pending_attachment_ids.get(chat_id):
+            raise StateError(
+                "attachments are unavailable in the Phase 3 local_openai compatibility mode"
+            )
         request = GenerationRequest(
             attempt_id=attempt_id,
             chat_id=chat_id,
@@ -1474,50 +1606,116 @@ class BotsApplication:
                 if attempt.id in self._cancel_requested:
                     raise asyncio.CancelledError
                 if isinstance(event, GenerationDispatched):
-                    dispatch_may_have_occurred = True
-                    current_attempt = replace(current_attempt, remote_outcome_unknown=True)
-                    self._store.update_attempt(current_attempt)
-                    self._update_tracked_generation(message, current_attempt)
-                    await self._publish_after_persistence(
-                        "generation_dispatched",
-                        chat_id=message.chat_id,
-                        message_id=message.id,
-                        attempt_id=attempt.id,
-                    )
+                    with self._application_effect_scope(independent=True):
+                        dispatch_may_have_occurred = True
+                        current_attempt = replace(current_attempt, remote_outcome_unknown=True)
+                        self._store.update_attempt(current_attempt)
+                        self._update_tracked_generation(message, current_attempt)
+                        await self._publish_after_persistence(
+                            "generation_dispatched",
+                            chat_id=message.chat_id,
+                            message_id=message.id,
+                            attempt_id=attempt.id,
+                        )
                 elif isinstance(event, GenerationMetadata):
-                    current_attempt = _merge_attempt_metadata(current_attempt, event)
-                    self._store.update_attempt(current_attempt)
-                    self._update_tracked_generation(message, current_attempt)
+                    with self._application_effect_scope(independent=True):
+                        current_attempt = _merge_attempt_metadata(current_attempt, event)
+                        self._store.update_attempt(current_attempt)
+                        self._update_tracked_generation(message, current_attempt)
                 elif isinstance(event, GenerationDelta):
-                    message = replace(
-                        message,
-                        state=MessageState.STREAMING,
-                        content=message.content + event.text,
-                    )
-                    self._store.update_streaming_message(message)
-                    self._update_tracked_generation(message, current_attempt)
-                    await self._publish_after_persistence(
-                        "message_delta",
-                        chat_id=message.chat_id,
-                        message_id=message.id,
-                        attempt_id=attempt.id,
-                        text=event.text,
-                    )
+                    with self._application_effect_scope(independent=True):
+                        message = replace(
+                            message,
+                            state=MessageState.STREAMING,
+                            content=message.content + event.text,
+                        )
+                        self._store.update_streaming_message(message)
+                        self._update_tracked_generation(message, current_attempt)
+                        await self._publish_after_persistence(
+                            "message_delta",
+                            chat_id=message.chat_id,
+                            message_id=message.id,
+                            attempt_id=attempt.id,
+                            text=event.text,
+                        )
                 elif isinstance(event, GenerationCompleted):
                     terminal = True
-                    now = self._clock.now()
-                    current_attempt = _merge_attempt_metadata(current_attempt, event)
-                    if type(event.finish_reason) is not str or not event.finish_reason:
-                        error_type = "malformed_finish_reason"
-                        error_message = "generation completed with an invalid finish_reason"
+                    with self._application_effect_scope(independent=True):
+                        now = self._clock.now()
+                        current_attempt = _merge_attempt_metadata(current_attempt, event)
+                        if type(event.finish_reason) is not str or not event.finish_reason:
+                            error_type = "malformed_finish_reason"
+                            error_message = "generation completed with an invalid finish_reason"
+                            message = replace(message, state=MessageState.FAILED)
+                            current_attempt = replace(
+                                current_attempt,
+                                state=AttemptState.FAILED,
+                                ended_at=now,
+                                error_type=error_type,
+                                error_message=error_message,
+                                finish_reason=None,
+                                remote_outcome_unknown=(
+                                    event.remote_outcome_unknown
+                                    if event.remote_outcome_unknown is not None
+                                    else dispatch_may_have_occurred
+                                ),
+                            )
+                            self._finalize_generation(message, current_attempt)
+                            terminal_persisted = True
+                            await self._publish_after_persistence(
+                                "generation_failed",
+                                chat_id=message.chat_id,
+                                message_id=message.id,
+                                attempt_id=attempt.id,
+                                error_type=error_type,
+                                error_message=error_message,
+                            )
+                        else:
+                            current_attempt = replace(
+                                current_attempt,
+                                finish_reason=event.finish_reason,
+                            )
+                            if event.finish_reason == "stop":
+                                message = replace(message, state=MessageState.COMPLETE)
+                                current_attempt = replace(
+                                    current_attempt,
+                                    state=AttemptState.COMPLETE,
+                                    ended_at=now,
+                                    remote_outcome_unknown=event.remote_outcome_unknown,
+                                )
+                                event_kind = "generation_completed"
+                            else:
+                                message = replace(message, state=MessageState.TRUNCATED)
+                                current_attempt = replace(
+                                    current_attempt,
+                                    state=AttemptState.INCOMPLETE,
+                                    ended_at=now,
+                                    error_type="non_stop_finish",
+                                    error_message=f"generation ended with finish_reason={event.finish_reason}",
+                                    remote_outcome_unknown=event.remote_outcome_unknown,
+                                )
+                                event_kind = "generation_incomplete"
+                            self._finalize_generation(message, current_attempt)
+                            terminal_persisted = True
+                            await self._publish_after_persistence(
+                                event_kind,
+                                chat_id=message.chat_id,
+                                message_id=message.id,
+                                attempt_id=attempt.id,
+                                finish_reason=event.finish_reason,
+                            )
+                    break
+                elif isinstance(event, GenerationFailed):
+                    terminal = True
+                    with self._application_effect_scope(independent=True):
+                        now = self._clock.now()
                         message = replace(message, state=MessageState.FAILED)
                         current_attempt = replace(
                             current_attempt,
                             state=AttemptState.FAILED,
                             ended_at=now,
-                            error_type=error_type,
-                            error_message=error_message,
-                            finish_reason=None,
+                            error_type=event.error_type,
+                            error_message=event.error_message,
                             remote_outcome_unknown=(
                                 event.remote_outcome_unknown
                                 if event.remote_outcome_unknown is not None
@@ -1531,73 +1729,87 @@ class BotsApplication:
                             chat_id=message.chat_id,
                             message_id=message.id,
                             attempt_id=attempt.id,
-                            error_type=error_type,
-                            error_message=error_message,
+                            error_type=event.error_type,
+                            error_message=event.error_message,
                         )
-                        break
-                    current_attempt = replace(
-                        current_attempt,
-                        finish_reason=event.finish_reason,
-                    )
-                    if event.finish_reason == "stop":
-                        message = replace(message, state=MessageState.COMPLETE)
-                        current_attempt = replace(
-                            current_attempt,
-                            state=AttemptState.COMPLETE,
-                            ended_at=now,
-                            remote_outcome_unknown=event.remote_outcome_unknown,
-                        )
-                        event_kind = "generation_completed"
-                    else:
-                        message = replace(message, state=MessageState.TRUNCATED)
-                        current_attempt = replace(
-                            current_attempt,
-                            state=AttemptState.INCOMPLETE,
-                            ended_at=now,
-                            error_type="non_stop_finish",
-                            error_message=f"generation ended with finish_reason={event.finish_reason}",
-                            remote_outcome_unknown=event.remote_outcome_unknown,
-                        )
-                        event_kind = "generation_incomplete"
-                    self._finalize_generation(message, current_attempt)
-                    terminal_persisted = True
-                    await self._publish_after_persistence(
-                        event_kind,
-                        chat_id=message.chat_id,
-                        message_id=message.id,
-                        attempt_id=attempt.id,
-                        finish_reason=event.finish_reason,
-                    )
-                    break
-                elif isinstance(event, GenerationFailed):
-                    terminal = True
-                    now = self._clock.now()
-                    message = replace(message, state=MessageState.FAILED)
-                    current_attempt = replace(
-                        current_attempt,
-                        state=AttemptState.FAILED,
-                        ended_at=now,
-                        error_type=event.error_type,
-                        error_message=event.error_message,
-                        remote_outcome_unknown=(
-                            event.remote_outcome_unknown
-                            if event.remote_outcome_unknown is not None
-                            else dispatch_may_have_occurred
-                        ),
-                    )
-                    self._finalize_generation(message, current_attempt)
-                    terminal_persisted = True
-                    await self._publish_after_persistence(
-                        "generation_failed",
-                        chat_id=message.chat_id,
-                        message_id=message.id,
-                        attempt_id=attempt.id,
-                        error_type=event.error_type,
-                        error_message=event.error_message,
-                    )
                     break
 
             if not terminal and attempt.id in self._cancel_requested:
+                with self._application_effect_scope(independent=True):
+                    now = self._clock.now()
+                    message = replace(message, state=MessageState.ABORTED)
+                    current_attempt = replace(
+                        current_attempt,
+                        state=AttemptState.ABORTED,
+                        ended_at=now,
+                        error_type="aborted",
+                        error_message="generation was cancelled",
+                        remote_outcome_unknown=dispatch_may_have_occurred,
+                    )
+                    self._finalize_generation(message, current_attempt)
+                    terminal_persisted = True
+                    await self._publish_after_persistence(
+                        "generation_aborted",
+                        chat_id=message.chat_id,
+                        message_id=message.id,
+                        attempt_id=attempt.id,
+                    )
+            elif not terminal:
+                with self._application_effect_scope(independent=True):
+                    now = self._clock.now()
+                    message = replace(message, state=MessageState.INCOMPLETE)
+                    current_attempt = replace(
+                        current_attempt,
+                        state=AttemptState.INCOMPLETE,
+                        ended_at=now,
+                        error_type="missing_terminal_event",
+                        error_message="generation stream ended without a terminal event",
+                        remote_outcome_unknown=dispatch_may_have_occurred,
+                    )
+                    self._finalize_generation(message, current_attempt)
+                    terminal_persisted = True
+                    await self._publish_after_persistence(
+                        "generation_incomplete",
+                        chat_id=message.chat_id,
+                        message_id=message.id,
+                        attempt_id=attempt.id,
+                    )
+        except GenerationTimeout:
+            if terminal_persisted:
+                raise
+            with self._application_effect_scope(independent=True):
+                now = self._clock.now()
+                message = replace(message, state=MessageState.FAILED)
+                current_attempt = replace(
+                    current_attempt,
+                    state=AttemptState.FAILED,
+                    ended_at=now,
+                    error_type="timeout",
+                    error_message="B.O.T.S. generation deadline expired",
+                    remote_outcome_unknown=(
+                        True if dispatch_may_have_occurred else current_attempt.remote_outcome_unknown
+                    ),
+                )
+                self._finalize_generation(message, current_attempt)
+                terminal_persisted = True
+                await self._publish_after_persistence(
+                    "generation_failed",
+                    chat_id=message.chat_id,
+                    message_id=message.id,
+                    attempt_id=attempt.id,
+                    error_type="timeout",
+                    error_message="B.O.T.S. generation deadline expired",
+                )
+        except asyncio.CancelledError:
+            if terminal_persisted:
+                raise
+            close_stream = getattr(iterator, "aclose", None)
+            if close_stream is not None:
+                try:
+                    await close_stream()
+                except BaseException:
+                    pass
+            with self._application_effect_scope(independent=True):
                 now = self._clock.now()
                 message = replace(message, state=MessageState.ABORTED)
                 current_attempt = replace(
@@ -1616,166 +1828,175 @@ class BotsApplication:
                     message_id=message.id,
                     attempt_id=attempt.id,
                 )
-            elif not terminal:
-                now = self._clock.now()
-                message = replace(message, state=MessageState.INCOMPLETE)
-                current_attempt = replace(
-                    current_attempt,
-                    state=AttemptState.INCOMPLETE,
-                    ended_at=now,
-                    error_type="missing_terminal_event",
-                    error_message="generation stream ended without a terminal event",
-                    remote_outcome_unknown=dispatch_may_have_occurred,
-                )
-                self._finalize_generation(message, current_attempt)
-                terminal_persisted = True
-                await self._publish_after_persistence(
-                    "generation_incomplete",
-                    chat_id=message.chat_id,
-                    message_id=message.id,
-                    attempt_id=attempt.id,
-                )
-        except GenerationTimeout:
-            if terminal_persisted:
-                raise
-            now = self._clock.now()
-            message = replace(message, state=MessageState.FAILED)
-            current_attempt = replace(
-                current_attempt,
-                state=AttemptState.FAILED,
-                ended_at=now,
-                error_type="timeout",
-                error_message="B.O.T.S. generation deadline expired",
-                remote_outcome_unknown=(
-                    True if dispatch_may_have_occurred else current_attempt.remote_outcome_unknown
-                ),
-            )
-            self._finalize_generation(message, current_attempt)
-            terminal_persisted = True
-            await self._publish_after_persistence(
-                "generation_failed",
-                chat_id=message.chat_id,
-                message_id=message.id,
-                attempt_id=attempt.id,
-                error_type="timeout",
-                error_message="B.O.T.S. generation deadline expired",
-            )
-        except asyncio.CancelledError:
-            if terminal_persisted:
-                raise
-            now = self._clock.now()
-            message = replace(message, state=MessageState.ABORTED)
-            current_attempt = replace(
-                current_attempt,
-                state=AttemptState.ABORTED,
-                ended_at=now,
-                error_type="aborted",
-                error_message="generation was cancelled",
-                remote_outcome_unknown=dispatch_may_have_occurred,
-            )
-            self._finalize_generation(message, current_attempt)
-            terminal_persisted = True
-            await self._publish_after_persistence(
-                "generation_aborted",
-                chat_id=message.chat_id,
-                message_id=message.id,
-                attempt_id=attempt.id,
-            )
             raise
         except Exception as exc:
             if terminal_persisted:
                 raise
-            now = self._clock.now()
-            message = replace(message, state=MessageState.FAILED)
-            current_attempt = replace(
-                current_attempt,
-                state=AttemptState.FAILED,
-                ended_at=now,
-                error_type=type(exc).__name__,
-                error_message=str(exc)[:500],
-                returned_model=None,
-                request_id=None,
-                finish_reason=None,
-                prompt_tokens=None,
-                completion_tokens=None,
-                reasoning_tokens=None,
-                total_tokens=None,
-                known_cost_usd=None,
-                remote_outcome_unknown=(
-                    True if dispatch_may_have_occurred else current_attempt.remote_outcome_unknown
-                ),
-            )
-            self._finalize_generation(message, current_attempt)
-            terminal_persisted = True
-            await self._publish_after_persistence(
-                "generation_failed",
-                chat_id=message.chat_id,
-                message_id=message.id,
-                attempt_id=attempt.id,
-                error_type=current_attempt.error_type,
-                error_message=current_attempt.error_message,
-            )
+            with self._application_effect_scope(independent=True):
+                now = self._clock.now()
+                message = replace(message, state=MessageState.FAILED)
+                current_attempt = replace(
+                    current_attempt,
+                    state=AttemptState.FAILED,
+                    ended_at=now,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc)[:500],
+                    returned_model=None,
+                    request_id=None,
+                    finish_reason=None,
+                    prompt_tokens=None,
+                    completion_tokens=None,
+                    reasoning_tokens=None,
+                    total_tokens=None,
+                    known_cost_usd=None,
+                    remote_outcome_unknown=(
+                        True if dispatch_may_have_occurred else current_attempt.remote_outcome_unknown
+                    ),
+                )
+                self._finalize_generation(message, current_attempt)
+                terminal_persisted = True
+                await self._publish_after_persistence(
+                    "generation_failed",
+                    chat_id=message.chat_id,
+                    message_id=message.id,
+                    attempt_id=attempt.id,
+                    error_type=current_attempt.error_type,
+                    error_message=current_attempt.error_message,
+                )
         finally:
             self._pending_generations.pop(attempt.id, None)
             self._generation_tasks.pop(attempt.id, None)
             self._generation_terminal_events.pop(attempt.id, None)
             self._cancel_requested.discard(attempt.id)
 
-    async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._events.close()
-        shutdown_failure: BaseException | None = None
+    async def _close_driver(
+        self, initial_errors: tuple[TerminalCloseError, ...]
+    ) -> TerminalCloseResult:
+        """Run teardown exactly once and always complete with scalar-safe data."""
+        errors = list(initial_errors)
         try:
             await self._execution.shutdown()
-        except BaseException as exc:
-            shutdown_failure = exc
+        except BaseException:
+            errors.append(_close_error("execution"))
 
-        await self._commands_idle.wait()
-
-        reconciliation_failure: BaseException | None = None
-        for attempt_id, (message, attempt) in tuple(self._pending_generations.items()):
-            try:
-                stored_message = self._store.get_message(message.id)
-                stored_attempt = next(
-                    (
-                        item
-                        for item in self._store.list_generation_attempts(message.chat_id)
-                        if item.id == attempt_id
-                    ),
-                    None,
-                )
-                if (
-                    stored_message is not None
-                    and stored_attempt is not None
-                    and stored_message.state == MessageState.STREAMING
-                    and stored_attempt.state == AttemptState.RUNNING
+        try:
+            await self._commands_idle.wait()
+            # Selection and finalization are one fallback effect.  If this
+            # independent close-driver grant loses authority, durable RUNNING
+            # state is deliberately left for a fresh authority at restart.
+            if self._pending_generations:
+                effect_scope = self._application_effect_scope(independent=True)
+            else:
+                effect_scope = nullcontext()
+            with effect_scope:
+                for attempt_id, (message, attempt) in tuple(
+                    self._pending_generations.items()
                 ):
-                    now = self._clock.now()
-                    self._store.finalize_generation(
-                        replace(stored_message, state=MessageState.ABORTED),
-                        replace(
-                            stored_attempt,
-                            state=AttemptState.ABORTED,
-                            ended_at=now,
-                            error_type="aborted",
-                            error_message="generation was cancelled during shutdown",
-                            remote_outcome_unknown=stored_attempt.remote_outcome_unknown,
-                        ),
-                    )
-            except BaseException as exc:
-                if reconciliation_failure is None:
-                    reconciliation_failure = exc
-            finally:
+                    try:
+                        stored_message = self._store.get_message(message.id)
+                        stored_attempt = next(
+                            (
+                                item
+                                for item in self._store.list_generation_attempts(
+                                    message.chat_id
+                                )
+                                if item.id == attempt_id
+                            ),
+                            None,
+                        )
+                        if (
+                            stored_message is not None
+                            and stored_attempt is not None
+                            and stored_message.state == MessageState.STREAMING
+                            and stored_attempt.state == AttemptState.RUNNING
+                        ):
+                            now = self._clock.now()
+                            self._store.finalize_generation(
+                                replace(stored_message, state=MessageState.ABORTED),
+                                replace(
+                                    stored_attempt,
+                                    state=AttemptState.ABORTED,
+                                    ended_at=now,
+                                    error_type="aborted",
+                                    error_message=(
+                                        "generation was cancelled during shutdown"
+                                    ),
+                                    remote_outcome_unknown=(
+                                        stored_attempt.remote_outcome_unknown
+                                    ),
+                                ),
+                            )
+                    except BaseException:
+                        if not any(
+                            error.stage == "reconciliation" for error in errors
+                        ):
+                            errors.append(_close_error("reconciliation"))
+                    finally:
+                        self._pending_generations.pop(attempt_id, None)
+                        self._generation_tasks.pop(attempt_id, None)
+                        self._generation_terminal_events.pop(attempt_id, None)
+                        self._cancel_requested.discard(attempt_id)
+        except BaseException:
+            if not any(error.stage == "reconciliation" for error in errors):
+                errors.append(_close_error("reconciliation"))
+            # Release-only in-memory bookkeeping is still permitted after the
+            # fallback grant is rejected or revoked; no persistence occurs.
+            for attempt_id in tuple(self._pending_generations):
                 self._pending_generations.pop(attempt_id, None)
                 self._generation_tasks.pop(attempt_id, None)
+                self._generation_terminal_events.pop(attempt_id, None)
                 self._cancel_requested.discard(attempt_id)
 
         try:
             self._store.close()
-        finally:
-            if shutdown_failure is not None:
-                raise shutdown_failure
-            if reconciliation_failure is not None:
-                raise reconciliation_failure
+        except BaseException:
+            errors.append(_close_error("store", authority=True))
+
+        errors.sort(key=lambda error: _CLOSE_PRECEDENCE[error.stage])
+        result = TerminalCloseResult(tuple(errors))
+        self._close_result = result
+        self._close_state = (
+            ApplicationCloseState.CLOSED
+            if result.succeeded
+            else ApplicationCloseState.FAILED
+        )
+        return result
+
+    def _forget_close_task(self, task: asyncio.Task[TerminalCloseResult]) -> None:
+        if self._close_task is task:
+            # The task is guaranteed to have a normal, data-only result.
+            task.result()
+            self._close_task = None
+
+    @staticmethod
+    def _raise_terminal_close(result: TerminalCloseResult) -> None:
+        if result.succeeded:
+            return
+        error = result.errors[0]
+        if error.public_kind == "authority":
+            raise AuthorityError(error.message) from None
+        raise StateError(error.message) from None
+
+    async def close(self) -> None:
+        loop = asyncio.get_running_loop()
+        if self._close_state is ApplicationCloseState.OPEN:
+            self._close_state = ApplicationCloseState.CLOSING
+            self._close_loop = loop
+            event_errors: tuple[TerminalCloseError, ...] = ()
+            try:
+                self._events.close()
+            except BaseException:
+                event_errors = (_close_error("events"),)
+            task = loop.create_task(self._close_driver(event_errors))
+            self._close_task = task
+            task.add_done_callback(self._forget_close_task)
+        elif self._close_result is None and self._close_loop is not loop:
+            raise StateError("application close belongs to another event loop")
+
+        result = self._close_result
+        if result is None:
+            task = self._close_task
+            if task is None:
+                raise StateError("application close has no terminal operation")
+            result = await asyncio.shield(task)
+        self._raise_terminal_close(result)

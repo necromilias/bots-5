@@ -15,7 +15,7 @@ from alembic.config import Config
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import DatabaseError
 
-from bots5.core.application import BotsApplication
+from bots5.core.application import BotsApplication, GenerationMode
 from bots5.core.errors import StateError
 from bots5.core.events import EventBus, EventSubscription
 from bots5.core.generation import (
@@ -85,10 +85,11 @@ def test_phase3_outcome_columns_are_additive_and_nullable(tmp_path: Path):
     upgrade_database(database)
     store = SQLiteAppStateStore.open(database)
     try:
-        columns = {
-            column["name"]: column
-            for column in inspect(store.engine).get_columns("generation_attempts")
-        }
+        with store.command_admission():
+            columns = {
+                column["name"]: column
+                for column in inspect(store.engine).get_columns("generation_attempts")
+            }
         outcome_columns = {
             "provider_id",
             "returned_model",
@@ -103,10 +104,11 @@ def test_phase3_outcome_columns_are_additive_and_nullable(tmp_path: Path):
         }
         assert outcome_columns <= columns.keys()
         assert all(columns[name]["nullable"] for name in outcome_columns)
-        with store.engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-                "0009_phase6_context_attachments"
-            )
+        with store.command_admission():
+            with store.engine.connect() as connection:
+                assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
+                    "0009_phase6_context_attachments"
+                )
     finally:
         store.close()
 
@@ -135,6 +137,11 @@ def _application(
         provider_id=provider_id if hasattr(backend, "provider_id") else None,
         base_url=base_url if hasattr(backend, "base_url") else None,
         api_key_env=api_key_env if hasattr(backend, "api_key_env") else None,
+        generation_mode=(
+            GenerationMode.LEGACY_PHASE3_LOCAL_OPENAI
+            if hasattr(backend, "provider_id")
+            else GenerationMode.LEGACY_CORE_COMPATIBILITY
+        ),
     )
 
 
@@ -315,14 +322,15 @@ def test_authoritative_store_rejects_unknown_remote_outcome_truth_for_phase3(
         with pytest.raises(StateError, match="explicit remote outcome truth"):
             store.update_attempt(replace(attempt, remote_outcome_unknown=None))
         with pytest.raises(DatabaseError):
-            with store.engine.begin() as connection:
-                connection.execute(
-                    text(
-                        "UPDATE generation_attempts "
-                        "SET remote_outcome_unknown = NULL WHERE id = :id"
-                    ),
-                    {"id": attempt.id},
-                )
+            with store.command_admission():
+                with store.engine.begin() as connection:
+                    connection.execute(
+                        text(
+                            "UPDATE generation_attempts "
+                            "SET remote_outcome_unknown = NULL WHERE id = :id"
+                        ),
+                        {"id": attempt.id},
+                    )
         with pytest.raises(StateError, match="explicit remote outcome truth"):
             store.finalize_generation(
                 replace(assistant, state=MessageState.ABORTED, content="partial text"),
@@ -345,13 +353,14 @@ def test_sqlite_trigger_rejects_invalid_phase3_outcome_metadata(tmp_path: Path):
     try:
         _persist_fixture(store, chat, user, assistant, attempt)
         with pytest.raises(DatabaseError):
-            with store.engine.begin() as connection:
-                connection.execute(
-                    text(
-                        "UPDATE generation_attempts SET request_id = '' WHERE id = :id"
-                    ),
-                    {"id": attempt.id},
-                )
+            with store.command_admission():
+                with store.engine.begin() as connection:
+                    connection.execute(
+                        text(
+                            "UPDATE generation_attempts SET request_id = '' WHERE id = :id"
+                        ),
+                        {"id": attempt.id},
+                    )
     finally:
         store.close()
 
@@ -1685,14 +1694,15 @@ def test_invalid_cost_is_rejected_by_sqlite_trigger(tmp_path: Path):
             attempt = await application.send_message(chat.id, "hello")
             await backend.started.wait()
             with pytest.raises(DatabaseError):
-                with application._store.engine.begin() as connection:
-                    connection.execute(
-                        text(
-                            "UPDATE generation_attempts SET known_cost_usd = '-1' "
-                            "WHERE id = :id"
-                        ),
-                        {"id": attempt.id},
-                    )
+                with application._store.command_admission():
+                    with application._store.engine.begin() as connection:
+                        connection.execute(
+                            text(
+                                "UPDATE generation_attempts SET known_cost_usd = '-1' "
+                                "WHERE id = :id"
+                            ),
+                            {"id": attempt.id},
+                        )
         finally:
             await application.close()
 
@@ -1814,6 +1824,7 @@ def test_cancellation_returns_after_durable_abort_under_full_event_backpressure(
             model="qwen-local",
             provider_id=backend.provider_id,
             base_url=backend.base_url,
+            generation_mode=GenerationMode.LEGACY_PHASE3_LOCAL_OPENAI,
         )
         subscription = application.subscribe()
         try:
@@ -1876,6 +1887,7 @@ def test_late_cancellation_does_not_drop_durable_terminal_event(tmp_path: Path):
             model="qwen-local",
             provider_id=backend.provider_id,
             base_url=backend.base_url,
+            generation_mode=GenerationMode.LEGACY_PHASE3_LOCAL_OPENAI,
         )
         subscription = application.subscribe()
         try:
@@ -1951,11 +1963,12 @@ def test_terminal_outcome_metadata_is_immutable(tmp_path: Path):
             attempt = await application.send_message(chat.id, "hello")
             await _terminal(subscription, attempt.id)
             with pytest.raises(DatabaseError):
-                with application._store.engine.begin() as connection:
-                    connection.execute(
-                        text("UPDATE generation_attempts SET request_id = 'tampered' WHERE id = :id"),
-                        {"id": attempt.id},
-                    )
+                with application._store.command_admission():
+                    with application._store.engine.begin() as connection:
+                        connection.execute(
+                            text("UPDATE generation_attempts SET request_id = 'tampered' WHERE id = :id"),
+                            {"id": attempt.id},
+                        )
         finally:
             await application.close()
 

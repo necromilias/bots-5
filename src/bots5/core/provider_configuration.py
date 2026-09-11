@@ -6,6 +6,7 @@ import re
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
+from functools import wraps
 from typing import Any
 
 from bots5.domain.provider import (
@@ -54,6 +55,17 @@ _CAPABILITY_PRECEDENCE = {
     "heuristic": 4,
     "unknown": 5,
 }
+
+
+def _configuration_operation(method):
+    """Make direct configuration-facade calls own their complete effect."""
+
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self.store.command_admission():
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 def normalize_connection_name(name: str) -> tuple[str, str]:
@@ -196,6 +208,7 @@ class ProviderConfiguration:
                 "error",
             )
 
+    @_configuration_operation
     def credential_value(self, connection: ProviderConnection) -> str | None:
         if connection.credential_source is CredentialSource.NONE:
             return None
@@ -219,6 +232,7 @@ class ProviderConfiguration:
             self.secret_stores[connection.credential_source] = secret_store
         return secret_store
 
+    @_configuration_operation
     def save_credential(self, connection: ProviderConnection, value: str) -> CredentialStatus:
         failure: SecretStoreError | None = None
         try:
@@ -238,21 +252,26 @@ class ProviderConfiguration:
             raise failure
         return status
 
+    @_configuration_operation
     def delete_credential(self, connection: ProviderConnection) -> CredentialStatus:
         if connection.credential_source is not CredentialSource.SECRET_SERVICE:
             raise SecretStoreError("only Secret Service credentials are writable")
         self._credential_store(connection).delete(connection.credential_reference or "")
         return self._secret_status(connection)
 
+    @_configuration_operation
     def list_connections(self) -> tuple[ProviderConnection, ...]:
         return self.store.list_provider_connections()
 
+    @_configuration_operation
     def credential_status(self, connection: ProviderConnection) -> CredentialStatus:
         return self._secret_status(connection)
 
+    @_configuration_operation
     def list_models(self, connection_id: str | None = None) -> tuple[ModelCatalogueEntry, ...]:
         return self.store.list_model_catalogue_entries(connection_id)
 
+    @_configuration_operation
     def create_connection(
         self,
         *,
@@ -294,6 +313,7 @@ class ProviderConfiguration:
         self.store.create_provider_connection(connection)
         return connection
 
+    @_configuration_operation
     def edit_connection(self, connection: ProviderConnection, *, expected_revision: int) -> ProviderConnection:
         if connection.revision != expected_revision:
             raise RevisionConflict(f"provider connection object is stale: {connection.id}")
@@ -332,6 +352,7 @@ class ProviderConfiguration:
         )
         return self.store.update_provider_connection(edited, expected_revision=expected_revision)
 
+    @_configuration_operation
     def add_manual_model(
         self,
         *,
@@ -350,10 +371,12 @@ class ProviderConfiguration:
             model_entry_id=self.ids.new(),
         )
 
+    @_configuration_operation
     def set_model_defaults(self, model_entry_id: str, settings: GenerationSettings, *, expected_revision: int | None = None) -> int:
         _validate_settings(settings)
         return self.store.set_model_generation_settings(model_entry_id, settings, expected_revision=expected_revision)
 
+    @_configuration_operation
     def set_capability_override(self, override: CapabilityOverride, *, expected_revision: int | None = None) -> CapabilityOverride:
         if override.key not in {key.value for key in CapabilityKey}:
             raise StateError("unknown capability key")
@@ -365,6 +388,7 @@ class ProviderConfiguration:
             override = replace(override, revision=current.revision + 1, updated_at=self.clock.now())
         return self.store.set_capability_override(override, expected_revision=expected_revision)
 
+    @_configuration_operation
     def get_selection(self, chat_id: str) -> ModelSelection:
         selection = self.store.get_chat_model_selection(chat_id)
         if selection is None:
@@ -419,6 +443,7 @@ class ProviderConfiguration:
             provenance=provenance,
         )
 
+    @_configuration_operation
     def resolve_capabilities(self, model_entry_id: str) -> tuple[ResolvedCapability, ...]:
         facts = self.store.list_capability_facts(model_entry_id)
         model = self.store.get_model_catalogue_entry(model_entry_id)
@@ -445,6 +470,7 @@ class ProviderConfiguration:
             for key in sorted(CAPABILITY_KEYS)
         )
 
+    @_configuration_operation
     def phase6_capability_present(self, chat_id: str) -> bool:
         """Return whether the selected model has adopted the closed Phase 6 contract.
 
@@ -467,6 +493,7 @@ class ProviderConfiguration:
             for override in self.store.list_capability_overrides(selection.model_entry_id)
         )
 
+    @_configuration_operation
     def prepare_generation(
         self,
         *,

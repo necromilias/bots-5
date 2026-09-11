@@ -6,7 +6,14 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from bots5.core.application import BotsApplication
+from bots5.core.application import (
+    ApplicationCloseState,
+    BotsApplication,
+    GenerationMode,
+    TerminalCloseError,
+    TerminalCloseResult,
+)
+from bots5.core.errors import AuthorityError, StateError
 from bots5.core.events import EventBus
 from bots5.core.provider_configuration import ProviderConfiguration
 from bots5.domain.clock import SystemClock
@@ -32,17 +39,29 @@ class DesktopRuntime:
     workspace: DesktopSessionController
     windows: list[object] = field(default_factory=list)
     _opening_windows: set[asyncio.Task[None]] = field(default_factory=set)
+    _close_state: ApplicationCloseState = field(
+        default=ApplicationCloseState.OPEN, init=False
+    )
+    _close_loop: asyncio.AbstractEventLoop | None = field(default=None, init=False)
+    _close_task: asyncio.Task[TerminalCloseResult] | None = field(
+        default=None, init=False
+    )
+    _close_result: TerminalCloseResult | None = field(default=None, init=False)
 
     def _forget_window(self, window: object) -> None:
         if window in self.windows:
             self.windows.remove(window)
 
     def _request_new_window(self) -> None:
+        if self._close_state is not ApplicationCloseState.OPEN:
+            return
         task = asyncio.create_task(self.open_window())
         self._opening_windows.add(task)
         task.add_done_callback(self._opening_windows.discard)
 
     async def open_window(self, state=None):
+        if self._close_state is not ApplicationCloseState.OPEN:
+            raise StateError("desktop runtime is closed")
         from bots5.desktop.window import MainWindow
 
         window = MainWindow(
@@ -65,15 +84,101 @@ class DesktopRuntime:
             raise
         return window
 
+    @staticmethod
+    def _runtime_error(stage: str, *, authority: bool = False) -> TerminalCloseError:
+        return TerminalCloseError(
+            stage=stage,
+            code=f"runtime_close_{stage}_failed",
+            public_kind="authority" if authority else "state",
+            message=f"desktop runtime close failed during {stage}",
+        )
+
+    async def _close_driver(self) -> TerminalCloseResult:
+        errors: list[TerminalCloseError] = []
+        try:
+            for task in tuple(self._opening_windows):
+                if not task.done():
+                    task.cancel()
+            if self._opening_windows:
+                results = await asyncio.gather(
+                    *self._opening_windows, return_exceptions=True
+                )
+                if any(
+                    isinstance(result, BaseException)
+                    and not isinstance(result, asyncio.CancelledError)
+                    for result in results
+                ):
+                    errors.append(self._runtime_error("opening_windows"))
+        except BaseException:
+            errors.append(self._runtime_error("opening_windows"))
+
+        try:
+            await self.workspace.close()
+        except BaseException:
+            errors.append(self._runtime_error("workspace"))
+
+        try:
+            await self.application.close()
+        except BaseException:
+            application_result = self.application._close_result
+            if application_result is None:
+                errors.append(self._runtime_error("application", authority=True))
+            else:
+                errors.extend(application_result.errors)
+
+        try:
+            self.authority.release()
+        except BaseException:
+            errors.append(self._runtime_error("outer_authority", authority=True))
+
+        precedence = {
+            "store": 0,
+            "outer_authority": 1,
+            "application": 1,
+            "workspace": 2,
+            "opening_windows": 2,
+            "execution": 3,
+            "reconciliation": 4,
+            "events": 5,
+        }
+        errors.sort(key=lambda error: precedence[error.stage])
+        result = TerminalCloseResult(tuple(errors))
+        self._close_result = result
+        self._close_state = (
+            ApplicationCloseState.CLOSED
+            if result.succeeded
+            else ApplicationCloseState.FAILED
+        )
+        return result
+
+    def _forget_close_task(
+        self, task: asyncio.Task[TerminalCloseResult]
+    ) -> None:
+        if self._close_task is task:
+            task.result()
+            self._close_task = None
+
     async def close(self) -> None:
-        for task in tuple(self._opening_windows):
-            if not task.done():
-                task.cancel()
-        if self._opening_windows:
-            await asyncio.gather(*self._opening_windows, return_exceptions=True)
-        await self.workspace.close()
-        await self.application.close()
-        self.authority.release()
+        loop = asyncio.get_running_loop()
+        if self._close_state is ApplicationCloseState.OPEN:
+            self._close_state = ApplicationCloseState.CLOSING
+            self._close_loop = loop
+            task = loop.create_task(self._close_driver())
+            self._close_task = task
+            task.add_done_callback(self._forget_close_task)
+        elif self._close_result is None and self._close_loop is not loop:
+            raise StateError("desktop runtime close belongs to another event loop")
+        result = self._close_result
+        if result is None:
+            task = self._close_task
+            if task is None:
+                raise StateError("desktop runtime close has no terminal operation")
+            result = await asyncio.shield(task)
+        if not result.succeeded:
+            error = result.errors[0]
+            if error.public_kind == "authority":
+                raise AuthorityError(error.message) from None
+            raise StateError(error.message) from None
 
 
 def build_runtime(
@@ -125,6 +230,11 @@ def build_runtime(
             if backend == "fake"
             else None
         )
+        generation_mode = (
+            GenerationMode.CONFIGURED
+            if backend == "fake"
+            else GenerationMode.LEGACY_PHASE3_LOCAL_OPENAI
+        )
         application = BotsApplication(
             store,
             events,
@@ -137,11 +247,14 @@ def build_runtime(
             base_url=selected_base_url,
             api_key_env=selected_api_key_env,
             configuration=configuration,
+            generation_mode=generation_mode,
         )
         session = DesktopSessionInfo(
             backend_id=backend_id,
             model=selected_model,
             provider_id=provider_id,
+            generation_mode=generation_mode.value,
+            phase6_enabled=application.phase6_enabled,
         )
         return DesktopRuntime(
             paths,
@@ -167,7 +280,10 @@ def _parser() -> argparse.ArgumentParser:
         "--backend",
         choices=("fake", "local_openai"),
         default="fake",
-        help="generation backend (fake is the default)",
+        help=(
+            "generation backend; local_openai is explicit Phase 3 legacy "
+            "compatibility mode (Phase 6 planning/accounting disabled)"
+        ),
     )
     parser.add_argument(
         "--base-url",
@@ -232,7 +348,17 @@ def main(argv: list[str] | None = None) -> int:
                     await runtime.open_window(state)
                 await workspace.wait_closed()
             finally:
-                await runtime.close()
+                cancelled = False
+                try:
+                    await runtime.close()
+                except asyncio.CancelledError:
+                    cancelled = True
+                    # The outer waiter may be cancelled, but qasync must not
+                    # stop while the shared non-exceptional close driver owns
+                    # live application or authority capabilities.
+                    await runtime.close()
+                if cancelled:
+                    raise asyncio.CancelledError from None
 
         try:
             with event_loop:

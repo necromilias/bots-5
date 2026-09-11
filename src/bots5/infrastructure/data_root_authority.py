@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import ctypes
 import fcntl
 import hashlib
@@ -12,13 +13,18 @@ import threading
 import uuid
 import weakref
 from contextlib import contextmanager
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Iterator
 
 from bots5.core.errors import AuthorityError
-from bots5.infrastructure.rooted_sqlite_vfs import RootedSQLiteVfs, native_library
+from bots5.infrastructure.rooted_sqlite_vfs import (
+    RootedSQLiteVfs,
+    RootedVfsRegistrationCloseUnknown,
+    native_library,
+)
 
 
 _RESOLVE_NO_XDEV = 0x01
@@ -99,6 +105,32 @@ class FileIdentity:
         return self.device_major, self.device_minor, self.inode, self.mount_id
 
 
+@dataclass(frozen=True, slots=True)
+class DirectoryIdentityBaseline:
+    device_major: int
+    device_minor: int
+    inode: int
+    mount_id: int
+    mode: int
+    uid: int
+    nlink: int
+
+    @classmethod
+    def from_identity(cls, value: FileIdentity) -> "DirectoryIdentityBaseline":
+        return cls(
+            value.device_major,
+            value.device_minor,
+            value.inode,
+            value.mount_id,
+            value.mode,
+            value.uid,
+            value.nlink,
+        )
+
+    def matches(self, value: FileIdentity) -> bool:
+        return self == DirectoryIdentityBaseline.from_identity(value)
+
+
 @dataclass(slots=True)
 class _Claim:
     label: str
@@ -106,11 +138,66 @@ class _Claim:
     status: str = "HELD"
 
 
+class _GrantStatus(str, Enum):
+    FORWARD = "FORWARD"
+    CLEANUP = "CLEANUP"
+    RELEASED = "RELEASED"
+
+
+@dataclass(slots=True)
+class _EffectGrant:
+    grant_id: str
+    epoch: str
+    pid: int
+    owner: object
+    purpose: str
+    status: _GrantStatus = _GrantStatus.FORWARD
+    resources: set[str] = field(default_factory=set)
+    issued_effects: int = 0
+
+
+class _DatabaseResourceLease:
+    """One serialized native/DBAPI resource owned by a logical grant."""
+
+    __slots__ = ("_authority", "_grant", "_resource", "released")
+
+    def __init__(self, authority, grant, resource: str):
+        self._authority = authority
+        self._grant = grant
+        self._resource = resource
+        self.released = False
+
+    def assert_forward(self) -> None:
+        """Require this resource's exact logical owner, not any live grant."""
+        if self.released:
+            raise AuthorityError("database resource ownership has been released")
+        authority = self._authority
+        authority._assert_pid()
+        with authority._condition:
+            authority._poll_native_unknown_locked()
+            current = authority._current_grant_locked(allow_startup=True)
+            if current is not self._grant or self._grant.status is not _GrantStatus.FORWARD:
+                raise AuthorityError(
+                    "database resource owning grant is unavailable or revoked"
+                )
+
+    def release(self) -> None:
+        if self.released:
+            return
+        self.released = True
+        authority = self._authority
+        with authority._condition:
+            self._grant.resources.discard(self._resource)
+            authority._publish_requested_poison_locked()
+            authority._condition.notify_all()
+
+
 _REGISTRY_LOCK = threading.RLock()
 _LOGICAL_ROOTS: dict[str, weakref.ReferenceType["DataRootAuthority"]] = {}
 _ROOT_IDENTITIES: dict[tuple[int, int, int, int], weakref.ReferenceType["DataRootAuthority"]] = {}
 _DATABASE_IDENTITIES: dict[tuple[int, int, int, int], weakref.ReferenceType["DataRootAuthority"]] = {}
 _AUTHORITIES: weakref.WeakSet["DataRootAuthority"] = weakref.WeakSet()
+_TERMINAL_AUTHORITIES: set["DataRootAuthority"] = set()
 
 
 def _native() -> ctypes.CDLL:
@@ -135,6 +222,8 @@ def _native() -> ctypes.CDLL:
         ctypes.c_ulonglong,
     ]
     library.bots5_open_component.restype = ctypes.c_int
+    library.bots5_open_fresh_directory.argtypes = [ctypes.c_int]
+    library.bots5_open_fresh_directory.restype = ctypes.c_int
     return library
 
 
@@ -239,19 +328,32 @@ class DataRootAuthority:
         self._state = AuthorityState.ACQUIRING
         self._condition = threading.Condition(threading.RLock())
         self._transition_gate = threading.Lock()
-        self._operation_local = threading.local()
+        self._epoch = uuid.uuid4().hex
+        self._grant_context: ContextVar[_EffectGrant | None] = ContextVar(
+            f"bots5_data_root_effect_grant_{id(self)}", default=None
+        )
+        self._transition_context: ContextVar[str | None] = ContextVar(
+            f"bots5_data_root_transition_grant_{id(self)}", default=None
+        )
+        self._grants: dict[str, _EffectGrant] = {}
+        self._startup_grant: _EffectGrant | None = None
+        self._pending_invalidation: AuthorityState | None = None
+        self._pending_cause: str | None = None
         self._active_operations = 0
+        self._poison_requested = False
         self._checked_out_connections = 0
         self._opening_store = False
-        self._private_close_checkout = False
         self._store = None
         self._vfs: RootedSQLiteVfs | None = None
         self._vfs_claims: dict[str, _Claim] = {}
+        self._vfs_claim_groups: dict[str, dict[str, _Claim]] = {}
+        self._vfs_instances: dict[str, RootedSQLiteVfs] = {}
         self._vfs_generation = 0
         self._main_identity: FileIdentity | None = None
         self._claims: list[_Claim] = []
         self._ancestor_claims: list[_Claim] = []
         self._descendant_claims: dict[str, _Claim] = {}
+        self._directory_baselines: dict[str, DirectoryIdentityBaseline] = {}
         self._root_claim: _Claim | None = None
         self._main_claim: _Claim | None = None
         self._migration_claim: _Claim | None = None
@@ -261,7 +363,7 @@ class DataRootAuthority:
         self._physical_release_complete = False
         self._closed_error: str | None = None
         self._close_owner: int | None = None
-        self._close_result: tuple[type[BaseException], tuple[object, ...], str] | None = None
+        self._close_result: tuple[str, str] | None = None
         _AUTHORITIES.add(self)
 
     def __copy__(self):
@@ -276,7 +378,8 @@ class DataRootAuthority:
 
     @property
     def state(self) -> AuthorityState:
-        return self._state
+        with self._condition:
+            return self._state
 
     @property
     def claim_inventory(self) -> tuple[tuple[str, str], ...]:
@@ -299,16 +402,195 @@ class DataRootAuthority:
 
     def assert_live(self) -> None:
         self._assert_pid()
-        admitted_during_close = (
-            self._state == AuthorityState.CLOSING and self._operation_depth() > 0
-        )
-        if not self.acquired and not admitted_during_close:
-            raise AuthorityError(f"data root authority is not live: {self._state.value}")
-        if self._root_claim is None or self._root_claim.fd is None:
-            raise AuthorityError("data root authority has no physical root claim")
+        with self._condition:
+            self._poll_native_unknown_locked()
+            grant = self._current_grant_locked(allow_startup=True)
+            if grant is None or grant.status is not _GrantStatus.FORWARD:
+                raise AuthorityError("data root authority has no forward effect grant")
+            if self._state not in {
+                AuthorityState.ACQUIRING,
+                AuthorityState.ACQUIRED,
+                AuthorityState.MIGRATING,
+                AuthorityState.RECOVERING,
+                AuthorityState.READY,
+                AuthorityState.CLOSING,
+            }:
+                raise AuthorityError(
+                    f"data root authority is not live: {self._state.value}"
+                )
+            if self._root_claim is None or self._root_claim.fd is None:
+                raise AuthorityError("data root authority has no physical root claim")
 
     def _operation_depth(self) -> int:
-        return int(getattr(self._operation_local, "depth", 0))
+        grant = self._grant_context.get()
+        return int(
+            grant is not None
+            and grant.epoch == self._epoch
+            and grant.pid == os.getpid()
+            and grant.owner == self._application_owner()
+            and grant.status is not _GrantStatus.RELEASED
+        )
+
+    @staticmethod
+    def _application_owner() -> object:
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            task = None
+        return task if task is not None else ("thread", threading.get_ident())
+
+    def _has_application_admission(self) -> bool:
+        grant = self._grant_context.get()
+        return bool(
+            grant is not None
+            and grant.epoch == self._epoch
+            and grant.pid == os.getpid()
+            and grant.owner == self._application_owner()
+            and grant.purpose == "application"
+            and grant.status is _GrantStatus.FORWARD
+            and self._grants.get(grant.grant_id) is grant
+        )
+
+    def _new_grant_locked(self, purpose: str) -> _EffectGrant:
+        grant = _EffectGrant(
+            uuid.uuid4().hex,
+            self._epoch,
+            self._pid,
+            self._application_owner(),
+            purpose,
+        )
+        self._grants[grant.grant_id] = grant
+        if purpose in {"runtime", "application"}:
+            self._active_operations += 1
+        return grant
+
+    def _current_grant_locked(
+        self, *, allow_startup: bool = False
+    ) -> _EffectGrant | None:
+        grant = self._grant_context.get()
+        if grant is not None:
+            if (
+                grant.epoch != self._epoch
+                or grant.pid != os.getpid()
+                or self._grants.get(grant.grant_id) is not grant
+            ):
+                raise AuthorityError("effect grant is stale or belongs to another authority")
+            if grant.owner != self._application_owner():
+                raise AuthorityError("effect grant belongs to another executor")
+            return grant
+        if (
+            allow_startup
+            and self._startup_grant is not None
+            and self._startup_grant.owner == self._application_owner()
+            and self._startup_grant.status is not _GrantStatus.RELEASED
+            and self._state
+            in {
+                AuthorityState.ACQUIRING,
+                AuthorityState.ACQUIRED,
+                AuthorityState.MIGRATING,
+                AuthorityState.RECOVERING,
+            }
+        ):
+            return self._startup_grant
+        return None
+
+    def _assert_current_forward(self) -> None:
+        self._assert_pid()
+        with self._condition:
+            self._poll_native_unknown_locked()
+            grant = self._current_grant_locked(allow_startup=True)
+            if grant is None or grant.status is not _GrantStatus.FORWARD:
+                raise AuthorityError("forward effect grant is unavailable or revoked")
+
+    @staticmethod
+    def _invalidation_rank(state: AuthorityState) -> int:
+        return {
+            AuthorityState.POISONED: 1,
+            AuthorityState.FAILED_STARTUP: 2,
+            AuthorityState.FAILED_CLOSED: 3,
+        }[state]
+
+    def _forward_work_locked(self) -> bool:
+        return any(
+            grant.status is _GrantStatus.FORWARD
+            or grant.issued_effects
+            or grant.resources
+            for grant in self._grants.values()
+        )
+
+    def _publish_requested_poison_locked(self) -> None:
+        target = self._pending_invalidation
+        if target is not None and not self._forward_work_locked():
+            self._state = target
+            self._condition.notify_all()
+
+    def _set_pending_invalidation_locked(
+        self,
+        target: AuthorityState,
+        message: str,
+        origin: _EffectGrant | None,
+    ) -> None:
+        previous = self._pending_invalidation
+        if previous is None or self._invalidation_rank(target) > self._invalidation_rank(
+            previous
+        ):
+            self._pending_invalidation = target
+        if self._pending_cause is None:
+            self._pending_cause = message
+        self._poison_requested = True
+        self._closed_error = message
+        if origin is not None and origin.status is _GrantStatus.FORWARD:
+            origin.status = _GrantStatus.CLEANUP
+        self._publish_requested_poison_locked()
+        self._condition.notify_all()
+
+    def _request_invalidation(
+        self, target: AuthorityState | str, message: str
+    ) -> None:
+        if not isinstance(target, AuthorityState):
+            target = AuthorityState(target)
+        if target not in {
+            AuthorityState.POISONED,
+            AuthorityState.FAILED_STARTUP,
+            AuthorityState.FAILED_CLOSED,
+        }:
+            raise ValueError("invalid terminal authority target")
+        with self._condition:
+            current = self._grant_context.get()
+            origin = None
+            if (
+                current is not None
+                and current.epoch == self._epoch
+                and current.pid == os.getpid()
+                and current.owner == self._application_owner()
+                and self._grants.get(current.grant_id) is current
+            ):
+                origin = current
+            self._set_pending_invalidation_locked(target, message, origin)
+
+    def _poll_native_unknown_locked(self) -> None:
+        for key, vfs in tuple(self._vfs_instances.items()):
+            if vfs.closed:
+                continue
+            try:
+                generation = vfs.unknown_close_generation
+            except AuthorityError:
+                continue
+            claims = self._vfs_claim_groups.get(key, {})
+            claim = claims.get("native-open-files")
+            if generation and claim is not None and claim.status != "UNKNOWN":
+                claim.status = "UNKNOWN"
+                self._pin_terminal()
+                self._set_pending_invalidation_locked(
+                    AuthorityState.FAILED_CLOSED,
+                    "native rooted VFS close outcome is uncertain",
+                    None,
+                )
+
+    @property
+    def poison_pending(self) -> bool:
+        with self._condition:
+            return self._pending_invalidation is not None
 
     @property
     def _root_capability(self) -> int:
@@ -339,18 +621,34 @@ class DataRootAuthority:
         try:
             claim.bind(f"\0bots5-root-v2-{os.geteuid()}-{digest}")
         except OSError as exc:
-            claim.close()
+            self._close_provisional_logical(claim)
             raise AuthorityError(
                 "mandatory abstract Unix logical-root claim is unavailable or already owned"
             ) from exc
         with _REGISTRY_LOCK:
             previous = _LOGICAL_ROOTS.get(self.spec.logical_root)
             if previous is not None and previous() is not None:
-                claim.close()
+                self._close_provisional_logical(claim)
                 raise AuthorityError("configured logical data root is already owned")
             _LOGICAL_ROOTS[self.spec.logical_root] = weakref.ref(self)
         self._logical_socket = claim
         self._logical_status = "HELD"
+
+    def _close_provisional_logical(self, claim: socket.socket) -> None:
+        """Classify an uncertain socket close before the logical claim is bound."""
+        try:
+            claim.close()
+        except OSError as exc:
+            self._claims.append(_Claim("provisional:logical-root", None, "UNKNOWN"))
+            self._logical_status = "UNKNOWN"
+            self._pin_terminal()
+            self._request_invalidation(
+                AuthorityState.FAILED_CLOSED,
+                "provisional logical-root close outcome is uncertain",
+            )
+            raise AuthorityError(
+                "provisional logical-root close outcome is uncertain"
+            ) from exc
 
     def _append_claim(self, label: str, fd: int, *, ancestor: bool = False) -> _Claim:
         claim = _Claim(label, fd)
@@ -359,18 +657,165 @@ class DataRootAuthority:
             self._ancestor_claims.append(claim)
         return claim
 
+    def _claim_scoped_fd(self, label: str, fd: int) -> _Claim:
+        self._assert_pid()
+        if any(
+            claim.fd == fd and claim.status == "HELD" for claim in self._claims
+        ):
+            raise AuthorityError("descriptor already has an authority owner")
+        return self._append_claim(f"scoped:{label}", fd)
+
+    def _release_scoped_fd(self, claim: _Claim) -> None:
+        if claim not in self._claims or not claim.label.startswith("scoped:"):
+            raise AuthorityError("scoped descriptor ownership is invalid")
+        self._close_claim(claim)
+
+    def _pin_terminal(self) -> None:
+        with _REGISTRY_LOCK:
+            _TERMINAL_AUTHORITIES.add(self)
+
+    def _record_directory_baselines(self) -> None:
+        if self._root_claim is None or self._root_claim.fd is None:
+            raise AuthorityError("root baseline has no retained capability")
+        values = {"root": self._root_claim.fd}
+        values.update(
+            {
+                relative: claim.fd
+                for relative, claim in self._descendant_claims.items()
+                if claim.fd is not None
+            }
+        )
+        if set(values) != {"root", *_FIXED_DESCENDANTS}:
+            raise AuthorityError("fixed directory topology is incomplete")
+        self._directory_baselines = {
+            relative: DirectoryIdentityBaseline.from_identity(
+                _check_directory(fd, mount_id=self._root_identity.mount_id)
+            )
+            for relative, fd in values.items()
+        }
+
+    def fresh_directory_inventory(self, relative: str) -> tuple[str, ...]:
+        """Enumerate one new open-file description and expose it only after close."""
+        self._assert_pid()
+        if relative not in {"root", *_FIXED_DESCENDANTS}:
+            raise AuthorityError(f"unknown directory observation area: {relative}")
+
+        def classify(message: str) -> None:
+            with self._condition:
+                state = self._state
+            target = (
+                AuthorityState.POISONED
+                if state in {AuthorityState.READY, AuthorityState.RECOVERING}
+                else AuthorityState.FAILED_CLOSED
+                if state == AuthorityState.CLOSING
+                else AuthorityState.FAILED_STARTUP
+            )
+            self._request_invalidation(target, message)
+
+        with self.operation():
+            claim = (
+                self._root_claim
+                if relative == "root"
+                else self._descendant_claims.get(relative)
+            )
+            baseline = self._directory_baselines.get(relative)
+            if (
+                claim is None
+                or claim.fd is None
+                or claim.status != "HELD"
+                or baseline is None
+            ):
+                classify(f"directory observation is not claimed: {relative}")
+                raise AuthorityError(
+                    f"directory observation is not claimed: {relative}"
+                )
+            fresh_fd = _native().bots5_open_fresh_directory(claim.fd)
+            if fresh_fd < 0:
+                error = ctypes.get_errno()
+                classify("fresh directory observation cannot be opened")
+                raise AuthorityError(
+                    "fresh directory observation cannot be opened"
+                ) from OSError(error, os.strerror(error))
+            fresh_claim = self._append_claim(f"fresh-view:{relative}", fresh_fd)
+            try:
+                observed = _check_directory(
+                    fresh_fd, mount_id=self._root_identity.mount_id
+                )
+                if not baseline.matches(observed):
+                    raise AuthorityError(
+                        "fresh directory observation changed identity"
+                    )
+                result = tuple(sorted(os.listdir(fresh_fd)))
+            except BaseException:
+                try:
+                    self._close_claim(fresh_claim)
+                except BaseException:
+                    self._request_invalidation(
+                        AuthorityState.FAILED_CLOSED,
+                        "fresh directory close outcome is uncertain",
+                    )
+                    raise
+                classify("fresh directory observation failed")
+                raise
+            try:
+                self._close_claim(fresh_claim)
+            except BaseException:
+                self._request_invalidation(
+                    AuthorityState.FAILED_CLOSED,
+                    "fresh directory close outcome is uncertain",
+                )
+                raise
+            return result
+
+    def database_durability_fence(self) -> None:
+        """Durably hand committed database authority to attachment mutation."""
+        def sync_claims() -> None:
+            self.assert_live()
+            if self._main_claim is None or self._main_claim.fd is None:
+                raise AuthorityError("database durability fence has no main claim")
+            os.fsync(self._main_claim.fd)
+            os.fsync(self._database_dir_capability)
+
+        with self.operation():
+            try:
+                sync_claims()
+            except BaseException:
+                with self._condition:
+                    startup = self._state in {
+                        AuthorityState.ACQUIRING,
+                        AuthorityState.ACQUIRED,
+                        AuthorityState.MIGRATING,
+                        AuthorityState.RECOVERING,
+                    }
+                self._request_invalidation(
+                    AuthorityState.FAILED_STARTUP if startup else AuthorityState.POISONED,
+                    "database durability fence failed",
+                )
+                raise
+
+    def _sync_topology_parent(self, parent_fd: int, edge_label: str) -> None:
+        """Acknowledge one fixed topology edge for this acquisition.
+
+        The label is intentionally diagnostic only.  Replaying the containing
+        directory barrier on every acquisition means a failed mkdir/fsync
+        obligation cannot be forgotten merely because the child name remains
+        visible on the next startup.
+        """
+        del edge_label
+        os.fsync(parent_fd)
+
     def _probe_required_primitives(self) -> None:
         """Exercise required data-filesystem primitives before any DB open."""
         claim = self._descendant_claims.get("database/temp")
         if claim is None or claim.fd is None:
             raise AuthorityError("data-root capability probe has no temporary directory")
         directory_fd = claim.fd
-        if os.listdir(directory_fd):
+        if self.fresh_directory_inventory("database/temp"):
             raise AuthorityError("database temporary directory contains unexplained state")
         token = uuid.uuid4().hex
         first = f".bots5-probe-{token}-a"
         second = f".bots5-probe-{token}-b"
-        descriptors: list[int] = []
+        descriptors: list[_Claim] = []
         try:
             for leaf, payload in ((first, b"A"), (second, b"B")):
                 fd = os.open(
@@ -383,14 +828,17 @@ class DataRootAuthority:
                     0o600,
                     dir_fd=directory_fd,
                 )
-                descriptors.append(fd)
+                descriptors.append(
+                    self._append_claim(f"provisional:primitive-probe:{leaf}", fd)
+                )
                 os.fchmod(fd, 0o600)
                 _check_regular(fd, mount_id=self._root_identity.mount_id)
                 if os.write(fd, payload) != 1:
                     raise AuthorityError("data-root capability probe write was short")
                 os.fsync(fd)
-            first_identity = _identity(descriptors[0])
-            second_identity = _identity(descriptors[1])
+            assert descriptors[0].fd is not None and descriptors[1].fd is not None
+            first_identity = _identity(descriptors[0].fd)
+            second_identity = _identity(descriptors[1].fd)
             from bots5.infrastructure.attachments import (
                 _rename_exchange,
                 _rename_noreplace,
@@ -400,18 +848,26 @@ class DataRootAuthority:
             opened_first = _open_component(
                 directory_fd, first, os.O_RDONLY | os.O_CLOEXEC
             )
-            opened_second = _open_component(
-                directory_fd, second, os.O_RDONLY | os.O_CLOEXEC
+            first_proof = self._append_claim(
+                "provisional:primitive-probe:first-proof", opened_first
             )
             try:
-                if (
-                    _identity(opened_first).key != second_identity.key
-                    or _identity(opened_second).key != first_identity.key
-                ):
-                    raise AuthorityError("RENAME_EXCHANGE identity proof failed")
+                opened_second = _open_component(
+                    directory_fd, second, os.O_RDONLY | os.O_CLOEXEC
+                )
+                second_proof = self._append_claim(
+                    "provisional:primitive-probe:second-proof", opened_second
+                )
+                try:
+                    if (
+                        _identity(opened_first).key != second_identity.key
+                        or _identity(opened_second).key != first_identity.key
+                    ):
+                        raise AuthorityError("RENAME_EXCHANGE identity proof failed")
+                finally:
+                    self._close_claim(second_proof)
             finally:
-                os.close(opened_second)
-                os.close(opened_first)
+                self._close_claim(first_proof)
             _rename_exchange(directory_fd, first, directory_fd, second)
             try:
                 _rename_noreplace(directory_fd, first, directory_fd, second)
@@ -426,14 +882,18 @@ class DataRootAuthority:
             os.fsync(directory_fd)
         finally:
             while descriptors:
-                os.close(descriptors.pop())
+                self._close_claim(descriptors.pop())
 
     def acquire(self) -> "DataRootAuthority":
         self._assert_pid()
         if self._state != AuthorityState.ACQUIRING:
             raise AuthorityError("data root authority may be acquired only once")
-        self._bind_logical()
+        with self._condition:
+            startup = self._new_grant_locked("startup")
+            self._startup_grant = startup
+        token = self._grant_context.set(startup)
         try:
+            self._bind_logical()
             slash = os.open("/", _DIRECTORY_FLAGS)
             self._append_claim("ancestor:/", slash, ancestor=True)
             _flock(slash, fcntl.LOCK_SH, "data-root hierarchy is already owned")
@@ -450,41 +910,42 @@ class DataRootAuthority:
                     if not final:
                         raise AuthorityError("configured data-root parent does not exist") from None
                     os.mkdir(component, 0o700, dir_fd=parent_fd)
-                    os.fsync(parent_fd)
                     child = _open_component(
                         parent_fd, component, _DIRECTORY_FLAGS, resolve=_RESOLVE_WALK
                     )
                     created = True
+                child_claim = self._append_claim(
+                    "provisional:root-component:" + component, child
+                )
                 identity = _identity(child)
                 if not stat.S_ISDIR(identity.mode) or (
                     final and identity.mount_id != parent_identity.mount_id
                 ):
-                    os.close(child)
                     raise AuthorityError("configured data root crosses an unsafe mount or type")
                 named = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
                 opened = os.fstat(child)
                 if (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino):
-                    os.close(child)
                     raise AuthorityError("configured data-root component changed during acquisition")
                 if final:
                     if created:
                         os.fchmod(child, 0o700)
                     root_identity = _check_directory(child, mount_id=parent_identity.mount_id)
                     _flock(child, fcntl.LOCK_EX, "configured data root is already owned")
-                    self._root_claim = self._append_claim("root", child)
+                    child_claim.label = "root"
+                    self._root_claim = child_claim
                     with _REGISTRY_LOCK:
                         previous = _ROOT_IDENTITIES.get(root_identity.key)
                         if previous is not None and previous() is not None:
                             raise AuthorityError("configured data-root inode is already owned")
                         _ROOT_IDENTITIES[root_identity.key] = weakref.ref(self)
                     self._root_identity = root_identity
+                    self._sync_topology_parent(parent_fd, "configured-root")
                     break
                 _flock(child, fcntl.LOCK_SH, "data-root hierarchy is already owned")
-                self._append_claim(
-                    "ancestor:/" + "/".join(self.spec.components[: index + 1]),
-                    child,
-                    ancestor=True,
+                child_claim.label = (
+                    "ancestor:/" + "/".join(self.spec.components[: index + 1])
                 )
+                self._ancestor_claims.append(child_claim)
                 parent_fd = child
                 parent_identity = identity
             assert self._root_claim is not None and self._root_claim.fd is not None
@@ -503,14 +964,15 @@ class DataRootAuthority:
                         fd = _open_component(current, component, _DIRECTORY_FLAGS)
                     except FileNotFoundError:
                         os.mkdir(component, 0o700, dir_fd=current)
-                        os.fsync(current)
                         fd = _open_component(current, component, _DIRECTORY_FLAGS)
                         created = True
+                    claim = self._append_claim(f"provisional:descendant:{key}", fd)
                     if created:
                         os.fchmod(fd, 0o700)
                     _check_directory(fd, mount_id=self._root_identity.mount_id)
                     _flock(fd, fcntl.LOCK_EX, "data-root descendant is already owned")
-                    claim = self._append_claim(f"descendant:{key}", fd)
+                    self._sync_topology_parent(current, key)
+                    claim.label = f"descendant:{key}"
                     self._descendant_claims[key] = claim
                     descendants[key] = fd
                     current = fd
@@ -521,17 +983,23 @@ class DataRootAuthority:
             self._root_identity = _check_directory(
                 self._root_claim.fd, mount_id=self._root_identity.mount_id
             )
+            self._record_directory_baselines()
             self._probe_required_primitives()
             with self._condition:
                 self._state = AuthorityState.ACQUIRED
             return self
         except BaseException as exc:
-            self._state = AuthorityState.FAILED_STARTUP
+            self._request_invalidation(
+                AuthorityState.FAILED_STARTUP,
+                "data root authority acquisition failed",
+            )
             self._close_physical_best_effort()
             self._close_logical_if_physical_released()
             if isinstance(exc, OSError):
                 raise AuthorityError("data root authority acquisition failed") from exc
             raise
+        finally:
+            self._grant_context.reset(token)
 
     def _claim_database(self) -> int:
         self.assert_live()
@@ -541,15 +1009,20 @@ class DataRootAuthority:
             fd = _open_component(self._database_dir_capability, _MAIN_LEAF, os.O_RDWR | os.O_CLOEXEC)
         except FileNotFoundError as exc:
             raise AuthorityError("authoritative database main is absent") from exc
-        identity = _check_regular(fd, mount_id=self._root_identity.mount_id)
-        _flock(fd, fcntl.LOCK_EX, "authoritative database main is already owned")
-        with _REGISTRY_LOCK:
-            previous = _DATABASE_IDENTITIES.get(identity.key)
-            if previous is not None and previous() is not None and previous() is not self:
-                os.close(fd)
-                raise AuthorityError("authoritative database inode is already owned")
-            _DATABASE_IDENTITIES[identity.key] = weakref.ref(self)
-        self._main_claim = self._append_claim("database-main", fd)
+        claim = self._append_claim("provisional:database-main", fd)
+        try:
+            identity = _check_regular(fd, mount_id=self._root_identity.mount_id)
+            _flock(fd, fcntl.LOCK_EX, "authoritative database main is already owned")
+            with _REGISTRY_LOCK:
+                previous = _DATABASE_IDENTITIES.get(identity.key)
+                if previous is not None and previous() is not None and previous() is not self:
+                    raise AuthorityError("authoritative database inode is already owned")
+                _DATABASE_IDENTITIES[identity.key] = weakref.ref(self)
+        except BaseException:
+            self._close_claim(claim)
+            raise
+        claim.label = "database-main"
+        self._main_claim = claim
         self._main_identity = identity
         return fd
 
@@ -560,20 +1033,40 @@ class DataRootAuthority:
         self.assert_live()
         if self._migration_claim is not None:
             raise AuthorityError("migration candidate claim already exists")
-        identity = _check_regular(retained_fd, mount_id=self._root_identity.mount_id)
-        _flock(retained_fd, fcntl.LOCK_EX, "migration candidate is already owned")
-        named_fd = _open_component(directory_fd, leaf, os.O_RDWR | os.O_CLOEXEC)
+        claim = next(
+            (
+                item
+                for item in self._claims
+                if item.fd == retained_fd
+                and item.status == "HELD"
+                and item.label.startswith("scoped:")
+            ),
+            None,
+        )
+        if claim is None:
+            claim = self._append_claim("provisional:migration-candidate", retained_fd)
         try:
-            if _identity(named_fd).key != identity.key:
-                raise AuthorityError("migration candidate name does not match retained claim")
-        finally:
-            os.close(named_fd)
-        with _REGISTRY_LOCK:
-            previous = _DATABASE_IDENTITIES.get(identity.key)
-            if previous is not None and previous() is not None and previous() is not self:
-                raise AuthorityError("migration candidate inode is already owned")
-            _DATABASE_IDENTITIES[identity.key] = weakref.ref(self)
-        self._migration_claim = self._append_claim("migration-candidate", retained_fd)
+            identity = _check_regular(retained_fd, mount_id=self._root_identity.mount_id)
+            _flock(retained_fd, fcntl.LOCK_EX, "migration candidate is already owned")
+            named_fd = _open_component(directory_fd, leaf, os.O_RDWR | os.O_CLOEXEC)
+            proof = self._append_claim("provisional:migration-name-proof", named_fd)
+            try:
+                if _identity(named_fd).key != identity.key:
+                    raise AuthorityError(
+                        "migration candidate name does not match retained claim"
+                    )
+            finally:
+                self._close_claim(proof)
+            with _REGISTRY_LOCK:
+                previous = _DATABASE_IDENTITIES.get(identity.key)
+                if previous is not None and previous() is not None and previous() is not self:
+                    raise AuthorityError("migration candidate inode is already owned")
+                _DATABASE_IDENTITIES[identity.key] = weakref.ref(self)
+        except BaseException:
+            self._close_claim(claim)
+            raise
+        claim.label = "migration-candidate"
+        self._migration_claim = claim
         self._migration_identity = identity
 
     def _release_migration_candidate(self) -> None:
@@ -603,6 +1096,8 @@ class DataRootAuthority:
                 claim = self._vfs_claims.get(label)
                 if claim is not None:
                     claim.status = status
+                if status == "UNKNOWN":
+                    self._pin_terminal()
             if vfs.closed:
                 self._vfs = None
 
@@ -616,11 +1111,12 @@ class DataRootAuthority:
         named_fd = _open_component(
             self._database_dir_capability, _MAIN_LEAF, os.O_RDWR | os.O_CLOEXEC
         )
+        proof = self._append_claim("provisional:promotion-name-proof", named_fd)
         try:
             if _identity(named_fd).key != identity.key:
                 raise AuthorityError("promoted name does not match retained candidate claim")
         finally:
-            os.close(named_fd)
+            self._close_claim(proof)
         self._close_database_vfs()
         old_claim = self._main_claim
         old_identity = self._main_identity
@@ -645,6 +1141,7 @@ class DataRootAuthority:
         new_fd = _open_component(
             self._database_dir_capability, _MAIN_LEAF, os.O_RDWR | os.O_CLOEXEC
         )
+        new_claim = self._append_claim("provisional:database-replacement", new_fd)
         try:
             identity = _check_regular(new_fd, mount_id=self._root_identity.mount_id)
             old_claim = self._main_claim
@@ -663,7 +1160,7 @@ class DataRootAuthority:
                     raise AuthorityError(
                         "retained database claim changed during canonical handoff"
                     )
-                os.close(new_fd)
+                self._close_claim(new_claim)
                 self._main_identity = retained_identity
                 return old_claim.fd
             _flock(new_fd, fcntl.LOCK_EX, "replacement database main is already owned")
@@ -677,11 +1174,11 @@ class DataRootAuthority:
                     raise AuthorityError("replacement database inode is already owned")
                 _DATABASE_IDENTITIES[identity.key] = weakref.ref(self)
         except BaseException:
-            os.close(new_fd)
+            self._close_claim(new_claim)
             raise
         old_claim = self._main_claim
         old_identity = self._main_identity
-        new_claim = self._append_claim("database-main", new_fd)
+        new_claim.label = "database-main"
         self._main_claim = new_claim
         self._main_identity = identity
         if old_claim is not None and old_claim is not new_claim:
@@ -709,81 +1206,238 @@ class DataRootAuthority:
         self._main_claim = None
         self._main_identity = None
 
+    def _record_vfs_registration_close_unknown(
+        self, resource_key: str | None = None
+    ) -> None:
+        if resource_key is None:
+            self._vfs_generation += 1
+            resource_key = f"rooted-vfs[{self._vfs_generation}]"
+        claim = _Claim(
+            f"{resource_key}:native-open-files",
+            None,
+            "UNKNOWN",
+        )
+        self._claims.append(claim)
+        group = {"native-open-files": claim}
+        self._vfs_claim_groups[resource_key] = group
+        self._vfs_claims = group
+        self._close_result = (
+            "rooted_vfs_registration_cleanup_incomplete",
+            "rooted VFS registration cleanup incomplete",
+        )
+        self._pin_terminal()
+        self._request_invalidation(
+            AuthorityState.FAILED_CLOSED,
+            "rooted VFS registration cleanup incomplete",
+        )
+
+    def _register_vfs_instance(
+        self, resource_key: str, vfs: RootedSQLiteVfs
+    ) -> None:
+        self._assert_current_forward()
+        with self._condition:
+            if resource_key in self._vfs_claim_groups:
+                raise AuthorityError("rooted VFS resource identity is already registered")
+            group: dict[str, _Claim] = {}
+            for label, status in vfs.close_inventory:
+                claim = _Claim(f"{resource_key}:{label}", None, status)
+                self._claims.append(claim)
+                group[label] = claim
+            self._vfs_claim_groups[resource_key] = group
+            self._vfs_instances[resource_key] = vfs
+
+    def _merge_vfs_close_inventory(
+        self, resource_key: str, inventory: tuple[tuple[str, str], ...]
+    ) -> None:
+        unknown = False
+        with self._condition:
+            group = self._vfs_claim_groups.get(resource_key)
+            if group is None:
+                raise AuthorityError("rooted VFS close has no authority ledger")
+            for label, status in inventory:
+                claim = group.get(label)
+                if claim is None:
+                    raise AuthorityError("rooted VFS close inventory changed shape")
+                claim.status = status
+                unknown = unknown or status == "UNKNOWN"
+            self._vfs_instances.pop(resource_key, None)
+        if unknown:
+            self._pin_terminal()
+            self._request_invalidation(
+                AuthorityState.FAILED_CLOSED,
+                "rooted VFS private close outcome is uncertain",
+            )
+
+    def _record_native_vfs_unknown(
+        self, resource_key: str, operation: str, generation: int
+    ) -> None:
+        del generation
+        with self._condition:
+            claim = self._vfs_claim_groups.get(resource_key, {}).get(
+                "native-open-files"
+            )
+            if claim is not None:
+                claim.status = "UNKNOWN"
+        self._pin_terminal()
+        self._request_invalidation(
+            AuthorityState.FAILED_CLOSED,
+            f"native rooted VFS close outcome is uncertain during {operation}",
+        )
+
     def _open_rooted_vfs(self) -> RootedSQLiteVfs:
         self.assert_live()
         if self._vfs is not None:
             return self._vfs
         main = self._claim_database()
-        self._vfs = RootedSQLiteVfs(
-            database_dir_fd=self._database_dir_capability,
-            main_claim_fd=main,
-            temp_dir_fd=self._directory_fd("database/temp"),
-            mount_id=self._root_identity.mount_id,
-        )
         self._vfs_generation += 1
-        self._vfs_claims = {}
-        for label, status in self._vfs.close_inventory:
-            claim = _Claim(f"rooted-vfs[{self._vfs_generation}]:{label}", None, status)
-            self._claims.append(claim)
-            self._vfs_claims[label] = claim
+        resource_key = f"rooted-vfs[{self._vfs_generation}]"
+        try:
+            vfs = RootedSQLiteVfs(
+                database_dir_fd=self._database_dir_capability,
+                main_claim_fd=main,
+                temp_dir_fd=self._directory_fd("database/temp"),
+                mount_id=self._root_identity.mount_id,
+                authority=self,
+                resource_label=resource_key,
+            )
+        except RootedVfsRegistrationCloseUnknown:
+            raise AuthorityError(
+                "rooted VFS registration cleanup incomplete"
+            ) from None
+        self._vfs = vfs
+        self._vfs_claims = self._vfs_claim_groups[resource_key]
         return self._vfs
 
     @contextmanager
     def operation(self) -> Iterator[None]:
         self._assert_pid()
+        token = None
+        created = False
         with self._condition:
-            depth = self._operation_depth()
-            if depth:
-                if self._state not in {AuthorityState.READY, AuthorityState.CLOSING}:
-                    raise AuthorityError(
-                        f"nested data-root operation rejected in {self._state.value}"
-                    )
-                self._operation_local.depth = depth + 1
-                outermost = False
-            elif self._state != AuthorityState.READY:
-                raise AuthorityError(f"data-root operation rejected in {self._state.value}")
+            self._poll_native_unknown_locked()
+            grant = self._current_grant_locked(allow_startup=True)
+            if grant is not None:
+                if grant.status is not _GrantStatus.FORWARD:
+                    raise AuthorityError("effect grant has been revoked")
+                if self._grant_context.get() is None:
+                    token = self._grant_context.set(grant)
             else:
-                self._operation_local.depth = 1
-                self._active_operations += 1
-                outermost = True
+                if (
+                    self._state != AuthorityState.READY
+                    or self._pending_invalidation is not None
+                ):
+                    raise AuthorityError(
+                        f"data-root operation rejected in {self._state.value}"
+                    )
+                grant = self._new_grant_locked("runtime")
+                token = self._grant_context.set(grant)
+                created = True
+        try:
+            yield
+        finally:
+            if created:
+                with self._condition:
+                    if grant.status is not _GrantStatus.RELEASED:
+                        grant.status = _GrantStatus.RELEASED
+                        self._active_operations -= 1
+                    self._publish_requested_poison_locked()
+                    self._condition.notify_all()
+            if token is not None:
+                self._grant_context.reset(token)
+
+    @contextmanager
+    def application_operation(self, *, independent: bool = False) -> Iterator[None]:
+        """Keep one application command ordered before any racing poison."""
+        self._assert_pid()
+        owner = self._application_owner()
+        token = None
+        created = False
+        with self._condition:
+            self._poll_native_unknown_locked()
+            raw = self._grant_context.get()
+            if raw is not None and raw.owner == owner:
+                current = self._current_grant_locked()
+                if current.status is not _GrantStatus.FORWARD:
+                    raise AuthorityError("application effect grant has been revoked")
+                grant = current
+            elif raw is not None and not independent:
+                raise AuthorityError("application effect grant belongs to another executor")
+            else:
+                grant = None
+            if grant is None and (
+                self._state != AuthorityState.READY
+                or self._pending_invalidation is not None
+            ):
+                raise AuthorityError(
+                    f"application admission rejected in {self._state.value}"
+                )
+            if grant is None:
+                grant = self._new_grant_locked("application")
+                token = self._grant_context.set(grant)
+                created = True
+        try:
+            yield
+        finally:
+            if created:
+                with self._condition:
+                    if grant.status is not _GrantStatus.RELEASED:
+                        grant.status = _GrantStatus.RELEASED
+                        self._active_operations -= 1
+                    self._publish_requested_poison_locked()
+                    self._condition.notify_all()
+            if token is not None:
+                self._grant_context.reset(token)
+
+    @contextmanager
+    def issued_effect(self) -> Iterator[None]:
+        """Retain one already-issued child effect through settlement."""
+        with self._condition:
+            grant = self._current_grant_locked()
+            if grant is None or grant.status is not _GrantStatus.FORWARD:
+                raise AuthorityError("event effect grant is unavailable or revoked")
+            grant.issued_effects += 1
         try:
             yield
         finally:
             with self._condition:
-                current = self._operation_depth()
-                if current <= 1:
-                    self._operation_local.depth = 0
-                    if outermost:
-                        self._active_operations -= 1
-                        self._condition.notify_all()
-                else:
-                    self._operation_local.depth = current - 1
+                grant.issued_effects -= 1
+                self._publish_requested_poison_locked()
+                self._condition.notify_all()
+
+    def _acquire_database_resource(self, label: str) -> _DatabaseResourceLease:
+        with self._condition:
+            self._poll_native_unknown_locked()
+            grant = self._current_grant_locked(allow_startup=True)
+            if grant is None or grant.status is not _GrantStatus.FORWARD:
+                raise AuthorityError("database resource has no forward grant")
+        self._assert_current_forward()
+        resource = f"database:{label}:{uuid.uuid4().hex}"
+        with self._condition:
+            grant.resources.add(resource)
+        return _DatabaseResourceLease(self, grant, resource)
 
     @contextmanager
     def transition(self) -> Iterator[None]:
         with self.operation():
-            with self._transition_gate:
+            grant = self._grant_context.get()
+            assert grant is not None
+            if self._transition_context.get() == grant.grant_id:
                 yield
+                return
+            with self._transition_gate:
+                token = self._transition_context.set(grant.grant_id)
+                try:
+                    yield
+                finally:
+                    self._transition_context.reset(token)
 
     def _connection_checkout(self) -> None:
         self._assert_pid()
         with self._condition:
-            if self._state not in {
-                AuthorityState.ACQUIRED,
-                AuthorityState.MIGRATING,
-                AuthorityState.RECOVERING,
-                AuthorityState.READY,
-            } and not (
-                self._state == AuthorityState.CLOSING
-                and (
-                    self._operation_depth() > 0
-                    or (
-                        self._private_close_checkout
-                        and self._close_owner == threading.get_ident()
-                    )
-                )
-            ):
-                raise AuthorityError(f"database checkout rejected in {self._state.value}")
+            self._poll_native_unknown_locked()
+            grant = self._current_grant_locked(allow_startup=True)
+            if grant is None or grant.status is not _GrantStatus.FORWARD:
+                raise AuthorityError("database checkout has no forward grant")
             self._checked_out_connections += 1
 
     def _connection_checkin(self) -> None:
@@ -792,21 +1446,66 @@ class DataRootAuthority:
                 self._checked_out_connections -= 1
             self._condition.notify_all()
 
+    @contextmanager
+    def _startup_operation(self) -> Iterator[None]:
+        self._assert_pid()
+        token = None
+        with self._condition:
+            grant = self._startup_grant
+            if (
+                grant is None
+                or grant.owner != self._application_owner()
+                or self._grants.get(grant.grant_id) is not grant
+                or grant.status is not _GrantStatus.FORWARD
+            ):
+                raise AuthorityError("startup effect grant is unavailable or revoked")
+            raw = self._grant_context.get()
+            if raw is not None and raw is not grant:
+                raise AuthorityError("another effect grant is active during startup")
+            if raw is None:
+                token = self._grant_context.set(grant)
+        try:
+            yield
+        finally:
+            if token is not None:
+                self._grant_context.reset(token)
+
     def _begin_migration(self) -> None:
         with self._condition:
             self._assert_pid()
+            grant = self._current_grant_locked(allow_startup=True)
+            if grant is not self._startup_grant or grant.status is not _GrantStatus.FORWARD:
+                raise AuthorityError("migration has no valid startup grant")
             if self._state != AuthorityState.ACQUIRED:
                 raise AuthorityError(f"migration rejected in {self._state.value}")
             self._state = AuthorityState.MIGRATING
 
     def _finish_migration(self, *, success: bool) -> None:
         with self._condition:
-            self._state = AuthorityState.ACQUIRED if success else AuthorityState.FAILED_STARTUP
+            grant = self._current_grant_locked(allow_startup=True)
+            if (
+                success
+                and grant is self._startup_grant
+                and grant.status is _GrantStatus.FORWARD
+                and self._pending_invalidation is None
+            ):
+                self._state = AuthorityState.ACQUIRED
+            elif self._pending_invalidation is None:
+                self._set_pending_invalidation_locked(
+                    AuthorityState.FAILED_STARTUP,
+                    "database migration failed",
+                    grant,
+                )
+            else:
+                self._publish_requested_poison_locked()
             self._condition.notify_all()
 
     def register_store(self, store) -> None:
         with self._condition:
             self._assert_pid()
+            grant = self._current_grant_locked(allow_startup=True)
+            if grant is not self._startup_grant or grant.status is not _GrantStatus.FORWARD:
+                raise AuthorityError("store publication has no valid startup grant")
             if self._store is not None and self._store is not store:
                 raise AuthorityError("one authority may own only one store")
             if self._state != AuthorityState.ACQUIRED:
@@ -816,9 +1515,20 @@ class DataRootAuthority:
 
     def publish_ready(self, store) -> None:
         with self._condition:
-            if self._store is not store or self._state != AuthorityState.RECOVERING:
+            grant = self._current_grant_locked(allow_startup=True)
+            if (
+                self._store is not store
+                or self._state != AuthorityState.RECOVERING
+                or grant is not self._startup_grant
+                or grant.status is not _GrantStatus.FORWARD
+                or self._pending_invalidation is not None
+                or grant.resources
+                or grant.issued_effects
+            ):
                 raise AuthorityError("store readiness publication is invalid")
             self._state = AuthorityState.READY
+            grant.status = _GrantStatus.RELEASED
+            self._startup_grant = None
             self._condition.notify_all()
 
     def open_store(self):
@@ -834,21 +1544,32 @@ class DataRootAuthority:
                 raise AuthorityError(
                     f"store construction rejected in {self._state.value}"
                 )
+            # Acquisition establishes the one startup grant before any root
+            # effect.  Once acquisition returns, its first store opener may be
+            # a designated worker; transfer ownership exactly once while the
+            # authority is still quiescent ACQUIRED.
+            if (
+                self._startup_grant is not None
+                and self._startup_grant.owner != self._application_owner()
+                and self._grant_context.get() is None
+            ):
+                self._startup_grant.owner = self._application_owner()
             self._opening_store = True
-        from bots5.infrastructure.persistence.migration_runner import upgrade_database
-        from bots5.infrastructure.persistence.sqlite import SQLiteAppStateStore
-
         try:
-            upgrade_database(authority=self)
-            return SQLiteAppStateStore._open_from_authority(self)
+            with self._startup_operation():
+                from bots5.infrastructure.persistence.migration_runner import upgrade_database
+                from bots5.infrastructure.persistence.sqlite import SQLiteAppStateStore
+
+                upgrade_database(authority=self)
+                return SQLiteAppStateStore._open_from_authority(self)
         except BaseException:
             with self._condition:
-                if self._state not in {
-                    AuthorityState.FAILED_STARTUP,
-                    AuthorityState.FAILED_CLOSED,
-                    AuthorityState.POISONED,
-                }:
-                    self._state = AuthorityState.FAILED_STARTUP
+                if self._pending_invalidation is None:
+                    self._set_pending_invalidation_locked(
+                        AuthorityState.FAILED_STARTUP,
+                        "state store startup failed",
+                        self._startup_grant,
+                    )
             raise
         finally:
             with self._condition:
@@ -857,10 +1578,15 @@ class DataRootAuthority:
 
     def poison(self, message: str) -> None:
         with self._condition:
-            if self._state in {AuthorityState.READY, AuthorityState.RECOVERING}:
-                self._state = AuthorityState.POISONED
-            self._closed_error = message
-            self._condition.notify_all()
+            startup = self._state in {
+                AuthorityState.ACQUIRING,
+                AuthorityState.ACQUIRED,
+                AuthorityState.MIGRATING,
+            }
+        self._request_invalidation(
+            AuthorityState.FAILED_STARTUP if startup else AuthorityState.POISONED,
+            message,
+        )
 
     def _close_claim(self, claim: _Claim) -> None:
         if claim.fd is None or claim.status != "HELD":
@@ -871,59 +1597,89 @@ class DataRootAuthority:
             os.close(fd)
         except OSError as exc:
             claim.status = "UNKNOWN"
+            self._pin_terminal()
+            self._request_invalidation(
+                AuthorityState.FAILED_CLOSED,
+                f"close outcome is uncertain for {claim.label}",
+            )
             raise AuthorityError(f"close outcome is uncertain for {claim.label}") from exc
         claim.status = "RELEASED"
 
     def _close_physical_best_effort(self) -> None:
-        try:
-            if self._vfs is not None:
-                self._close_database_vfs()
-            if self._migration_claim is not None:
-                identity = self._migration_identity
-                self._close_claim(self._migration_claim)
-                if identity is not None:
-                    with _REGISTRY_LOCK:
-                        current = _DATABASE_IDENTITIES.get(identity.key)
-                        if current is not None and current() is self:
-                            _DATABASE_IDENTITIES.pop(identity.key, None)
-            if self._main_claim is not None:
-                identity = self._main_identity
-                self._close_claim(self._main_claim)
-                if identity is not None:
-                    with _REGISTRY_LOCK:
-                        current = _DATABASE_IDENTITIES.get(identity.key)
-                        if current is not None and current() is self:
-                            _DATABASE_IDENTITIES.pop(identity.key, None)
-            for relative in (
-                "database/temp",
-                "database/migration",
-                "recovery",
-                "attachments/captures",
-                "attachments/staging",
-                "attachments/gc",
-                "attachments/objects",
-                "database",
-                "attachments",
-            ):
-                claim = self._descendant_claims.get(relative)
-                if claim is not None:
-                    self._close_claim(claim)
-            if self._root_claim is not None:
-                identity = getattr(self, "_root_identity", None)
-                self._close_claim(self._root_claim)
-                if identity is not None:
-                    with _REGISTRY_LOCK:
-                        current = _ROOT_IDENTITIES.get(identity.key)
-                        if current is not None and current() is self:
-                            _ROOT_IDENTITIES.pop(identity.key, None)
-            for claim in reversed(self._ancestor_claims):
-                self._close_claim(claim)
-            self._physical_release_complete = all(
-                claim.status == "RELEASED" for claim in self._claims
+        first_failure: BaseException | None = None
+
+        def attempt(operation) -> None:
+            nonlocal first_failure
+            try:
+                operation()
+            except BaseException as exc:
+                if first_failure is None:
+                    first_failure = exc
+
+        # Migration/recovery engines own distinct registered VFS instances.
+        # Their native private descriptors are authority claims too, even
+        # though only the steady-state VFS is stored in ``self._vfs``.
+        for vfs in tuple(self._vfs_instances.values()):
+            if vfs is not self._vfs:
+                attempt(vfs.close)
+        if self._vfs is not None:
+            attempt(self._close_database_vfs)
+        if self._migration_claim is not None:
+            identity = self._migration_identity
+            attempt(lambda: self._close_claim(self._migration_claim))
+            if self._migration_claim.status == "RELEASED" and identity is not None:
+                with _REGISTRY_LOCK:
+                    current = _DATABASE_IDENTITIES.get(identity.key)
+                    if current is not None and current() is self:
+                        _DATABASE_IDENTITIES.pop(identity.key, None)
+        if self._main_claim is not None:
+            identity = self._main_identity
+            attempt(lambda: self._close_claim(self._main_claim))
+            if self._main_claim.status == "RELEASED" and identity is not None:
+                with _REGISTRY_LOCK:
+                    current = _DATABASE_IDENTITIES.get(identity.key)
+                    if current is not None and current() is self:
+                        _DATABASE_IDENTITIES.pop(identity.key, None)
+        for relative in (
+            "database/temp",
+            "database/migration",
+            "recovery",
+            "attachments/captures",
+            "attachments/staging",
+            "attachments/gc",
+            "attachments/objects",
+            "database",
+            "attachments",
+        ):
+            claim = self._descendant_claims.get(relative)
+            if claim is not None:
+                attempt(lambda claim=claim: self._close_claim(claim))
+        if self._root_claim is not None:
+            identity = getattr(self, "_root_identity", None)
+            attempt(lambda: self._close_claim(self._root_claim))
+            if self._root_claim.status == "RELEASED" and identity is not None:
+                with _REGISTRY_LOCK:
+                    current = _ROOT_IDENTITIES.get(identity.key)
+                    if current is not None and current() is self:
+                        _ROOT_IDENTITIES.pop(identity.key, None)
+        for claim in reversed(self._ancestor_claims):
+            attempt(lambda claim=claim: self._close_claim(claim))
+        # Any provisional or scoped capability omitted by a role-specific path
+        # is still owned here and receives exactly one close attempt.
+        for claim in reversed(self._claims):
+            if claim.status == "HELD" and claim.fd is not None:
+                attempt(lambda claim=claim: self._close_claim(claim))
+        self._physical_release_complete = all(
+            claim.status == "RELEASED" for claim in self._claims
+        )
+        if not self._physical_release_complete:
+            self._pin_terminal()
+        if first_failure is not None:
+            self._request_invalidation(
+                AuthorityState.FAILED_CLOSED,
+                "physical data-root release is incomplete",
             )
-        except BaseException:
-            self._state = AuthorityState.FAILED_CLOSED
-            raise
+            raise first_failure
 
     def _close_logical_if_physical_released(self) -> None:
         if not self._physical_release_complete or self._logical_socket is None:
@@ -934,7 +1690,11 @@ class DataRootAuthority:
             _close_socket(claim)
         except OSError as exc:
             self._logical_status = "UNKNOWN"
-            self._state = AuthorityState.FAILED_CLOSED
+            self._pin_terminal()
+            self._request_invalidation(
+                AuthorityState.FAILED_CLOSED,
+                "logical-root close outcome is uncertain",
+            )
             raise AuthorityError("logical-root close outcome is uncertain") from exc
         self._logical_status = "RELEASED"
         with _REGISTRY_LOCK:
@@ -946,69 +1706,160 @@ class DataRootAuthority:
         result = self._close_result
         if result is None:
             return AuthorityError(f"data-root authority is terminal: {self._state.value}")
-        error_type, arguments, message = result
+        _code, message = result
+        return AuthorityError(message)
+
+    def _classified_close_failure_result(self) -> tuple[str, str]:
+        # Classify only from authority-owned scalar state. In particular, never
+        # retain or interpolate the exception whose graph may contain secrets.
+        if any(
+            claim.status == "UNKNOWN"
+            for group in self._vfs_claim_groups.values()
+            for claim in group.values()
+        ):
+            return (
+                "rooted_vfs_private_close_incomplete",
+                "rooted VFS private close incomplete",
+            )
+        return (
+            "authority_close_failed",
+            "data-root authority close failed",
+        )
+
+    def _failed_close_requires_terminal_pin(self) -> bool:
+        return (
+            not self._physical_release_complete
+            or self._logical_status in {"HELD", "UNKNOWN"}
+            or any(
+                claim.status in {"HELD", "UNKNOWN"}
+                for claim in self._claims
+            )
+        )
+
+    @contextmanager
+    def _healthy_teardown_operation(self) -> Iterator[None]:
+        with self._condition:
+            if (
+                self._state != AuthorityState.CLOSING
+                or self._pending_invalidation is not None
+                or self._forward_work_locked()
+                or any(grant.resources for grant in self._grants.values())
+                or self._checked_out_connections
+            ):
+                raise AuthorityError("healthy teardown grant is not available")
+            grant = self._new_grant_locked("teardown")
+            token = self._grant_context.set(grant)
         try:
-            return error_type(*arguments)
-        except BaseException:
-            return AuthorityError(message)
+            yield
+        finally:
+            with self._condition:
+                grant.status = _GrantStatus.RELEASED
+                self._publish_requested_poison_locked()
+                self._condition.notify_all()
+            self._grant_context.reset(token)
 
     def close(self) -> None:
         self._assert_pid()
+        current = self._grant_context.get()
+        if (
+            current is not None
+            and current.epoch == self._epoch
+            and current.owner == self._application_owner()
+            and current.status is not _GrantStatus.RELEASED
+        ):
+            raise AuthorityError("an effect owner cannot synchronously close itself")
         caller = threading.get_ident()
         with self._condition:
             while self._state in {
                 AuthorityState.CLOSING,
                 AuthorityState.RELEASING_LOGICAL,
             } or (
-                self._state == AuthorityState.FAILED_CLOSED
-                and self._close_owner is not None
+                self._close_owner is not None
             ):
                 if self._close_owner == caller:
                     raise AuthorityError("close owner cannot re-enter data-root close")
                 self._condition.wait()
             if self._state == AuthorityState.CLOSED:
                 return
-            if self._state == AuthorityState.FAILED_CLOSED:
+            if self._close_result is not None and self._state in {
+                AuthorityState.POISONED,
+                AuthorityState.FAILED_STARTUP,
+                AuthorityState.FAILED_CLOSED,
+            }:
                 raise self._terminal_close_exception()
             if self._state in {AuthorityState.MIGRATING, AuthorityState.RECOVERING}:
                 raise AuthorityError("cannot close while startup work is active")
+            if self._state == AuthorityState.ACQUIRED and self._startup_grant is not None:
+                if self._startup_grant.owner != self._application_owner():
+                    raise AuthorityError("only the startup owner may close before READY")
+                self._startup_grant.status = _GrantStatus.RELEASED
+                self._startup_grant = None
+            preexisting_failure = self._pending_invalidation is not None or self._state in {
+                AuthorityState.POISONED,
+                AuthorityState.FAILED_STARTUP,
+                AuthorityState.FAILED_CLOSED,
+            }
             self._state = AuthorityState.CLOSING
             self._close_owner = caller
             self._close_result = None
-            while self._active_operations or self._checked_out_connections:
+            while (
+                self._forward_work_locked()
+                or any(grant.resources for grant in self._grants.values())
+                or self._checked_out_connections
+            ):
                 self._condition.wait()
+            healthy = not preexisting_failure and self._pending_invalidation is None
+        forward_failure: BaseException | None = None
         try:
-            if self._store is not None and not getattr(self._store, "closed", False):
-                with self._condition:
-                    self._private_close_checkout = True
-                try:
-                    self._store._close_under_authority()
-                finally:
-                    with self._condition:
-                        self._private_close_checkout = False
-                        self._condition.notify_all()
-            if self._checked_out_connections:
-                raise AuthorityError("database connections remain checked out after close")
-            if self._main_claim is not None and self._main_claim.fd is not None:
-                database_claim = self._descendant_claims.get("database")
-                if database_claim is None or database_claim.fd is None:
-                    raise AuthorityError("database directory claim is absent during close")
-                os.fsync(self._main_claim.fd)
-                for leaf in (
-                    "state.sqlite3-journal",
-                    "state.sqlite3-wal",
-                    "state.sqlite3-shm",
-                ):
-                    try:
-                        os.stat(
-                            leaf,
-                            dir_fd=database_claim.fd,
-                            follow_symlinks=False,
+            if healthy:
+                with self._healthy_teardown_operation():
+                    if self._store is not None and not getattr(self._store, "closed", False):
+                        self._store._close_under_authority()
+                    self._assert_current_forward()
+                    if self._checked_out_connections:
+                        raise AuthorityError(
+                            "database connections remain checked out after close"
                         )
-                    except FileNotFoundError:
-                        continue
-                    raise AuthorityError("SQLite sidecar remains during close")
-                os.fsync(database_claim.fd)
+                    if self._main_claim is not None and self._main_claim.fd is not None:
+                        database_claim = self._descendant_claims.get("database")
+                        if database_claim is None or database_claim.fd is None:
+                            raise AuthorityError(
+                                "database directory claim is absent during close"
+                            )
+                        os.fsync(self._main_claim.fd)
+                        for leaf in (
+                            "state.sqlite3-journal",
+                            "state.sqlite3-wal",
+                            "state.sqlite3-shm",
+                        ):
+                            try:
+                                os.stat(
+                                    leaf,
+                                    dir_fd=database_claim.fd,
+                                    follow_symlinks=False,
+                                )
+                            except FileNotFoundError:
+                                continue
+                            raise AuthorityError("SQLite sidecar remains during close")
+                        os.fsync(database_claim.fd)
+            elif self._store is not None and not getattr(self._store, "closed", False):
+                try:
+                    self._store._release_after_invalidation()
+                except BaseException as exc:
+                    forward_failure = exc
+                    self._request_invalidation(
+                        AuthorityState.FAILED_CLOSED,
+                        "invalidated store resource release failed",
+                    )
+        except BaseException as exc:
+            forward_failure = exc
+            self._request_invalidation(
+                AuthorityState.FAILED_CLOSED,
+                "healthy data-root teardown failed",
+            )
+
+        release_failure: BaseException | None = None
+        try:
             self._close_physical_best_effort()
             if not self._physical_release_complete:
                 raise AuthorityError("physical data-root release is incomplete")
@@ -1016,17 +1867,42 @@ class DataRootAuthority:
                 self._state = AuthorityState.RELEASING_LOGICAL
             self._close_logical_if_physical_released()
         except BaseException as exc:
+            release_failure = exc
+            self._request_invalidation(
+                AuthorityState.FAILED_CLOSED,
+                "terminal data-root resource release failed",
+            )
+
+        with self._condition:
+            # A published runtime poison is an admission outcome, not proof
+            # that physical release itself is uncertain.  Once invalidated,
+            # skip all healthy forward checks, release existing bearers only,
+            # and permit CLOSED when every release outcome is known.  UNKNOWN
+            # claims still make ``release_failure`` terminal.
+            failed = forward_failure is not None or release_failure is not None
+        if failed:
+            close_result = self._classified_close_failure_result()
             with self._condition:
-                self._state = AuthorityState.FAILED_CLOSED
-                self._close_result = (type(exc), exc.args, str(exc))
+                self._publish_requested_poison_locked()
+                if self._state in {
+                    AuthorityState.CLOSING,
+                    AuthorityState.RELEASING_LOGICAL,
+                }:
+                    self._state = (
+                        self._pending_invalidation or AuthorityState.FAILED_CLOSED
+                    )
+                self._close_result = close_result
+                if self._failed_close_requires_terminal_pin():
+                    self._pin_terminal()
                 self._close_owner = None
                 self._condition.notify_all()
-            raise self._terminal_close_exception() from exc
-        else:
-            with self._condition:
-                self._state = AuthorityState.CLOSED
-                self._close_owner = None
-                self._condition.notify_all()
+            raise self._terminal_close_exception() from None
+        with self._condition:
+            self._state = AuthorityState.CLOSED
+            self._pending_invalidation = None
+            self._poison_requested = False
+            self._close_owner = None
+            self._condition.notify_all()
 
     release = close
 

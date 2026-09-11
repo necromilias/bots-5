@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from collections import UserDict
+from contextlib import contextmanager
 
 import pytest
 import httpx
@@ -73,6 +74,15 @@ def _upgrade_to(database: Path, revision: str) -> None:
     authority_upgrade_to(database, revision)
 
 
+@contextmanager
+def _engine_connection(store, *, transaction: bool = False):
+    """Supply the explicit test grant required for private Engine probes."""
+    with store.command_admission():
+        scope = store.engine.begin() if transaction else store.engine.connect()
+        with scope as connection:
+            yield connection
+
+
 def _configured_application(tmp_path: Path, backend=None, *, secret_store=None):
     database = tmp_path / "state.sqlite3"
     upgrade_database(database)
@@ -115,7 +125,7 @@ def test_fresh_phase5_seed_and_pre_phase5_chat_selection_required(tmp_path: Path
         assert connections[0].backend_type is BackendType.FAKE
         assert models[0].provider_model_id == "fake-v0.1"
         assert store.get_chat_model_selection("old") is None
-        with store.engine.connect() as connection:
+        with _engine_connection(store) as connection:
             assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0009_phase6_context_attachments"
     finally:
         store.close()
@@ -277,7 +287,7 @@ def test_application_default_connection_retirement_requires_replacement_at_publi
                     expected_revision=connection.revision,
                 )
             assert store.get_application_generation_config()[1] == model.id
-            with store.engine.begin() as db:
+            with _engine_connection(store, transaction=True) as db:
                 with pytest.raises(SqlAlchemyIntegrityError, match="replacement"):
                     db.execute(
                         text(
@@ -310,7 +320,7 @@ def test_raw_retired_connection_cannot_be_resurrected_after_restart(tmp_path: Pa
 
         reopened = SQLiteAppStateStore.open(tmp_path / "state.sqlite3")
         try:
-            with reopened.engine.begin() as database:
+            with _engine_connection(reopened, transaction=True) as database:
                 with pytest.raises(SqlAlchemyIntegrityError, match="resurrected"):
                     database.execute(
                         text(
@@ -346,7 +356,7 @@ def test_raw_connection_identity_edit_cannot_preserve_catalogue_authority(tmp_pa
             )
             before = store.get_provider_connection(connection.id)
             assert before is not None
-            with store.engine.begin() as db:
+            with _engine_connection(store, transaction=True) as db:
                 with pytest.raises(SqlAlchemyIntegrityError, match="core authority"):
                     db.execute(
                         text(
@@ -384,7 +394,7 @@ def test_raw_unavailable_model_cannot_become_application_default(tmp_path: Path)
                 connection.id,
                 expected_revision=connection.revision,
             )
-            with store.engine.begin() as db:
+            with _engine_connection(store, transaction=True) as db:
                 with pytest.raises(SqlAlchemyIntegrityError, match="default model"):
                     db.execute(
                         text(
@@ -429,7 +439,7 @@ def test_openrouter_required_auth_is_enforced_by_core_and_raw_sqlite_authority(t
                     ),
                     expected_revision=connection.revision,
                 )
-            with store.engine.begin() as db:
+            with _engine_connection(store, transaction=True) as db:
                 with pytest.raises(SqlAlchemyIntegrityError, match="OpenRouter|provider connection"):
                     db.execute(
                         text(
@@ -507,7 +517,7 @@ def test_catalogue_revision_is_store_derived_and_cannot_regress(tmp_path: Path):
             assert {
                 item.key: item for item in application._configuration.resolve_capabilities(model.id)
             }[CapabilityKey.OUTPUT_TOKENS.value].state is CapabilityState.UNKNOWN
-            with store.engine.begin() as db:
+            with _engine_connection(store, transaction=True) as db:
                 with pytest.raises(SqlAlchemyIntegrityError, match="catalogue revision"):
                     db.execute(
                         text(
@@ -826,7 +836,7 @@ def test_catalogue_refresh_outcome_is_truthful_across_success_failure_and_restar
                 assert reopened_failed.catalogue_refresh_status is CatalogueRefreshStatus.FAILED
                 assert reopened_failed.catalogue_refresh_failure_class is CatalogueRefreshFailureClass.PROVIDER_HTTP
 
-                with reopened.engine.connect() as database:
+                with _engine_connection(reopened) as database:
                     raw = database.execute(
                         text(
                             "SELECT connection_id, status, failure_class, failure_message "
@@ -877,7 +887,7 @@ def test_failed_catalogue_refresh_survives_restart_and_requery_without_secret_le
             assert observed.catalogue_refresh_status is CatalogueRefreshStatus.FAILED
             assert observed.catalogue_refresh_failure_class is CatalogueRefreshFailureClass.PROVIDER_HTTP
             assert secret not in repr(observed)
-            with store.engine.connect() as database:
+            with _engine_connection(store) as database:
                 dump = " ".join(
                     str(value)
                     for row in database.execute(text("SELECT * FROM catalogue_refresh_state"))
@@ -918,7 +928,7 @@ def test_raw_catalogue_refresh_outcome_cannot_be_forged_or_revised_in_place(tmp_
             assert current.catalogue_refresh_status is CatalogueRefreshStatus.SUCCEEDED
             assert current.catalogue_refresh_revision == current.catalogue_revision == 1
 
-            with store.engine.begin() as database:
+            with _engine_connection(store, transaction=True) as database:
                 with pytest.raises(SqlAlchemyIntegrityError, match="requires core authority"):
                     database.execute(
                         text(
@@ -930,7 +940,7 @@ def test_raw_catalogue_refresh_outcome_cannot_be_forged_or_revised_in_place(tmp_
                         ),
                         {"connection_id": connection.id},
                     )
-            with store.engine.begin() as database:
+            with _engine_connection(store, transaction=True) as database:
                 with pytest.raises(SqlAlchemyIntegrityError, match="requires core authority"):
                     database.execute(
                         text(
@@ -1082,7 +1092,7 @@ def test_discovery_echoed_credential_is_rejected_before_catalogue_persistence(tm
             assert secret not in str(caught.value)
             assert received_authorization == [f"Bearer {secret}"]
             assert store.list_model_catalogue_entries(connection.id) == ()
-            with store.engine.connect() as db:
+            with _engine_connection(store) as db:
                 values = db.execute(
                     text(
                         "SELECT metadata_json, display_name, provider_model_id "
@@ -1433,7 +1443,7 @@ def test_raw_chat_model_selection_cannot_commit_a_contradictory_state(tmp_path: 
     try:
         now = datetime(2026, 9, 5, tzinfo=UTC)
         store.create_chat(Chat("raw-selection", "Raw selection", now, now))
-        with store.engine.begin() as connection:
+        with _engine_connection(store, transaction=True) as connection:
             connection.execute(
                 text(
                     "INSERT INTO chat_model_selection "
@@ -1881,7 +1891,7 @@ def test_raw_application_settings_revision_and_timestamp_are_authoritative(tmp_p
     upgrade_database(database)
     store = SQLiteAppStateStore.open(database)
     try:
-        with store.engine.begin() as connection:
+        with _engine_connection(store, transaction=True) as connection:
             with pytest.raises(SqlAlchemyIntegrityError, match="generation settings"):
                 connection.execute(
                     text("UPDATE application_generation_config SET revision = 0 WHERE id = 1")
@@ -2563,7 +2573,7 @@ def test_add_connection_save_and_refresh_clears_secret_before_catalogue_event_ba
             assert not task.done()
             assert secret_store.values == {"save-refresh-ref": sentinel}
             assert_no_secret_in_await_chain(task)
-            with store.engine.connect() as db:
+            with _engine_connection(store) as db:
                 dump = repr(db.execute(text("SELECT * FROM provider_connections")).fetchall())
                 dump += repr(db.execute(text("SELECT * FROM model_catalogue_entries")).fetchall())
             assert sentinel not in dump

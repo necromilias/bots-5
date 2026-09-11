@@ -23,6 +23,7 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.pool import NullPool
 from uuid6 import uuid7
 
+from bots5.core.errors import AuthorityError
 from bots5.infrastructure.data_root_authority import (
     DataRootAuthority,
     FileIdentity,
@@ -30,7 +31,10 @@ from bots5.infrastructure.data_root_authority import (
     _identity,
 )
 from bots5.infrastructure.persistence.transition_guard import install_transition_guard
-from bots5.infrastructure.rooted_sqlite_vfs import RootedSQLiteVfs
+from bots5.infrastructure.rooted_sqlite_vfs import (
+    RootedSQLiteVfs,
+    RootedVfsRegistrationCloseUnknown,
+)
 
 
 _HEAD = "0009_phase6_context_attachments"
@@ -167,6 +171,27 @@ def _read_all(fd: int, *, limit: int) -> bytes:
         chunks.append(chunk)
 
 
+def _own_fd(authority: DataRootAuthority, label: str, fd: int):
+    """Put every provisional migration descriptor in the authority ledger."""
+    return authority._claim_scoped_fd(f"migration:{label}", fd)
+
+
+def _release_fd(authority: DataRootAuthority, fd: int) -> None:
+    claim = next(
+        (
+            item
+            for item in authority._claims
+            if item.fd == fd
+            and item.status == "HELD"
+            and item.label.startswith("scoped:migration:")
+        ),
+        None,
+    )
+    if claim is None:
+        raise RuntimeError("migration descriptor has no authority owner")
+    authority._release_scoped_fd(claim)
+
+
 def _safe_regular(
     authority: DataRootAuthority, directory_fd: int, leaf: str
 ) -> tuple[int, FileIdentity]:
@@ -178,11 +203,12 @@ def _safe_regular(
         )
     except OSError as exc:
         raise RuntimeError(f"migration artifact is unavailable: {leaf}") from exc
+    claim = _own_fd(authority, f"regular:{leaf}", fd)
     try:
         value = _check_regular(fd, mount_id=authority._root_identity.mount_id)
         return fd, value
     except BaseException:
-        os.close(fd)
+        authority._release_scoped_fd(claim)
         raise
 
 
@@ -199,10 +225,11 @@ def _leaf_identity(
         return None
     except OSError as exc:
         raise RuntimeError(f"migration artifact is unsafe: {leaf}") from exc
+    claim = _own_fd(authority, f"identity:{leaf}", fd)
     try:
         return _check_regular(fd, mount_id=authority._root_identity.mount_id)
     finally:
-        os.close(fd)
+        authority._release_scoped_fd(claim)
 
 
 def _hash_fd(fd: int) -> tuple[FileIdentity, str]:
@@ -228,7 +255,7 @@ def _hash_leaf(
     try:
         return _hash_fd(fd)
     finally:
-        os.close(fd)
+        _release_fd(authority, fd)
 
 
 def _recorded_file_matches(
@@ -504,13 +531,14 @@ def _read_journal(authority: DataRootAuthority) -> dict[str, object] | None:
         )
     except FileNotFoundError:
         return None
+    claim = _own_fd(authority, "journal-read", fd)
     try:
         value = _check_regular(fd, mount_id=authority._root_identity.mount_id)
         if value.size > 128 * 1024:
             raise RuntimeError("migration journal is too large")
         raw = _read_all(fd, limit=128 * 1024)
     finally:
-        os.close(fd)
+        authority._release_scoped_fd(claim)
     try:
         record = json.loads(raw, object_pairs_hook=_parse_pairs)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -593,6 +621,7 @@ def _write_journal(
         0o600,
         dir_fd=migration_fd,
     )
+    claim = _own_fd(authority, "journal-write", fd)
     try:
         _fault(f"after-journal-create-{record['phase']}")
         _write_all(fd, _canonical_bytes(record))
@@ -600,7 +629,7 @@ def _write_journal(
         os.fsync(fd)
         _fault(f"after-journal-file-fsync-{record['phase']}")
     finally:
-        os.close(fd)
+        authority._release_scoped_fd(claim)
     if initial:
         from bots5.infrastructure.attachments import _rename_noreplace
 
@@ -626,7 +655,7 @@ def _remove_leaf(
             raise RuntimeError("migration artifact changed before deletion")
         os.unlink(leaf, dir_fd=directory_fd)
     finally:
-        os.close(fd)
+        _release_fd(authority, fd)
     _fault(f"after-unlink-{leaf}")
     os.fsync(directory_fd)
     _fault(f"after-unlink-directory-fsync-{leaf}")
@@ -634,7 +663,7 @@ def _remove_leaf(
 
 def _clean_initial_temp(authority: DataRootAuthority) -> None:
     migration_fd = authority._directory_fd("database/migration")
-    names = os.listdir(migration_fd)
+    names = authority.fresh_directory_inventory("database/migration")
     if names:
         if (
             len(names) != 1
@@ -643,9 +672,9 @@ def _clean_initial_temp(authority: DataRootAuthority) -> None:
         ):
             raise RuntimeError("unattributed migration artifact exists without a journal")
         fd, _ = _safe_regular(authority, migration_fd, names[0])
-        os.close(fd)
+        _release_fd(authority, fd)
         _remove_leaf(authority, migration_fd, names[0])
-    if os.listdir(authority._directory_fd("recovery")):
+    if authority.fresh_directory_inventory("recovery"):
         raise RuntimeError("unattributed recovery artifact exists without a journal")
 
 
@@ -654,9 +683,9 @@ def _clean_next_temp(
 ) -> None:
     migration_fd = authority._directory_fd("database/migration")
     leaf = str(record["next_update_leaf"])
-    if leaf in os.listdir(migration_fd):
+    if leaf in authority.fresh_directory_inventory("database/migration"):
         fd, _ = _safe_regular(authority, migration_fd, leaf)
-        os.close(fd)
+        _release_fd(authority, fd)
         _remove_leaf(authority, migration_fd, leaf)
 
 
@@ -668,15 +697,22 @@ def _vfs_for(
     *,
     intake_wal: bool = False,
 ) -> RootedSQLiteVfs:
-    return RootedSQLiteVfs(
-        database_dir_fd=directory_fd,
-        main_claim_fd=claim_fd,
-        temp_dir_fd=authority._directory_fd("database/temp"),
-        mount_id=authority._root_identity.mount_id,
-        main_leaf=leaf,
-        journal_leaf=leaf + "-journal",
-        intake_wal=intake_wal,
-    )
+    try:
+        return RootedSQLiteVfs(
+            database_dir_fd=directory_fd,
+            main_claim_fd=claim_fd,
+            temp_dir_fd=authority._directory_fd("database/temp"),
+            mount_id=authority._root_identity.mount_id,
+            main_leaf=leaf,
+            journal_leaf=leaf + "-journal",
+            intake_wal=intake_wal,
+            authority=authority,
+            resource_label=f"migration-vfs:{leaf}:{uuid.uuid4().hex}",
+        )
+    except RootedVfsRegistrationCloseUnknown:
+        raise AuthorityError(
+            "rooted VFS registration cleanup incomplete"
+        ) from None
 
 
 def _revision(vfs: RootedSQLiteVfs) -> str | None:
@@ -709,7 +745,28 @@ def _open_intake(authority: DataRootAuthority) -> RootedSQLiteVfs:
     )
 
 
+def _prepare_source_sidecars(authority: DataRootAuthority) -> None:
+    """Validate and parent-sync visible fixed sidecars before SQLite recovery."""
+    database_fd = authority._database_dir_capability
+    names = set(authority.fresh_directory_inventory("database"))
+    for leaf in (
+        "state.sqlite3-journal",
+        "state.sqlite3-wal",
+        "state.sqlite3-shm",
+    ):
+        if leaf not in names:
+            continue
+        fd, _ = _safe_regular(authority, database_fd, leaf)
+        try:
+            pass
+        finally:
+            _release_fd(authority, fd)
+    os.fsync(database_fd)
+    _fault("after-source-sidecar-parent-fsync")
+
+
 def _discover_existing(authority: DataRootAuthority) -> str:
+    _prepare_source_sidecars(authority)
     vfs = _open_intake(authority)
     try:
         revision = _revision(vfs)
@@ -782,6 +839,7 @@ def _discover_existing(authority: DataRootAuthority) -> str:
 def _quiesce_source(
     authority: DataRootAuthority, expected_revision: str
 ) -> tuple[FileIdentity, str]:
+    _prepare_source_sidecars(authority)
     vfs = _open_intake(authority)
     try:
         _fault("before-source-recovery")
@@ -791,21 +849,29 @@ def _quiesce_source(
                 connection.execute("PRAGMA journal_mode").fetchone()[0]
             ).lower()
             _fault("after-source-recovery")
+            connection.execute("PRAGMA synchronous=FULL")
+            synchronous = int(
+                connection.execute("PRAGMA synchronous").fetchone()[0]
+            )
+            if synchronous != 2:
+                raise RuntimeError("migration intake is not synchronous FULL")
             if initial_mode == "wal":
-                checkpoint = tuple(
-                    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-                    or ()
-                )
-                if checkpoint != (0, 0, 0):
+                mode = str(
+                    connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+                ).lower()
+                if mode != "delete":
                     raise RuntimeError("migration intake WAL checkpoint did not drain")
                 _fault("after-source-wal-checkpoint")
             elif initial_mode != "delete":
                 raise RuntimeError("migration source journal mode is unsupported")
-            mode = str(
-                connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
-            ).lower()
+            else:
+                mode = str(
+                    connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+                ).lower()
             if mode != "delete":
                 raise RuntimeError("migration intake could not enter DELETE journal mode")
+            if int(connection.execute("PRAGMA synchronous").fetchone()[0]) != 2:
+                raise RuntimeError("migration intake lost synchronous FULL")
             _fault("after-source-delete-mode")
             rows = connection.execute(
                 "SELECT version_num FROM alembic_version"
@@ -860,6 +926,17 @@ def _verify_database(
     event.listen(engine, "connect", install_transition_guard)
     try:
         with engine.connect() as connection:
+            connection.exec_driver_sql("PRAGMA synchronous=FULL")
+            synchronous = int(
+                connection.exec_driver_sql("PRAGMA synchronous").scalar_one()
+            )
+            mode = str(
+                connection.exec_driver_sql("PRAGMA journal_mode=DELETE").scalar_one()
+            ).lower()
+            if mode != "delete" or synchronous != 2:
+                raise RuntimeError(
+                    "migration validation requires DELETE/FULL before writes"
+                )
             result = connection.exec_driver_sql("PRAGMA integrity_check").scalar_one()
             if result != "ok":
                 raise RuntimeError("SQLite integrity check failed")
@@ -907,12 +984,13 @@ def _make_backup(
             0o600,
             dir_fd=recovery_fd,
         )
+        temp_claim = _own_fd(authority, "backup-temp", temp_fd)
         try:
             _fault("after-backup-temp-create")
             _copy_fd(authority._main_claim.fd, temp_fd)
             _fault("after-backup-temp-file-fsync")
         finally:
-            os.close(temp_fd)
+            authority._release_scoped_fd(temp_claim)
         from bots5.infrastructure.attachments import _rename_noreplace
 
         _rename_noreplace(recovery_fd, temporary, recovery_fd, backup)
@@ -928,7 +1006,7 @@ def _make_backup(
         finally:
             vfs.close()
     finally:
-        os.close(backup_fd)
+        _release_fd(authority, backup_fd)
     if backup_hash != source_hash or checked.size != source_identity.size:
         raise RuntimeError("verified migration backup differs from quiescent source")
     return _advance(
@@ -974,7 +1052,7 @@ def _verify_source_and_backup(
         finally:
             vfs.close()
     finally:
-        os.close(backup_fd)
+        _release_fd(authority, backup_fd)
 
 
 def _preflight_bundle(
@@ -987,9 +1065,12 @@ def _preflight_bundle(
         str(record["candidate_rollback_journal_leaf"]),
     }
     next_temp = str(record["next_update_leaf"])
-    if next_temp in os.listdir(migration_fd):
+    migration_names = set(
+        authority.fresh_directory_inventory("database/migration")
+    )
+    if next_temp in migration_names:
         allowed.add(next_temp)
-    unexpected = sorted(set(os.listdir(migration_fd)) - allowed)
+    unexpected = sorted(migration_names - allowed)
     if unexpected:
         raise RuntimeError(
             "migration directory contains unattributed evidence: "
@@ -1005,7 +1086,10 @@ def _preflight_bundle(
         allowed_recovery = {
             str(record["backup_leaf"]), str(record["backup_temp_leaf"])
         }
-        unexpected_recovery = sorted(set(os.listdir(recovery_fd)) - allowed_recovery)
+        unexpected_recovery = sorted(
+            set(authority.fresh_directory_inventory("recovery"))
+            - allowed_recovery
+        )
         if unexpected_recovery:
             raise RuntimeError(
                 "recovery directory contains unattributed evidence: "
@@ -1013,7 +1097,7 @@ def _preflight_bundle(
             )
         for leaf in allowed_recovery:
             _leaf_identity(authority, recovery_fd, leaf)
-    elif os.listdir(authority._directory_fd("recovery")):
+    elif authority.fresh_directory_inventory("recovery"):
         raise RuntimeError("fresh migration has unattributed recovery evidence")
 
 
@@ -1049,6 +1133,7 @@ def _candidate_seed(authority: DataRootAuthority, record: dict[str, object]) -> 
         0o600,
         dir_fd=migration_fd,
     )
+    candidate_claim = authority._claim_scoped_fd("migration-candidate-seed", candidate_fd)
     try:
         _fault("after-candidate-create")
         if record["source_kind"] == "EXISTING":
@@ -1067,7 +1152,7 @@ def _candidate_seed(authority: DataRootAuthority, record: dict[str, object]) -> 
                 _copy_fd(backup_fd, candidate_fd)
                 _fault("after-candidate-seed-copy-fsync")
             finally:
-                os.close(backup_fd)
+                _release_fd(authority, backup_fd)
         else:
             if os.fstat(candidate_fd).st_size != 0:
                 raise RuntimeError("fresh migration candidate seed is not empty")
@@ -1078,7 +1163,7 @@ def _candidate_seed(authority: DataRootAuthority, record: dict[str, object]) -> 
         _fault("after-candidate-seed-directory-fsync")
         return candidate_fd
     except BaseException:
-        os.close(candidate_fd)
+        authority._release_scoped_fd(candidate_claim)
         raise
 
 
@@ -1099,6 +1184,18 @@ def _run_alembic(vfs: RootedSQLiteVfs) -> None:
     config.attributes["on_version_apply"] = after_revision
     try:
         with engine.connect() as connection:
+            connection.exec_driver_sql("PRAGMA synchronous=FULL")
+            synchronous = int(
+                connection.exec_driver_sql("PRAGMA synchronous").scalar_one()
+            )
+            mode = str(
+                connection.exec_driver_sql("PRAGMA journal_mode=DELETE").scalar_one()
+            ).lower()
+            if mode != "delete" or synchronous != 2:
+                raise RuntimeError(
+                    "candidate migration requires DELETE/FULL before Alembic"
+                )
+            _fault("after-candidate-delete-full-config")
             config.attributes["connection"] = connection
             command.upgrade(config, _HEAD)
     finally:
@@ -1137,11 +1234,17 @@ def _build_candidate(
             _fault("after-candidate-alembic")
             connection = vfs.connect()
             try:
+                connection.execute("PRAGMA synchronous=FULL")
+                synchronous = int(
+                    connection.execute("PRAGMA synchronous").fetchone()[0]
+                )
                 mode = str(
                     connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
                 ).lower()
                 if mode != "delete":
                     raise RuntimeError("candidate did not quiesce in DELETE mode")
+                if synchronous != 2:
+                    raise RuntimeError("candidate did not quiesce with synchronous FULL")
                 _fault("after-candidate-delete-mode")
             finally:
                 connection.close()
@@ -1166,10 +1269,12 @@ def _build_candidate(
         _fault("after-candidate-directory-fsync")
         candidate_identity, candidate_hash = _hash_fd(candidate_fd)
         _fault("after-candidate-hash")
+        # Ownership transfers to the adoption routine even if its validation
+        # fails; the candidate descriptor is never closed by two owners.
+        adopted = True
         authority._adopt_migration_candidate(
             candidate_fd, migration_fd, str(record["candidate_leaf"])
         )
-        adopted = True
         _fault("after-candidate-claim")
         return _advance(
             record,
@@ -1183,7 +1288,18 @@ def _build_candidate(
         )
     finally:
         if not adopted:
-            os.close(candidate_fd)
+            claim = next(
+                (
+                    item
+                    for item in authority._claims
+                    if item.fd == candidate_fd
+                    and item.status == "HELD"
+                    and item.label.startswith("scoped:")
+                ),
+                None,
+            )
+            if claim is not None:
+                authority._release_scoped_fd(claim)
 
 
 def _candidate_matches(
@@ -1220,11 +1336,7 @@ def _validate_private_candidate(
     _require_no_sidecars(authority, migration_fd, leaf)
     if authority._migration_claim is None:
         candidate_fd, _ = _safe_regular(authority, migration_fd, leaf)
-        try:
-            authority._adopt_migration_candidate(candidate_fd, migration_fd, leaf)
-        except BaseException:
-            os.close(candidate_fd)
-            raise
+        authority._adopt_migration_candidate(candidate_fd, migration_fd, leaf)
     claim = authority._migration_claim
     if claim is None or claim.fd is None:
         raise RuntimeError("validated candidate claim is unavailable")

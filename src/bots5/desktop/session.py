@@ -6,6 +6,7 @@ from collections import defaultdict
 from PySide6.QtCore import QObject, Signal
 
 from bots5.core.application import BotsApplication
+from bots5.core.errors import StateError
 from bots5.core.events import CoreEvent
 from bots5.domain.ids import IdFactory, Uuid7Factory
 from bots5.domain.models import ChatActivity, WorkspaceWindowState
@@ -52,12 +53,18 @@ class DesktopSessionController(QObject):
         self._background_completion: set[str] = set()
         self._needs_attention: set[str] = set()
         self._closed_event: asyncio.Event | None = None
+        self._close_loop: asyncio.AbstractEventLoop | None = None
+        self._close_task: asyncio.Task[bool] | None = None
+        self._close_result: bool | None = None
+        self._closing = False
 
     @property
     def window_count(self) -> int:
         return len(self._windows)
 
     def start(self) -> None:
+        if self._closing or self._close_result is not None:
+            raise StateError("desktop session is closed")
         if not self._started:
             self.bridge.start()
             self._started = True
@@ -184,6 +191,37 @@ class DesktopSessionController(QObject):
         assert self._closed_event is not None
         await self._closed_event.wait()
 
-    async def close(self) -> None:
-        await self.bridge.stop_async()
+    async def _close_driver(self) -> bool:
+        try:
+            await self.bridge.stop_async()
+        except BaseException:
+            result = False
+        else:
+            result = True
         self._started = False
+        self._close_result = result
+        return result
+
+    def _forget_close_task(self, task: asyncio.Task[bool]) -> None:
+        if self._close_task is task:
+            task.result()
+            self._close_task = None
+
+    async def close(self) -> None:
+        loop = asyncio.get_running_loop()
+        if not self._closing and self._close_result is None:
+            self._closing = True
+            self._close_loop = loop
+            task = loop.create_task(self._close_driver())
+            self._close_task = task
+            task.add_done_callback(self._forget_close_task)
+        elif self._close_result is None and self._close_loop is not loop:
+            raise StateError("desktop session close belongs to another event loop")
+        result = self._close_result
+        if result is None:
+            task = self._close_task
+            if task is None:
+                raise StateError("desktop session close has no terminal operation")
+            result = await asyncio.shield(task)
+        if not result:
+            raise StateError("desktop session bridge close failed") from None

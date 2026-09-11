@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 import errno
 import fcntl
+import gc
 import hashlib
+import inspect
 import json
 import os
 import sqlite3
@@ -20,19 +22,24 @@ import sys
 import threading
 import time
 import tomllib
+import tempfile
+import weakref
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.engine import Connection
 from sqlalchemy.exc import DatabaseError as SqlAlchemyDatabaseError
 from uuid6 import uuid7
 
-from bots5.core.application import BotsApplication
+from bots5.core.application import BotsApplication, GenerationMode
 from bots5.core.context import ContextBuildError, ContextBuilder, ContextSource
 from bots5.core.errors import AuthorityError, StateError
 from bots5.core.events import EventBus
+from bots5.core.generation import GenerationCompleted, GenerationDelta, GenerationDispatched
 from bots5.core.provider_configuration import ProviderConfiguration
 from bots5.domain.clock import SystemClock
 from bots5.domain.ids import Uuid7Factory
@@ -56,6 +63,7 @@ from bots5.infrastructure.persistence.phase6_schema import (
 from bots5.infrastructure.persistence.sqlite import SQLiteAppStateStore
 from bots5.infrastructure.persistence.transition_guard import (
     arm_phase6_attachment_insert,
+    arm_phase6_blob_transition,
     clear_phase6,
     require_phase6_consumed,
 )
@@ -140,6 +148,22 @@ class RecordingBackend(FakeStreamingBackend):
             yield item
 
 
+class LegacyRecordingBackend:
+    backend_id = "openai_compatible_http"
+    provider_id = "local_openai"
+    base_url = "http://127.0.0.1:9000/v1"
+    api_key_env = None
+
+    def __init__(self):
+        self.requests = []
+
+    async def stream(self, request):
+        self.requests.append(request)
+        yield GenerationDispatched(request.attempt_id)
+        yield GenerationDelta(request.attempt_id, "legacy response")
+        yield GenerationCompleted(request.attempt_id)
+
+
 def _new_authority(root: Path) -> DataRootAuthority:
     return DataRootAuthority(root.absolute()).acquire()
 
@@ -151,6 +175,162 @@ def _open_store(root: Path):
     except BaseException:
         authority.close()
         raise
+
+
+@contextmanager
+def _private_engine_connection(store, *, transaction: bool = False):
+    """Give intentional test-only raw Engine work an explicit effect grant."""
+    with store.command_admission():
+        scope = store._engine.begin() if transaction else store._engine.connect()
+        with scope as connection:
+            yield connection
+
+
+def _arm_selected_connection_close(monkeypatch, *, post_real: bool):
+    """Inject one close result only on the selected explicit transaction."""
+    selected: dict[str, object] = {"connection": None, "close_calls": 0}
+    original_exec_driver_sql = Connection.exec_driver_sql
+    original_close = Connection.close
+
+    def select_transaction(self, statement, *args, **kwargs):
+        result = original_exec_driver_sql(self, statement, *args, **kwargs)
+        if (
+            selected["connection"] is None
+            and str(statement).strip().upper() == "BEGIN IMMEDIATE"
+        ):
+            selected["connection"] = self
+        return result
+
+    def fail_selected_close(self, *args, **kwargs):
+        if self is selected["connection"]:
+            selected["close_calls"] += 1
+            if selected["close_calls"] == 1:
+                if post_real:
+                    original_close(self, *args, **kwargs)
+                raise OSError("injected attachment connection close uncertainty")
+        return original_close(self, *args, **kwargs)
+
+    monkeypatch.setattr(Connection, "exec_driver_sql", select_transaction)
+    monkeypatch.setattr(Connection, "close", fail_selected_close)
+    return selected
+
+
+def _raw_attachment_lifecycle(root: Path):
+    database = root / "database" / "state.sqlite3"
+    with sqlite3.connect(database) as connection:
+        blobs = connection.execute(
+            "SELECT state, operation_id, stage_name, gc_id FROM attachment_blobs"
+        ).fetchall()
+        attachments = connection.execute(
+            "SELECT id, blob_digest FROM attachments ORDER BY id"
+        ).fetchall()
+    areas = {
+        area: tuple(sorted(item.name for item in (root / "attachments" / area).iterdir()))
+        for area in ("captures", "staging", "objects", "gc")
+    }
+    return blobs, attachments, areas
+
+
+def _tree_fingerprint(root: Path):
+    """Capture every observable regular-file/tree entry without store APIs."""
+    entries = []
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            entries.append(("symlink", relative, path.readlink().as_posix()))
+        elif path.is_dir():
+            entries.append(("directory", relative))
+        elif path.is_file():
+            entries.append(("file", relative, hashlib.sha256(path.read_bytes()).hexdigest()))
+        else:
+            entries.append(("other", relative))
+    return tuple(entries)
+
+
+def _run_pre_release_t2_child(
+    root: Path, source_path: Path
+) -> subprocess.CompletedProcess[str]:
+    source = r'''
+import os
+import sys
+from sqlalchemy.engine import Connection
+from bots5.core.errors import StateError
+from bots5.infrastructure.data_root_authority import AuthorityState, DataRootAuthority
+
+root, source_path = sys.argv[1:]
+authority = DataRootAuthority(root).acquire()
+store = authority.open_store()
+selected = {"connection": None, "close_calls": 0}
+original_exec_driver_sql = Connection.exec_driver_sql
+original_close = Connection.close
+
+def select_transaction(self, statement, *args, **kwargs):
+    result = original_exec_driver_sql(self, statement, *args, **kwargs)
+    if selected["connection"] is None and str(statement).strip().upper() == "BEGIN IMMEDIATE":
+        selected["connection"] = self
+    return result
+
+def fail_selected_close(self, *args, **kwargs):
+    if self is selected["connection"]:
+        selected["close_calls"] += 1
+        if selected["close_calls"] == 1:
+            raise OSError("injected pre-release attachment connection close uncertainty")
+    return original_close(self, *args, **kwargs)
+
+Connection.exec_driver_sql = select_transaction
+Connection.close = fail_selected_close
+try:
+    store.ingest_attachment(source_path)
+except StateError as exc:
+    assert "connection close is uncertain" in str(exc)
+    assert isinstance(exc.__cause__, OSError)
+else:
+    os._exit(10)
+assert selected["connection"] is not None
+assert selected["close_calls"] == 1
+assert store._poisoned is True
+# The unresolved checked-out DB resource is itself a drain obligation.  New
+# admission is closed immediately, but terminal publication cannot overtake
+# that resource; process exit is the only honest release for this pre-real
+# close injection.
+assert authority.state is AuthorityState.READY
+assert authority.poison_pending is True
+assert authority._checked_out_connections == 1
+try:
+    store.assert_admitting()
+except StateError as exc:
+    assert "not admitting work" in str(exc)
+else:
+    os._exit(11)
+os._exit(0)
+'''
+    return subprocess.run(
+        [sys.executable, "-c", source, os.fspath(root), os.fspath(source_path)],
+        cwd=REPO,
+        env={**os.environ, "PYTHONPATH": os.fspath(REPO / "src")},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def _assert_recovered_t2(root: Path, expected_digest: str) -> None:
+    authority, store = _open_store(root)
+    try:
+        assert authority.state is AuthorityState.READY
+        blobs, attachments, areas = _raw_attachment_lifecycle(root)
+        assert blobs == [("ready", None, None, None)]
+        assert attachments == []
+        assert areas == {
+            "captures": (),
+            "staging": (),
+            "objects": (expected_digest,),
+            "gc": (),
+        }
+    finally:
+        if authority.state is not AuthorityState.CLOSED:
+            authority.close()
 
 
 def _await_state(authority: DataRootAuthority, expected: AuthorityState) -> None:
@@ -186,11 +366,2067 @@ def _configured_application(root: Path, backend=None):
     return application, store, authority
 
 
+def _assert_ef1_capture_cleanup_contract(base: Path) -> None:
+    clean_root = base / "clean-root"
+    clean_source = base / "clean-source.txt"
+    clean_source.write_bytes(b"EF1 clean cleanup control")
+    clean_authority, clean_store = _open_store(clean_root)
+    clean_captures_fd = clean_store._attachment_manager._captures_fd
+    original_fsync = os.fsync
+    clean_sync_calls = 0
+
+    def fail_first_capture_sync(fd):
+        nonlocal clean_sync_calls
+        if fd == clean_captures_fd:
+            clean_sync_calls += 1
+            if clean_sync_calls == 1:
+                raise OSError("injected capture publication barrier failure")
+        return original_fsync(fd)
+
+    os.fsync = fail_first_capture_sync
+    try:
+        with pytest.raises(OSError, match="publication barrier failure"):
+            clean_store.ingest_attachment(clean_source)
+    finally:
+        os.fsync = original_fsync
+    try:
+        assert clean_sync_calls == 2
+        assert clean_authority.state is AuthorityState.READY
+        assert clean_store._poisoned is False
+        clean_store.assert_admitting()
+        assert _raw_attachment_lifecycle(clean_root) == (
+            [],
+            [],
+            {"captures": (), "staging": (), "objects": (), "gc": ()},
+        )
+    finally:
+        if clean_authority.state is not AuthorityState.CLOSED:
+            clean_authority.close()
+
+    failed_root = base / "failed-root"
+    failed_source = base / "failed-source.txt"
+    failed_source.write_bytes(b"EF1 failed cleanup durability")
+    failed_authority, failed_store = _open_store(failed_root)
+    ids = Uuid7Factory()
+    clock = SystemClock()
+    events = EventBus(clock, ids, queue_size=16)
+    application = BotsApplication(
+        failed_store,
+        events,
+        FakeStreamingBackend(),
+        ids=ids,
+        clock=clock,
+    )
+    failed_captures_fd = failed_store._attachment_manager._captures_fd
+    failed_sync_calls = 0
+
+    def fail_publication_and_cleanup_sync(fd):
+        nonlocal failed_sync_calls
+        if fd == failed_captures_fd:
+            failed_sync_calls += 1
+            if failed_sync_calls <= 2:
+                raise OSError(
+                    f"injected capture namespace barrier failure {failed_sync_calls}"
+                )
+        return original_fsync(fd)
+
+    os.fsync = fail_publication_and_cleanup_sync
+    try:
+        with pytest.raises(
+            StateError, match="capture cleanup durability is uncertain"
+        ) as raised:
+            failed_store.ingest_attachment(failed_source)
+    finally:
+        os.fsync = original_fsync
+    assert isinstance(raised.value.__cause__, AttachmentIntegrityError)
+    assert isinstance(raised.value.__cause__.__cause__, OSError)
+    assert failed_sync_calls == 2
+    assert failed_authority.state is AuthorityState.POISONED
+    assert failed_store._poisoned is True
+    assert _raw_attachment_lifecycle(failed_root) == (
+        [],
+        [],
+        {"captures": (), "staging": (), "objects": (), "gc": ()},
+    )
+    before_tree = _tree_fingerprint(failed_root)
+    before_events = events._sequence
+    with pytest.raises(StateError, match="not admitting work"):
+        failed_store.assert_admitting()
+    with pytest.raises(StateError, match="not admitting work"):
+        failed_store.create_chat(
+            Chat(
+                str(uuid7()),
+                "EF1 unrelated store write",
+                datetime.now(UTC),
+                datetime.now(UTC),
+            )
+        )
+    with pytest.raises(StateError, match="not admitting work"):
+        asyncio.run(application.create_chat("EF1 unrelated application write"))
+    with pytest.raises(AuthorityError, match="operation rejected"):
+        failed_authority.database_durability_fence()
+    assert failed_authority.state is AuthorityState.POISONED
+    assert events._sequence == before_events
+    assert _tree_fingerprint(failed_root) == before_tree
+    assert _raw_attachment_lifecycle(failed_root)[0:2] == ([], [])
+
+    failed_authority.close()
+    assert failed_authority.state is AuthorityState.CLOSED
+    recovered_authority, recovered = _open_store(failed_root)
+    try:
+        assert recovered_authority.state is AuthorityState.READY
+        assert _raw_attachment_lifecycle(failed_root) == (
+            [],
+            [],
+            {"captures": (), "staging": (), "objects": (), "gc": ()},
+        )
+        recovered.assert_admitting()
+        recovered.create_chat(
+            Chat(
+                str(uuid7()),
+                "EF1 admitted only after recovery",
+                datetime.now(UTC),
+                datetime.now(UTC),
+            )
+        )
+        with sqlite3.connect(
+            failed_root / "database" / "state.sqlite3"
+        ) as connection:
+            assert connection.execute("SELECT count(*) FROM chats").fetchone() == (1,)
+    finally:
+        if recovered_authority.state is not AuthorityState.CLOSED:
+            recovered_authority.close()
+
+
+def test_ef1_capture_cleanup_contract_on_tmpfs(tmp_path: Path):
+    filesystem = subprocess.run(
+        ["findmnt", "-T", os.fspath(tmp_path), "-no", "FSTYPE"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert filesystem == "tmpfs"
+    _assert_ef1_capture_cleanup_contract(tmp_path)
+
+
+def test_ef1_capture_cleanup_contract_on_btrfs():
+    build = REPO / "build"
+    build.mkdir(exist_ok=True)
+    filesystem = subprocess.run(
+        ["findmnt", "-T", os.fspath(build), "-no", "FSTYPE"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert filesystem == "btrfs"
+    with tempfile.TemporaryDirectory(prefix="phase6-ef1-btrfs-", dir=build) as value:
+        _assert_ef1_capture_cleanup_contract(Path(value))
+
+
+def test_ef2_authority_only_poison_closes_application_admission_and_recovers(
+    tmp_path: Path,
+):
+    root = tmp_path / "root"
+    source = tmp_path / "source.txt"
+    source.write_bytes(b"EF2 authority-only poison")
+    child = r'''
+import asyncio
+import json
+import os
+import sqlite3
+import sys
+from datetime import UTC, datetime
+from uuid6 import uuid7
+from bots5.core.application import BotsApplication
+from bots5.core.errors import AuthorityError, StateError
+from bots5.core.events import EventBus
+from bots5.domain.clock import SystemClock
+from bots5.domain.ids import Uuid7Factory
+from bots5.domain.models import Chat
+from bots5.infrastructure.data_root_authority import AuthorityState, DataRootAuthority
+from bots5.infrastructure.generation.fake import FakeStreamingBackend
+
+async def scenario():
+    root, source = sys.argv[1:]
+    authority = DataRootAuthority(root).acquire()
+    store = authority.open_store()
+    attachment = store.ingest_attachment(source)
+    ids = Uuid7Factory()
+    clock = SystemClock()
+    events = EventBus(clock, ids, queue_size=16)
+    application = BotsApplication(
+        store, events, FakeStreamingBackend(), ids=ids, clock=clock
+    )
+    chat = await application.create_chat('EF2 durable chat')
+    await application.stage_attachment(chat.id, attachment.id)
+    selection = application._pending_attachment_ids[chat.id]
+    event_count = events._sequence
+    cancel_state = set(application._cancel_requested)
+    original_release = authority._release_scoped_fd
+    selected = {'calls': 0, 'claim': None}
+
+    def ambiguous_release(claim):
+        if claim.label == 'scoped:attachment:artifact-proof' and not selected['calls']:
+            selected['calls'] += 1
+            selected['claim'] = claim
+            original_release(claim)
+            claim.status = 'UNKNOWN'
+            raise AuthorityError('injected post-real descriptor close ambiguity')
+        original_release(claim)
+
+    authority._release_scoped_fd = ambiguous_release
+    try:
+        store.read_attachment_bytes(attachment.id)
+    except StateError as exc:
+        assert 'descriptor close outcome is uncertain' in str(exc)
+    else:
+        os._exit(20)
+    assert selected['calls'] == 1
+    assert selected['claim'].fd is None
+    assert selected['claim'].status == 'UNKNOWN'
+    assert ('scoped:attachment:artifact-proof', 'UNKNOWN') in authority.claim_inventory
+    assert authority.state is AuthorityState.POISONED
+    assert store._poisoned is False
+
+    for operation in (
+        lambda: application.unstage_attachment(chat.id, attachment.id),
+        lambda: application.stage_attachment(chat.id, attachment.id),
+        lambda: application.cancel_generation('missing-attempt'),
+        lambda: application.create_chat('EF2 blocked chat'),
+    ):
+        try:
+            await operation()
+        except StateError as exc:
+            assert 'not admitting work' in str(exc)
+        else:
+            os._exit(21)
+    try:
+        store.assert_admitting()
+    except StateError as exc:
+        assert 'not admitting work' in str(exc)
+    else:
+        os._exit(22)
+    assert application._pending_attachment_ids[chat.id] == selection
+    assert application._cancel_requested == cancel_state
+    assert events._sequence == event_count
+    try:
+        store.create_chat(
+            Chat(str(uuid7()), 'EF2 lower-gate write', datetime.now(UTC), datetime.now(UTC))
+        )
+    except StateError as exc:
+        assert 'not admitting work' in str(exc)
+    else:
+        os._exit(23)
+    with sqlite3.connect(os.path.join(root, 'database', 'state.sqlite3')) as connection:
+        assert connection.execute('SELECT count(*) FROM chats').fetchone() == (1,)
+        assert connection.execute('SELECT state FROM attachment_blobs').fetchall() == [('ready',)]
+        assert connection.execute('SELECT count(*) FROM attachments').fetchone() == (1,)
+    assert selected['calls'] == 1
+    try:
+        authority.close()
+    except AuthorityError:
+        pass
+    else:
+        os._exit(24)
+    assert authority.state is AuthorityState.FAILED_CLOSED
+    assert selected['calls'] == 1
+    payload = {
+        'attachment_id': attachment.id,
+        'digest': attachment.blob_digest,
+        'chat_id': chat.id,
+        'unknown_claim': selected['claim'].label,
+    }
+    sys.stdout.write(json.dumps(payload))
+    sys.stdout.flush()
+    os._exit(0)
+
+asyncio.run(scenario())
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", child, os.fspath(root), os.fspath(source)],
+        cwd=REPO,
+        env={**os.environ, "PYTHONPATH": os.fspath(REPO / "src")},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    evidence = json.loads(completed.stdout)
+    assert evidence["unknown_claim"] == "scoped:attachment:artifact-proof"
+    with sqlite3.connect(root / "database" / "state.sqlite3") as connection:
+        assert connection.execute("SELECT count(*) FROM chats").fetchone() == (1,)
+        assert connection.execute("SELECT state FROM attachment_blobs").fetchall() == [
+            ("ready",)
+        ]
+        assert connection.execute("SELECT count(*) FROM attachments").fetchone() == (1,)
+    assert tuple((root / "attachments" / "captures").iterdir()) == ()
+    assert tuple((root / "attachments" / "staging").iterdir()) == ()
+    assert tuple(path.name for path in (root / "attachments" / "objects").iterdir()) == (
+        evidence["digest"],
+    )
+
+    authority, store = _open_store(root)
+    try:
+        assert authority.state is AuthorityState.READY
+        assert all(status != "UNKNOWN" for _, status in authority.claim_inventory)
+        assert store.read_attachment_bytes(evidence["attachment_id"]) == source.read_bytes()
+        store.assert_admitting()
+        ids = Uuid7Factory()
+        clock = SystemClock()
+        events = EventBus(clock, ids, queue_size=16)
+        application = BotsApplication(
+            store,
+            events,
+            FakeStreamingBackend(),
+            ids=ids,
+            clock=clock,
+        )
+        assert asyncio.run(
+            application.stage_attachment(
+                evidence["chat_id"], evidence["attachment_id"]
+            )
+        ) == (evidence["attachment_id"],)
+        assert asyncio.run(
+            application.unstage_attachment(
+                evidence["chat_id"], evidence["attachment_id"]
+            )
+        ) == ()
+    finally:
+        if authority.state is not AuthorityState.CLOSED:
+            authority.close()
+
+
+def _run_ef2_concurrent_admission_child(
+    root_parent: Path,
+    *,
+    ordering: str,
+    repetitions: int = 1,
+) -> list[dict[str, object]]:
+    child = r'''
+import asyncio
+import json
+import os
+import sys
+import threading
+from datetime import UTC, datetime
+from pathlib import Path
+from uuid6 import uuid7
+from bots5.core.application import BotsApplication
+from bots5.core.errors import AuthorityError, StateError
+from bots5.core.events import EventBus
+from bots5.domain.clock import SystemClock
+from bots5.domain.ids import Uuid7Factory
+from bots5.domain.models import Chat
+from bots5.infrastructure.data_root_authority import AuthorityState, DataRootAuthority
+from bots5.infrastructure.generation.fake import FakeStreamingBackend
+
+async def one(parent, index, ordering):
+    base = parent / str(index)
+    base.mkdir()
+    root = base / 'root'
+    first_source = base / 'first.txt'
+    second_source = base / 'second.txt'
+    first_source.write_bytes(b'EF2 concurrent first')
+    second_source.write_bytes(b'EF2 concurrent second')
+    authority = DataRootAuthority(root.absolute()).acquire()
+    store = authority.open_store()
+    first = store.ingest_attachment(first_source)
+    second = store.ingest_attachment(second_source)
+    ids = Uuid7Factory()
+    clock = SystemClock()
+    events = EventBus(clock, ids, queue_size=16)
+    application = BotsApplication(
+        store, events, FakeStreamingBackend(), ids=ids, clock=clock
+    )
+    chat = await application.create_chat('EF2 concurrent')
+    await application.stage_attachment(chat.id, first.id)
+    pending_before = application._pending_attachment_ids[chat.id]
+    cancel_before = set(application._cancel_requested)
+    event_before = events._sequence
+    subscriptions_before = len(events._subscriptions)
+    original_release = authority._release_scoped_fd
+    selected = {'calls': 0, 'claim': None}
+
+    def ambiguous_release(claim):
+        if claim.label == 'scoped:attachment:artifact-proof' and not selected['calls']:
+            selected['calls'] += 1
+            selected['claim'] = claim
+            original_release(claim)
+            claim.status = 'UNKNOWN'
+            raise AuthorityError('injected post-real descriptor close ambiguity')
+        original_release(claim)
+
+    authority._release_scoped_fd = ambiguous_release
+    poison_errors = []
+
+    def cause_ambiguous_close():
+        try:
+            store.read_attachment_bytes(first.id)
+        except StateError as exc:
+            poison_errors.append(str(exc))
+        else:
+            raise AssertionError('ambiguous descriptor close unexpectedly succeeded')
+
+    if ordering == 'command-wins':
+        subscription = application.subscribe()
+        await events.publish('ef2_backpressure_barrier')
+        event_before = events._sequence
+        admitted = threading.Event()
+        release_command = threading.Event()
+        poison_finished = threading.Event()
+        original_assert = store.assert_admitting
+        admission_calls = 0
+        mid = {}
+
+        def coordinated_assert():
+            nonlocal admission_calls
+            original_assert()
+            admission_calls += 1
+            if admission_calls == 2:
+                mid['at_admission'] = {
+                    'authority_state': authority.state.value,
+                    'poison_pending': authority.poison_pending,
+                    'lease_owned': authority._has_application_admission(),
+                    'pending': application._pending_attachment_ids[chat.id],
+                    'event_sequence': events._sequence,
+                }
+                admitted.set()
+                if not release_command.wait(15):
+                    raise AssertionError('command release barrier timed out')
+
+        store.assert_admitting = coordinated_assert
+
+        async def release_event_backpressure():
+            while events._sequence == event_before:
+                await asyncio.sleep(0)
+            mid['during_event_backpressure'] = {
+                'authority_state': authority.state.value,
+                'poison_pending': authority.poison_pending,
+                'pending': application._pending_attachment_ids.get(chat.id, ()),
+                'event_sequence': events._sequence,
+            }
+            await subscription.__anext__()
+            subscription.close()
+
+        def poisoner():
+            if not admitted.wait(15):
+                poison_errors.append('command admission barrier timed out')
+                release_command.set()
+                return
+            cause_ambiguous_close()
+            mid['after_close_before_release'] = {
+                'authority_state': authority.state.value,
+                'poison_pending': authority.poison_pending,
+                'pending': application._pending_attachment_ids[chat.id],
+                'event_sequence': events._sequence,
+            }
+            poison_finished.set()
+            release_command.set()
+
+        thread = threading.Thread(target=poisoner, name='ef2-poisoner')
+        thread.start()
+        backpressure = asyncio.create_task(release_event_backpressure())
+        command_exception = None
+        try:
+            command_result = await application.unstage_attachment(chat.id, first.id)
+        except Exception as exc:
+            command_result = None
+            command_exception = f'{type(exc).__name__}: {exc}'
+        thread.join(15)
+        await asyncio.wait_for(backpressure, 15)
+        assert not thread.is_alive()
+        assert poison_finished.is_set()
+        subsequent_rejected = False
+        try:
+            await application.stage_attachment(chat.id, second.id)
+        except StateError as exc:
+            subsequent_rejected = 'not admitting work' in str(exc)
+        result = {
+            'ordering': ordering,
+            'admission_calls': admission_calls,
+            'mid': mid,
+            'command_result': command_result,
+            'command_exception': command_exception,
+            'subsequent_rejected': subsequent_rejected,
+        }
+    else:
+        cause_ambiguous_close()
+        assert authority.state is AuthorityState.POISONED
+        rejected = {}
+        operations = {
+            'unstage': lambda: application.unstage_attachment(chat.id, first.id),
+            'stage_sibling': lambda: application.stage_attachment(chat.id, second.id),
+            'cancel_sibling': lambda: application.cancel_generation('missing-attempt'),
+        }
+        for name, operation in operations.items():
+            try:
+                await operation()
+            except StateError as exc:
+                rejected[name] = 'not admitting work' in str(exc)
+            else:
+                rejected[name] = False
+        try:
+            application.subscribe()
+        except StateError as exc:
+            rejected['subscribe_sibling'] = 'not admitting work' in str(exc)
+        else:
+            rejected['subscribe_sibling'] = False
+        result = {
+            'ordering': ordering,
+            'rejected': rejected,
+            'command_result': None,
+            'command_exception': 'StateError',
+            'mid': {},
+        }
+
+    database_rejected = False
+    try:
+        store.create_chat(
+            Chat(
+                str(uuid7()),
+                'EF2 direct database probe',
+                datetime.now(UTC),
+                datetime.now(UTC),
+            )
+        )
+    except StateError:
+        database_rejected = True
+    claim = selected['claim']
+    result.update({
+        'artifact_close_calls': selected['calls'],
+        'claim_status': None if claim is None else claim.status,
+        'claim_fd': None if claim is None else claim.fd,
+        'poison_errors': poison_errors,
+        'authority_state': authority.state.value,
+        'poison_pending': authority.poison_pending,
+        'store_poisoned': store._poisoned,
+        'pending_before': pending_before,
+        'pending_after': application._pending_attachment_ids.get(chat.id, ()),
+        'cancel_unchanged': application._cancel_requested == cancel_before,
+        'event_sequence_before': event_before,
+        'event_sequence_after': events._sequence,
+        'subscriptions_unchanged': len(events._subscriptions) == subscriptions_before,
+        'database_rejected': database_rejected,
+    })
+    return result
+
+async def main():
+    parent = Path(sys.argv[1])
+    ordering = sys.argv[2]
+    repetitions = int(sys.argv[3])
+    results = []
+    for index in range(repetitions):
+        results.append(await one(parent, index, ordering))
+    sys.stdout.write(json.dumps(results))
+    sys.stdout.flush()
+    os._exit(0)
+
+asyncio.run(main())
+'''
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            child,
+            os.fspath(root_parent),
+            ordering,
+            str(repetitions),
+        ],
+        cwd=REPO,
+        env={**os.environ, "PYTHONPATH": os.fspath(REPO / "src")},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    return json.loads(completed.stdout)
+
+
+def _assert_ef2_command_wins(result: dict[str, object]) -> None:
+    assert result["ordering"] == "command-wins"
+    assert result["admission_calls"] == 2
+    assert result["mid"] == {
+        "at_admission": {
+            "authority_state": "READY",
+            "poison_pending": False,
+            "lease_owned": True,
+            "pending": result["pending_before"],
+            "event_sequence": result["event_sequence_before"],
+        },
+        "after_close_before_release": {
+            "authority_state": "READY",
+            "poison_pending": True,
+            "pending": result["pending_before"],
+            "event_sequence": result["event_sequence_before"],
+        },
+        "during_event_backpressure": {
+            "authority_state": "READY",
+            "poison_pending": True,
+            "pending": [],
+            "event_sequence": result["event_sequence_before"] + 1,
+        },
+    }
+    assert result["command_result"] == []
+    assert result["command_exception"] is None
+    assert result["pending_after"] == []
+    assert result["event_sequence_after"] == result["event_sequence_before"] + 1
+    assert result["artifact_close_calls"] == 1
+    assert result["claim_status"] == "UNKNOWN"
+    assert result["claim_fd"] is None
+    assert result["authority_state"] == "POISONED"
+    assert result["poison_pending"] is True
+    assert result["store_poisoned"] is False
+    assert result["subsequent_rejected"] is True
+    assert result["database_rejected"] is True
+    assert result["poison_errors"] == [
+        "attachment descriptor close outcome is uncertain"
+    ]
+
+
+def test_ef2_race_a_command_wins_serialization(tmp_path: Path):
+    result, = _run_ef2_concurrent_admission_child(
+        tmp_path, ordering="command-wins"
+    )
+    _assert_ef2_command_wins(result)
+
+
+def test_ef2_race_b_poison_wins_serialization_and_centrality(tmp_path: Path):
+    result, = _run_ef2_concurrent_admission_child(
+        tmp_path, ordering="poison-wins"
+    )
+    assert result["authority_state"] == "POISONED"
+    assert result["poison_pending"] is True
+    assert result["artifact_close_calls"] == 1
+    assert result["claim_status"] == "UNKNOWN"
+    assert result["claim_fd"] is None
+    assert result["rejected"] == {
+        "unstage": True,
+        "stage_sibling": True,
+        "cancel_sibling": True,
+        "subscribe_sibling": True,
+    }
+    assert result["pending_after"] == result["pending_before"]
+    assert result["cancel_unchanged"] is True
+    assert result["event_sequence_after"] == result["event_sequence_before"]
+    assert result["subscriptions_unchanged"] is True
+    assert result["database_rejected"] is True
+    assert result["poison_errors"] == [
+        "attachment descriptor close outcome is uncertain"
+    ]
+
+
+def test_ef2_race_c_original_sol_barriers_are_inverted(tmp_path: Path):
+    result, = _run_ef2_concurrent_admission_child(
+        tmp_path, ordering="command-wins"
+    )
+    before_release = result["mid"]["after_close_before_release"]
+    assert before_release["authority_state"] == "READY"
+    assert before_release["poison_pending"] is True
+    assert before_release["pending"] == result["pending_before"]
+    assert before_release["event_sequence"] == result["event_sequence_before"]
+    _assert_ef2_command_wins(result)
+
+
+def test_ef2_race_d_repeated_deterministic_serialization(tmp_path: Path):
+    results = _run_ef2_concurrent_admission_child(
+        tmp_path, ordering="command-wins", repetitions=6
+    )
+    assert len(results) == 6
+    for result in results:
+        _assert_ef2_command_wins(result)
+
+
+def test_ef2_poison_pending_gates_direct_fence_but_admitted_owner_finishes(
+    tmp_path: Path,
+):
+    authority, store = _open_store(tmp_path / "root")
+    admitted = threading.Event()
+    release = threading.Event()
+    owner_result = []
+
+    def admitted_owner():
+        try:
+            with store.command_admission():
+                admitted.set()
+                assert release.wait(15)
+                authority.database_durability_fence()
+                owner_result.append("fenced")
+        except BaseException as exc:
+            owner_result.append(f"{type(exc).__name__}: {exc}")
+
+    holder = threading.Thread(target=admitted_owner, name="ef2-fence-owner")
+    holder.start()
+    try:
+        assert admitted.wait(15)
+        authority.poison("injected competing fence poison")
+        assert authority.state is AuthorityState.READY
+        assert authority.poison_pending is True
+        with pytest.raises(AuthorityError, match="data-root operation rejected"):
+            authority.database_durability_fence()
+        release.set()
+        holder.join(15)
+        assert not holder.is_alive()
+        assert owner_result == ["fenced"]
+        assert authority._active_operations == 0
+        assert authority.state is AuthorityState.POISONED
+        assert authority.poison_pending is True
+    finally:
+        release.set()
+        holder.join(15)
+        if authority.state not in {
+            AuthorityState.CLOSED,
+            AuthorityState.FAILED_CLOSED,
+        }:
+            authority.close()
+
+
+def test_ef2_background_generation_effects_share_serialization_without_provider_lease(
+    tmp_path: Path,
+):
+    class ControlledBackend:
+        def __init__(self):
+            self.release_event = asyncio.Event()
+
+        async def stream(self, request):
+            await self.release_event.wait()
+            yield GenerationDelta(request.attempt_id, "EF2 delta")
+            yield GenerationCompleted(request.attempt_id)
+
+    async def command_wins():
+        root = tmp_path / "command-wins"
+        authority, store = _open_store(root)
+        ids = Uuid7Factory()
+        clock = SystemClock()
+        events = EventBus(clock, ids, queue_size=16)
+        backend = ControlledBackend()
+        application = BotsApplication(store, events, backend, ids=ids, clock=clock)
+        release_publish = threading.Event()
+        effect_entered = threading.Event()
+        poison_evidence = {}
+        original_publish = application._publish_after_persistence
+
+        async def coordinated_publish(kind, **payload):
+            if kind == "message_delta":
+                poison_evidence["lease_owned_at_publication"] = (
+                    authority._has_application_admission()
+                )
+                effect_entered.set()
+                assert release_publish.wait(15)
+            await original_publish(kind, **payload)
+            if kind == "message_delta":
+                poison_evidence["state_after_publication"] = authority.state.value
+                poison_evidence["pending_after_publication"] = authority.poison_pending
+
+        application._publish_after_persistence = coordinated_publish
+        try:
+            chat = await application.create_chat("EF2 generation command wins")
+            attempt = await application.send_message(chat.id, "start")
+            task = application._generation_tasks[attempt.id]
+            assistant_id = application._pending_generations[attempt.id][0].id
+            event_before = events._sequence
+            assert authority._active_operations == 0
+
+            def poisoner():
+                assert effect_entered.wait(15)
+                authority.poison("injected generation-effect poison")
+                poison_evidence["state_before_release"] = authority.state.value
+                poison_evidence["pending_before_release"] = authority.poison_pending
+                release_publish.set()
+
+            thread = threading.Thread(target=poisoner, name="ef2-generation-poisoner")
+            thread.start()
+            backend.release_event.set()
+            task_result, = await asyncio.gather(task, return_exceptions=True)
+            thread.join(15)
+            assert not thread.is_alive()
+            assert isinstance(task_result, StateError)
+            assert events._sequence == event_before + 1
+            assert poison_evidence == {
+                "lease_owned_at_publication": True,
+                "state_before_release": "READY",
+                "pending_before_release": True,
+                "state_after_publication": "READY",
+                "pending_after_publication": True,
+            }
+            assert authority.state is AuthorityState.POISONED
+            assert authority.poison_pending is True
+        finally:
+            release_publish.set()
+            if authority.state not in {
+                AuthorityState.CLOSED,
+                AuthorityState.FAILED_CLOSED,
+            }:
+                authority.close()
+        with sqlite3.connect(root / "database" / "state.sqlite3") as connection:
+            assert connection.execute(
+                "SELECT content, state FROM messages WHERE id = ?", (assistant_id,)
+            ).fetchone() == ("EF2 delta", "streaming")
+
+    async def poison_wins():
+        root = tmp_path / "poison-wins"
+        authority, store = _open_store(root)
+        ids = Uuid7Factory()
+        clock = SystemClock()
+        events = EventBus(clock, ids, queue_size=16)
+        backend = ControlledBackend()
+        application = BotsApplication(store, events, backend, ids=ids, clock=clock)
+        try:
+            chat = await application.create_chat("EF2 generation poison wins")
+            attempt = await application.send_message(chat.id, "start")
+            task = application._generation_tasks[attempt.id]
+            assistant_id = application._pending_generations[attempt.id][0].id
+            event_before = events._sequence
+            assert authority._active_operations == 0
+            authority.poison("injected pre-effect poison")
+            assert authority.state is AuthorityState.POISONED
+            backend.release_event.set()
+            task_result, = await asyncio.gather(task, return_exceptions=True)
+            assert isinstance(task_result, StateError)
+            assert events._sequence == event_before
+        finally:
+            if authority.state not in {
+                AuthorityState.CLOSED,
+                AuthorityState.FAILED_CLOSED,
+            }:
+                authority.close()
+        with sqlite3.connect(root / "database" / "state.sqlite3") as connection:
+            assert connection.execute(
+                "SELECT content, state FROM messages WHERE id = ?", (assistant_id,)
+            ).fetchone() == ("", "streaming")
+
+    asyncio.run(command_wins())
+    asyncio.run(poison_wins())
+
+
+def test_ef2_admission_reentrancy_exception_cleanup_and_terminal_close(
+    tmp_path: Path,
+):
+    authority, store = _open_store(tmp_path / "normal")
+    try:
+        with store.command_admission():
+            assert authority._active_operations == 1
+            store.assert_admitting()
+            assert authority._active_operations == 1
+        assert authority._active_operations == 0
+        with pytest.raises(RuntimeError, match="injected command failure"):
+            with store.command_admission():
+                raise RuntimeError("injected command failure")
+        assert authority._active_operations == 0
+        assert authority.state is AuthorityState.READY
+        store.assert_admitting()
+
+        admitted = threading.Event()
+        release = threading.Event()
+
+        def hold_admission():
+            with store.command_admission():
+                admitted.set()
+                assert release.wait(15)
+
+        holder = threading.Thread(target=hold_admission)
+        holder.start()
+        assert admitted.wait(15)
+        closer = threading.Thread(target=authority.close)
+        closer.start()
+        deadline = time.monotonic() + 15
+        while authority.state is not AuthorityState.CLOSING:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert closer.is_alive()
+        release.set()
+        holder.join(15)
+        closer.join(15)
+        assert not holder.is_alive()
+        assert not closer.is_alive()
+        assert authority._active_operations == 0
+        assert authority.state is AuthorityState.CLOSED
+    finally:
+        if authority.state not in {
+            AuthorityState.CLOSED,
+            AuthorityState.FAILED_CLOSED,
+        }:
+            authority.close()
+
+    poisoned, poisoned_store = _open_store(tmp_path / "poison")
+    try:
+        with pytest.raises(RuntimeError, match="injected poisoned command"):
+            with poisoned_store.command_admission():
+                poisoned.poison("injected admitted poison")
+                assert poisoned.poison_pending is True
+                assert poisoned.state is AuthorityState.POISONED
+                raise RuntimeError("injected poisoned command")
+        assert poisoned._active_operations == 0
+        assert poisoned.state is AuthorityState.POISONED
+        with pytest.raises(StateError, match="not admitting work"):
+            poisoned_store.assert_admitting()
+    finally:
+        if poisoned.state not in {
+            AuthorityState.CLOSED,
+            AuthorityState.FAILED_CLOSED,
+        }:
+            poisoned.close()
+
+
+def test_n1_close_classifier_is_one_attempt_and_monotonic():
+    class Authority:
+        def __init__(self):
+            self.state = AuthorityState.READY
+            self.reasons = []
+
+        def poison(self, reason):
+            self.reasons.append(reason)
+            self.state = AuthorityState.POISONED
+
+    class Connection:
+        def __init__(self):
+            self.close_calls = 0
+            self.released = False
+
+        def close(self):
+            self.close_calls += 1
+            raise OSError("injected close failure")
+
+    store = object.__new__(SQLiteAppStateStore)
+    authority = Authority()
+    connection = Connection()
+    store._poisoned = False
+    store._authority = authority
+    with pytest.raises(StateError, match="connection close is uncertain") as raised:
+        store._close_attachment_connection(connection, "test close")
+    assert connection.close_calls == 1
+    assert store._poisoned is True
+    assert authority.state is AuthorityState.POISONED
+    assert authority.reasons == [
+        "attachment lifecycle failure: test close database connection close outcome uncertain"
+    ]
+    assert isinstance(raised.value.__cause__, OSError)
+    connection.released = True
+    assert store._poisoned is True
+    assert authority.state is AuthorityState.POISONED
+
+
+def test_n1_t2_close_post_real_is_poisoned_and_restart_reconciles(tmp_path: Path, monkeypatch):
+    root = tmp_path / "root"
+    source = tmp_path / "payload.txt"
+    source.write_bytes(b"T2 post-real close")
+    authority, store = _open_store(root)
+    selected = _arm_selected_connection_close(monkeypatch, post_real=True)
+    try:
+        with pytest.raises(StateError, match="connection close is uncertain") as raised:
+            store.ingest_attachment(source)
+        assert isinstance(raised.value.__cause__, OSError)
+        assert selected["connection"] is not None
+        assert selected["close_calls"] == 1
+        assert store._poisoned is True
+        assert authority.state is AuthorityState.POISONED
+        assert authority._checked_out_connections == 0
+        before_rejection = _tree_fingerprint(root)
+        before = _raw_attachment_lifecycle(root)
+        with pytest.raises(StateError, match="not admitting work"):
+            store.list_attachments()
+        with pytest.raises(StateError, match="not admitting work"):
+            store.assert_admitting()
+        with pytest.raises(StateError, match="not admitting work"):
+            store.create_chat(
+                Chat(
+                    id=str(uuid7()),
+                    title="rejected after T2 close uncertainty",
+                    created_at=datetime.now(UTC),
+                    updated_at=datetime.now(UTC),
+                )
+            )
+        assert _tree_fingerprint(root) == before_rejection
+        assert _raw_attachment_lifecycle(root) == before
+    finally:
+        if authority.state is not AuthorityState.CLOSED:
+            authority.close()
+    blobs, attachments, areas = _raw_attachment_lifecycle(root)
+    assert len(blobs) == 1
+    state, operation_id, stage_name, gc_id = blobs[0]
+    assert state == "staging"
+    assert operation_id and stage_name == operation_id and gc_id is None
+    assert attachments == []
+    assert areas["captures"] == (operation_id,)
+    assert areas["staging"] == ()
+    assert areas["objects"] == ()
+    _assert_recovered_t2(root, hashlib.sha256(source.read_bytes()).hexdigest())
+
+
+def test_n1_t2_close_pre_real_requires_process_exit_and_restart_reconciles(tmp_path: Path):
+    root = tmp_path / "root"
+    source = tmp_path / "payload.txt"
+    source.write_bytes(b"T2 pre-real close")
+    _initialise_root(root)
+    completed = _run_pre_release_t2_child(root, source)
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    blobs, attachments, areas = _raw_attachment_lifecycle(root)
+    assert len(blobs) == 1
+    state, operation_id, stage_name, gc_id = blobs[0]
+    assert state == "staging"
+    assert operation_id and stage_name == operation_id and gc_id is None
+    assert attachments == []
+    assert areas["captures"] == (operation_id,)
+    assert areas["staging"] == ()
+    assert areas["objects"] == ()
+    _assert_recovered_t2(root, hashlib.sha256(source.read_bytes()).hexdigest())
+
+
+@pytest.mark.parametrize("boundary", ("T1", "T4", "T7"))
+def test_n1_live_k1_close_siblings_poison_before_unwind(
+    tmp_path: Path, monkeypatch, boundary: str
+):
+    root = tmp_path / boundary
+    source = tmp_path / f"{boundary}.txt"
+    source.write_bytes(f"{boundary} K1 close".encode())
+    authority, store = _open_store(root)
+    original = store.ingest_attachment(source)
+    selected = None
+    post_close_calls = {"database-fence": 0, "deleting-recovery": 0}
+    try:
+        if boundary == "T1":
+            selected = _arm_selected_connection_close(monkeypatch, post_real=True)
+            with pytest.raises(StateError, match="connection close is uncertain"):
+                store.ingest_attachment(source)
+        elif boundary == "T4":
+            selected = _arm_selected_connection_close(monkeypatch, post_real=True)
+            with pytest.raises(StateError, match="connection close is uncertain"):
+                store.delete_attachment(original.id)
+        else:
+            store.delete_attachment(original.id)
+            selected = _arm_selected_connection_close(monkeypatch, post_real=True)
+
+            original_fence = authority.database_durability_fence
+            original_recovery = store._recover_deleting_blob
+
+            def fence_after_close_failure():
+                post_close_calls["database-fence"] += 1
+                return original_fence()
+
+            def recovery_after_close_failure(*args, **kwargs):
+                post_close_calls["deleting-recovery"] += 1
+                return original_recovery(*args, **kwargs)
+
+            monkeypatch.setattr(authority, "database_durability_fence", fence_after_close_failure)
+            monkeypatch.setattr(store, "_recover_deleting_blob", recovery_after_close_failure)
+            with pytest.raises(StateError, match="connection close is uncertain"):
+                store.gc_attachments()
+        assert selected["connection"] is not None
+        assert selected["close_calls"] == 1
+        if boundary == "T7":
+            assert post_close_calls["database-fence"] == 0
+            assert post_close_calls["deleting-recovery"] == 0
+        assert store._poisoned is True
+        assert authority.state is AuthorityState.POISONED
+        assert authority._checked_out_connections == 0
+        with pytest.raises(StateError, match="not admitting work"):
+            store.assert_admitting()
+    finally:
+        if authority.state is not AuthorityState.CLOSED:
+            authority.close()
+
+    blobs, attachments, areas = _raw_attachment_lifecycle(root)
+    if boundary == "T1":
+        assert len(blobs) == 1 and blobs[0][0] == "ready"
+        assert len(attachments) == 2
+        assert areas["captures"] == ()
+        assert areas["staging"] == ()
+        assert areas["objects"] == (original.blob_digest,)
+    elif boundary == "T4":
+        assert blobs == [("ready", None, None, None)]
+        assert attachments == []
+        assert areas["objects"] == (original.blob_digest,)
+    else:
+        assert len(blobs) == 1
+        assert blobs[0][0] == "deleting" and blobs[0][3]
+        assert attachments == []
+        assert areas["objects"] == (original.blob_digest,)
+        assert areas["gc"] == ()
+
+    restarted_authority, restarted = _open_store(root)
+    try:
+        assert restarted_authority.state is AuthorityState.READY
+    finally:
+        if restarted_authority.state is not AuthorityState.CLOSED:
+            restarted_authority.close()
+    _, recovered_attachments, recovered_areas = _raw_attachment_lifecycle(root)
+    if boundary == "T1":
+        assert len(recovered_attachments) == 2
+        assert recovered_areas["objects"] == (original.blob_digest,)
+    elif boundary == "T4":
+        assert recovered_attachments == []
+        assert recovered_areas["objects"] == (original.blob_digest,)
+    else:
+        assert recovered_attachments == []
+        assert recovered_areas["objects"] == ()
+
+
+@pytest.mark.parametrize("operation", ("send", "edit", "regenerate"))
+def test_n1_t5_t6_application_callers_stop_before_dispatch_on_close_failure(
+    tmp_path: Path, monkeypatch, operation: str
+):
+    async def scenario():
+        backend = RecordingBackend()
+        application, store, authority = _configured_application(
+            tmp_path / operation, backend
+        )
+        source = tmp_path / f"{operation}.txt"
+        source.write_text(f"selected {operation}", encoding="utf-8")
+        try:
+            chat = await application.create_chat()
+            initial = None
+            if operation in {"edit", "regenerate"}:
+                initial_attachment = await application.attach_file(source)
+                await application.stage_attachment(chat.id, initial_attachment.id)
+                initial = await application.send_message(chat.id, "initial")
+                await _finish(application, initial.id)
+                attachment = initial_attachment
+            else:
+                attachment = await application.attach_file(source)
+            await application.stage_attachment(chat.id, attachment.id)
+            event_sequence = application._events._sequence
+            request_count = len(backend.requests)
+            selected = _arm_selected_connection_close(monkeypatch, post_real=True)
+            if operation == "send":
+                with pytest.raises(StateError, match="connection close is uncertain"):
+                    await application.send_message(chat.id, "send with attachment")
+            elif operation == "edit":
+                with pytest.raises(StateError, match="connection close is uncertain"):
+                    await application.edit_message(
+                        chat.id, initial.user_message_id, "edited with attachment"
+                    )
+            else:
+                with pytest.raises(StateError, match="connection close is uncertain"):
+                    await application.regenerate_message(
+                        chat.id, initial.assistant_message_id
+                    )
+            assert selected["connection"] is not None
+            assert selected["close_calls"] == 1
+            assert store._poisoned is True
+            assert authority.state is AuthorityState.POISONED
+            assert len(backend.requests) == request_count
+            assert application._events._sequence == event_sequence
+            assert application._pending_attachment_ids[chat.id] == (attachment.id,)
+            assert application._pending_generations == {}
+            pending_before_rejection = dict(application._pending_attachment_ids)
+            event_sequence_before_rejection = application._events._sequence
+            with pytest.raises(StateError, match="not admitting work"):
+                await application.unstage_attachment(chat.id, attachment.id)
+            assert application._pending_attachment_ids == pending_before_rejection
+            assert application._events._sequence == event_sequence_before_rejection
+            with pytest.raises(StateError, match="not admitting work"):
+                await application.list_chats()
+            assert application._pending_attachment_ids == pending_before_rejection
+            assert application._events._sequence == event_sequence_before_rejection
+        finally:
+            try:
+                await application.close()
+            except BaseException:
+                pass
+            if authority.state is not AuthorityState.CLOSED:
+                authority.close()
+
+        database = tmp_path / operation / "database" / "state.sqlite3"
+        with sqlite3.connect(database) as connection:
+            message_count = connection.execute(
+                "SELECT count(*) FROM messages WHERE chat_id = ?", (chat.id,)
+            ).fetchone()[0]
+            attempt_count = connection.execute(
+                "SELECT count(*) FROM generation_attempts WHERE chat_id = ?", (chat.id,)
+            ).fetchone()[0]
+            plan_count = connection.execute(
+                "SELECT count(*) FROM context_plans"
+            ).fetchone()[0]
+            message_ref_count = connection.execute(
+                "SELECT count(*) FROM message_attachments"
+            ).fetchone()[0]
+            attempt_ref_count = connection.execute(
+                "SELECT count(*) FROM attempt_attachments"
+            ).fetchone()[0]
+        expected_messages = 2 if operation == "send" else 3 if operation == "regenerate" else 4
+        expected_attempts = 1 if operation == "send" else 2
+        expected_plans = expected_attempts
+        expected_message_refs = 2 if operation == "edit" else 1
+        expected_attempt_refs = 1 if operation == "send" else 2
+        assert message_count == expected_messages
+        assert attempt_count == expected_attempts
+        assert plan_count == expected_plans
+        assert message_ref_count == expected_message_refs
+        assert attempt_ref_count == expected_attempt_refs
+
+        restarted_authority, restarted = _open_store(tmp_path / operation)
+        try:
+            assert restarted_authority.state is AuthorityState.READY
+            assert restarted.get_attachment(attachment.id) is not None
+        finally:
+            if restarted_authority.state is not AuthorityState.CLOSED:
+                restarted_authority.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("boundary", ("T1", "T2", "T4", "T5", "T6", "T7"))
+def test_n1_live_k0_close_failure_poison_survives_clean_business_rollback(
+    tmp_path: Path, monkeypatch, boundary: str
+):
+    async def scenario():
+        root = tmp_path / boundary
+        source = tmp_path / f"{boundary}.txt"
+        source.write_bytes(f"{boundary} K0 close".encode())
+        backend = RecordingBackend()
+        application = store = authority = None
+        baseline_requests = 0
+        baseline_events = 0
+        if boundary in {"T5", "T6"}:
+            application, store, authority = _configured_application(root, backend)
+            chat = await application.create_chat()
+            attachment = await application.attach_file(source)
+            if boundary == "T6":
+                await application.stage_attachment(chat.id, attachment.id)
+                initial = await application.send_message(chat.id, "initial")
+                await _finish(application, initial.id)
+            await application.stage_attachment(chat.id, attachment.id)
+            if boundary == "T6":
+                baseline_requests = len(backend.requests)
+            baseline_events = application._events._sequence
+        else:
+            authority, store = _open_store(root)
+            attachment = None
+            if boundary != "T2":
+                attachment = store.ingest_attachment(source)
+            if boundary == "T7":
+                store.delete_attachment(attachment.id)
+
+        marker = {
+            "T1": "INSERT INTO ATTACHMENTS",
+            "T2": "INSERT INTO ATTACHMENT_BLOBS",
+            "T4": "DELETE FROM ATTACHMENTS",
+            "T5": "INSERT INTO MESSAGES",
+            "T6": "INSERT INTO MESSAGES",
+            "T7": "UPDATE ATTACHMENT_BLOBS",
+        }[boundary]
+        selected = _arm_selected_connection_close(monkeypatch, post_real=True)
+        post_close_callbacks: list[str] = []
+        if boundary == "T7":
+            original_fence = authority.database_durability_fence
+            original_recovery = store._recover_deleting_blob
+
+            def fence_after_close_failure():
+                post_close_callbacks.append("database-fence")
+                return original_fence()
+
+            def recovery_after_close_failure(*args, **kwargs):
+                post_close_callbacks.append("deleting-recovery")
+                return original_recovery(*args, **kwargs)
+
+            monkeypatch.setattr(authority, "database_durability_fence", fence_after_close_failure)
+            monkeypatch.setattr(store, "_recover_deleting_blob", recovery_after_close_failure)
+        original_execute = Connection.execute
+        failed = False
+
+        def fail_statement(self, statement, *args, **kwargs):
+            nonlocal failed
+            if not failed and marker in str(statement).upper():
+                failed = True
+                raise OSError(f"injected {boundary} K0 statement failure")
+            return original_execute(self, statement, *args, **kwargs)
+
+        monkeypatch.setattr(Connection, "execute", fail_statement)
+        try:
+            if boundary in {"T1", "T2"}:
+                with pytest.raises(StateError, match="connection close is uncertain"):
+                    store.ingest_attachment(source)
+            elif boundary == "T4":
+                with pytest.raises(StateError, match="connection close is uncertain"):
+                    store.delete_attachment(attachment.id)
+            elif boundary == "T7":
+                with pytest.raises(StateError, match="connection close is uncertain"):
+                    store.gc_attachments()
+            elif boundary == "T5":
+                with pytest.raises(StateError, match="connection close is uncertain"):
+                    await application.send_message(chat.id, "K0 send")
+            else:
+                with pytest.raises(StateError, match="connection close is uncertain"):
+                    await application.regenerate_message(
+                        chat.id, initial.assistant_message_id
+                    )
+            assert failed is True
+            assert selected["connection"] is not None
+            assert selected["close_calls"] == 1
+            assert store._poisoned is True
+            assert authority.state is AuthorityState.POISONED
+            assert authority._checked_out_connections == 0
+            if boundary == "T7":
+                assert post_close_callbacks == []
+            with pytest.raises(StateError, match="not admitting work"):
+                store.assert_admitting()
+            if boundary in {"T5", "T6"}:
+                assert len(backend.requests) == baseline_requests
+                assert application._events._sequence == baseline_events
+        finally:
+            if application is not None:
+                try:
+                    await application.close()
+                except BaseException:
+                    pass
+            if authority.state is not AuthorityState.CLOSED:
+                authority.close()
+
+        blobs, attachments, areas = _raw_attachment_lifecycle(root)
+        if boundary == "T2":
+            assert blobs == [] and attachments == []
+            assert areas == {"captures": (), "staging": (), "objects": (), "gc": ()}
+        elif boundary == "T7":
+            assert blobs == [("ready", None, None, None)]
+            assert attachments == [] and areas["objects"] == (attachment.blob_digest,)
+            assert areas["gc"] == ()
+        else:
+            assert len(blobs) == 1 and blobs[0][0] == "ready"
+            if boundary == "T1":
+                assert areas["captures"] == ()
+                assert areas["staging"] == ()
+            assert areas["objects"] == (attachment.blob_digest,)
+            assert len(attachments) == 1
+
+        if boundary in {"T5", "T6"}:
+            with sqlite3.connect(root / "database" / "state.sqlite3") as connection:
+                counts = tuple(
+                    connection.execute(query).fetchone()[0]
+                    for query in (
+                        "SELECT count(*) FROM messages WHERE chat_id = '%s'" % chat.id,
+                        "SELECT count(*) FROM generation_attempts WHERE chat_id = '%s'" % chat.id,
+                        "SELECT count(*) FROM context_plans",
+                        "SELECT count(*) FROM message_attachments",
+                        "SELECT count(*) FROM attempt_attachments",
+                    )
+                )
+            assert counts == ((0, 0, 0, 0, 0) if boundary == "T5" else (2, 1, 1, 1, 1))
+
+        restarted_authority, restarted = _open_store(root)
+        try:
+            assert restarted_authority.state is AuthorityState.READY
+            if attachment is not None and boundary != "T7":
+                assert restarted.get_attachment(attachment.id) is not None
+            if boundary == "T7":
+                assert restarted.list_attachments() == ()
+        finally:
+            if restarted_authority.state is not AuthorityState.CLOSED:
+                restarted_authority.close()
+
+    asyncio.run(scenario())
+
+
 async def _finish(application: BotsApplication, attempt_id: str) -> None:
     task = application._generation_tasks.get(attempt_id)
     if task is not None:
         await task
     await asyncio.sleep(0)
+
+
+def test_generation_mode_truth_table_rejects_implicit_real_local_and_core_http(
+    tmp_path: Path,
+):
+    authority, store = _open_store(tmp_path / "root")
+    ids = Uuid7Factory()
+    clock = SystemClock()
+    backend = LegacyRecordingBackend()
+    try:
+        with pytest.raises(StateError, match="real provider or HTTP backend"):
+            BotsApplication(
+                store,
+                EventBus(clock, ids),
+                backend,
+                backend_id=backend.backend_id,
+                model="local-model",
+                provider_id=backend.provider_id,
+                base_url=backend.base_url,
+            )
+        with pytest.raises(StateError, match="real provider or HTTP backend"):
+            BotsApplication(
+                store,
+                EventBus(clock, ids),
+                backend,
+                generation_mode=GenerationMode.LEGACY_CORE_COMPATIBILITY,
+                backend_id=backend.backend_id,
+            )
+        application = BotsApplication(
+            store,
+            EventBus(clock, ids),
+            backend,
+            generation_mode=GenerationMode.LEGACY_PHASE3_LOCAL_OPENAI,
+            backend_id=backend.backend_id,
+            model="local-model",
+            provider_id=backend.provider_id,
+            base_url=backend.base_url,
+        )
+        assert application.generation_mode is GenerationMode.LEGACY_PHASE3_LOCAL_OPENAI
+        assert application.phase6_enabled is False
+    finally:
+        authority.close()
+
+
+def test_explicit_local_legacy_plain_send_has_no_phase6_plan_evidence(tmp_path: Path):
+    async def scenario():
+        authority, store = _open_store(tmp_path / "root")
+        backend = LegacyRecordingBackend()
+        ids = Uuid7Factory()
+        clock = SystemClock()
+        application = BotsApplication(
+            store,
+            EventBus(clock, ids),
+            backend,
+            generation_mode=GenerationMode.LEGACY_PHASE3_LOCAL_OPENAI,
+            backend_id=backend.backend_id,
+            model="local-model",
+            provider_id=backend.provider_id,
+            base_url=backend.base_url,
+        )
+        try:
+            chat = await application.create_chat()
+            attempt = await application.send_message(chat.id, "plain legacy text")
+            await _finish(application, attempt.id)
+            assert len(backend.requests) == 1
+            snapshot = json.loads(attempt.request_snapshot)
+            assert "context_plan" not in snapshot
+            with _private_engine_connection(store) as connection:
+                assert connection.exec_driver_sql(
+                    "SELECT count(*) FROM context_plans WHERE attempt_id = ?",
+                    (attempt.id,),
+                ).scalar_one() == 0
+        finally:
+            await application.close()
+            if authority.state is not AuthorityState.CLOSED:
+                authority.close()
+
+    asyncio.run(scenario())
+
+
+def test_local_legacy_attachment_rejection_precedes_persistence_and_dispatch(
+    tmp_path: Path,
+):
+    async def scenario():
+        authority, store = _open_store(tmp_path / "root")
+        backend = LegacyRecordingBackend()
+        ids = Uuid7Factory()
+        clock = SystemClock()
+        application = BotsApplication(
+            store,
+            EventBus(clock, ids),
+            backend,
+            generation_mode=GenerationMode.LEGACY_PHASE3_LOCAL_OPENAI,
+            backend_id=backend.backend_id,
+            model="local-model",
+            provider_id=backend.provider_id,
+            base_url=backend.base_url,
+        )
+        source = tmp_path / "selected.txt"
+        source.write_text("selected", encoding="utf-8")
+        try:
+            chat = await application.create_chat()
+            attachment = await application.attach_file(source)
+            with pytest.raises(StateError, match="attachments are unavailable"):
+                await application.stage_attachment(chat.id, attachment.id)
+            # Simulate stale/manual state carried from a prior Phase 6 chat;
+            # the defensive preparation check must still precede persistence.
+            application._pending_attachment_ids[chat.id] = (attachment.id,)
+            with pytest.raises(StateError, match="attachments are unavailable"):
+                await application.send_message(chat.id, "must not dispatch")
+            assert backend.requests == []
+            assert await application.list_message_history(chat.id) == ()
+            assert await application.list_generation_attempts(chat.id) == ()
+        finally:
+            await application.close()
+            if authority.state is not AuthorityState.CLOSED:
+                authority.close()
+
+    asyncio.run(scenario())
+
+
+def test_configured_phase6_missing_selection_fails_closed_without_legacy_fallback(
+    tmp_path: Path, monkeypatch
+):
+    async def scenario():
+        authority, store = _open_store(tmp_path / "root")
+        backend = LegacyRecordingBackend()
+        ids = Uuid7Factory()
+        clock = SystemClock()
+        configuration = ProviderConfiguration(store, ids, clock)
+        def no_adapter(**kwargs):
+            raise StateError("no exact Phase 6 accounting adapter is registered")
+
+        monkeypatch.setattr(configuration, "prepare_generation", no_adapter)
+        application = BotsApplication(
+            store,
+            EventBus(clock, ids),
+            backend,
+            generation_mode=GenerationMode.CONFIGURED,
+            configuration=configuration,
+            backend_id=backend.backend_id,
+            model="local-model",
+            provider_id=backend.provider_id,
+            base_url=backend.base_url,
+        )
+        try:
+            chat = await application.create_chat()
+            with pytest.raises(StateError):
+                await application.send_message(chat.id, "must fail before dispatch")
+            assert backend.requests == []
+            assert await application.list_message_history(chat.id) == ()
+        finally:
+            await application.close()
+            if authority.state is not AuthorityState.CLOSED:
+                authority.close()
+
+    asyncio.run(scenario())
+
+
+TOPOLOGY_EDGE_LABELS = (
+    "configured-root",
+    "database",
+    "attachments",
+    "attachments/objects",
+    "attachments/staging",
+    "attachments/captures",
+    "attachments/gc",
+    "database/migration",
+    "database/temp",
+    "recovery",
+)
+
+
+def test_n1_classified_commit_callsite_inventory_is_complete():
+    source = inspect.getsource(SQLiteAppStateStore)
+    for label in (
+        "T1 deduplicated attachment identity",
+        "T2 initial staging intent",
+        "T3 final publication",
+        "T4 reusable attachment deletion",
+        "T5 generation start with attachments",
+        "T6 regeneration with attachments",
+        "T7 GC authorization",
+        "T8 startup staging recovery",
+        "T9 GC final intent deletion",
+    ):
+        assert label in source
+    assert source.count("_commit_attachment_transaction(") >= 10
+
+
+def test_n1_uncertain_commit_poison_is_fail_closed_before_return():
+    class Authority:
+        def __init__(self):
+            self.reasons = []
+
+        def poison(self, reason):
+            self.reasons.append(reason)
+
+        @contextmanager
+        def application_operation(self, *, independent=False):
+            del independent
+            if self.reasons:
+                raise AuthorityError("test authority is not admitting work")
+            yield
+
+    class Connection:
+        def __init__(self):
+            self.rollbacks = 0
+
+        def commit(self):
+            raise OSError("injected uncertain commit")
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    store = object.__new__(SQLiteAppStateStore)
+    store._closed = False
+    store._poisoned = False
+    store._authority = Authority()
+    connection = Connection()
+    with pytest.raises(StateError, match="outcome is uncertain"):
+        store._commit_attachment_transaction(connection, "T1 test")
+    assert store._poisoned is True
+    assert connection.rollbacks == 1
+    assert store._authority.reasons == ["uncertain attachment transaction commit: T1 test"]
+    with pytest.raises(StateError, match="not admitting work"):
+        store.assert_admitting()
+
+
+@pytest.mark.parametrize(
+    ("boundary", "statement_marker"),
+    (("T1", "INSERT INTO attachments"), ("T2", "INSERT INTO attachment_blobs")),
+)
+def test_n1_true_k0_statement_abort_discards_only_capture_and_allows_retry(
+    tmp_path: Path, monkeypatch, boundary: str, statement_marker: str
+):
+    root = tmp_path / boundary
+    source = tmp_path / f"{boundary}.txt"
+    source.write_bytes(f"{boundary} K0".encode())
+    authority, store = _open_store(root)
+    failed = False
+    original_execute = Connection.execute
+
+    def fail_statement(self, statement, *args, **kwargs):
+        nonlocal failed
+        if not failed and statement_marker.upper() in str(statement).upper():
+            failed = True
+            raise OSError(f"injected {boundary} statement failure")
+        return original_execute(self, statement, *args, **kwargs)
+
+    try:
+        if boundary == "T1":
+            store.ingest_attachment(source)
+        monkeypatch.setattr(Connection, "execute", fail_statement)
+        with pytest.raises(OSError, match="statement failure"):
+            store.ingest_attachment(source)
+        assert failed is True
+        assert store._poisoned is False
+        assert store._attachment_manager.inventory("captures") == ()
+        assert store._attachment_manager.inventory("staging") == ()
+        assert store.ingest_attachment(source)
+        assert store._attachment_manager.inventory("captures") == ()
+        assert store._attachment_manager.inventory("staging") == ()
+    finally:
+        if authority.state is not AuthorityState.CLOSED:
+            authority.close()
+
+
+def test_n1_true_k0_begin_abort_discards_capture_and_allows_retry(
+    tmp_path: Path, monkeypatch
+):
+    source = tmp_path / "begin.txt"
+    source.write_bytes(b"BEGIN K0")
+    authority, store = _open_store(tmp_path / "root")
+    failed = False
+    original_exec_driver_sql = Connection.exec_driver_sql
+
+    def fail_begin(self, statement, *args, **kwargs):
+        nonlocal failed
+        if not failed and str(statement).strip().upper() == "BEGIN IMMEDIATE":
+            failed = True
+            raise OSError("injected BEGIN failure")
+        return original_exec_driver_sql(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(Connection, "exec_driver_sql", fail_begin)
+    try:
+        with pytest.raises(OSError, match="BEGIN failure"):
+            store.ingest_attachment(source)
+        assert failed is True
+        assert store._poisoned is False
+        assert store._attachment_manager.inventory("captures") == ()
+        assert store.ingest_attachment(source)
+    finally:
+        if authority.state is not AuthorityState.CLOSED:
+            authority.close()
+
+
+def test_n1_checkout_failure_discards_capture_and_allows_retry(
+    tmp_path: Path, monkeypatch
+):
+    root = tmp_path / "root"
+    source = tmp_path / "checkout.txt"
+    source.write_bytes(b"checkout K0")
+    authority, store = _open_store(root)
+    original_connect = store._engine.connect
+    failed = False
+
+    def fail_checkout(*args, **kwargs):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("injected checkout failure")
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(store._engine, "connect", fail_checkout)
+    try:
+        with pytest.raises(OSError, match="checkout failure"):
+            store.ingest_attachment(source)
+        assert failed is True
+        assert store._poisoned is False
+        assert authority.state is AuthorityState.READY
+        assert store._attachment_manager.inventory("captures") == ()
+        assert store.list_attachments() == ()
+        chat = Chat(
+            id=str(uuid7()),
+            title="checkout retry",
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        store.create_chat(chat)
+        assert store.ingest_attachment(source).blob_digest
+        assert store._attachment_manager.inventory("captures") == ()
+    finally:
+        if authority.state is not AuthorityState.CLOSED:
+            authority.close()
+
+
+def test_n1_checkout_failure_cleanup_failure_poison_and_restart_reconciles(
+    tmp_path: Path, monkeypatch
+):
+    root = tmp_path / "root"
+    source = tmp_path / "checkout-cleanup.txt"
+    source.write_bytes(b"checkout cleanup K0")
+    authority, store = _open_store(root)
+    original_connect = store._engine.connect
+    original_discard = type(store._attachment_manager).discard_capture
+    failed = False
+
+    def fail_checkout(*args, **kwargs):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("injected checkout failure")
+        return original_connect(*args, **kwargs)
+
+    def fail_discard(manager, operation_id):
+        if manager is store._attachment_manager:
+            raise OSError("injected checkout capture cleanup failure")
+        return original_discard(manager, operation_id)
+
+    monkeypatch.setattr(store._engine, "connect", fail_checkout)
+    monkeypatch.setattr(type(store._attachment_manager), "discard_capture", fail_discard)
+    try:
+        with pytest.raises(StateError, match="capture cleanup failed"):
+            store.ingest_attachment(source)
+        assert store._poisoned is True
+        assert authority.state is AuthorityState.POISONED
+        assert tuple((root / "attachments" / "captures").iterdir())
+        with pytest.raises(StateError, match="not admitting work"):
+            store.list_attachments()
+        with pytest.raises(StateError, match="not admitting work"):
+            store.create_chat(
+                Chat(
+                    id=str(uuid7()),
+                    title="blocked",
+                    created_at=datetime.now(UTC),
+                    updated_at=datetime.now(UTC),
+                )
+            )
+    finally:
+        if authority.state is not AuthorityState.CLOSED:
+            authority.close()
+    restarted_authority = DataRootAuthority(root).acquire()
+    try:
+        restarted = restarted_authority.open_store()
+        assert restarted_authority.state is AuthorityState.READY
+        assert restarted._attachment_manager.inventory("captures") == ()
+        restarted.close()
+    finally:
+        if restarted_authority.state is not AuthorityState.CLOSED:
+            restarted_authority.close()
+
+
+def test_n1_t1_first_abnormal_row_rollback_failure_is_irrevocably_poisoned(
+    tmp_path: Path, monkeypatch
+):
+    root = tmp_path / "root"
+    source = tmp_path / "abnormal.txt"
+    source.write_bytes(b"abnormal existing row")
+    authority, store = _open_store(root)
+    with authority.operation():
+        captured = store._attachment_manager.capture(source)
+        with _private_engine_connection(store) as connection:
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+            arm_phase6_blob_transition(
+                connection,
+                captured.digest,
+                "",
+                "staging",
+                operation_id=captured.operation_id,
+                stage_name=captured.operation_id,
+                byte_size=captured.byte_size,
+            )
+            try:
+                connection.exec_driver_sql(
+                    "INSERT INTO attachment_blobs "
+                    "(digest, byte_size, state, operation_id, stage_name, gc_id, created_at) "
+                    "VALUES (?, ?, 'staging', ?, ?, NULL, ?)",
+                    (
+                        captured.digest,
+                        captured.byte_size,
+                        captured.operation_id,
+                        captured.operation_id,
+                        datetime.now(UTC).isoformat(timespec="milliseconds").replace(
+                            "+00:00", "Z"
+                        ),
+                    ),
+                )
+                require_phase6_consumed(connection)
+            finally:
+                clear_phase6(connection)
+            connection.commit()
+    original_rollback = Connection.rollback
+    rollback_calls = 0
+
+    def fail_first_rollback(connection):
+        nonlocal rollback_calls
+        rollback_calls += 1
+        if rollback_calls == 1:
+            raise OSError("injected first T1 rollback failure")
+        return original_rollback(connection)
+
+    monkeypatch.setattr(Connection, "rollback", fail_first_rollback)
+    try:
+        with pytest.raises(StateError, match="rollback is uncertain"):
+            store.ingest_attachment(source)
+        assert rollback_calls >= 1
+        assert store._poisoned is True
+        assert authority.state is AuthorityState.POISONED
+        assert tuple((root / "attachments" / "captures").iterdir())
+        with pytest.raises(StateError, match="not admitting work"):
+            store.list_attachments()
+        with pytest.raises(StateError, match="not admitting work"):
+            store.create_chat(
+                Chat(
+                    id=str(uuid7()),
+                    title="blocked",
+                    created_at=datetime.now(UTC),
+                    updated_at=datetime.now(UTC),
+                )
+            )
+    finally:
+        if authority.state is not AuthorityState.CLOSED:
+            authority.close()
+    restarted_authority = DataRootAuthority(root).acquire()
+    try:
+        restarted = restarted_authority.open_store()
+        assert restarted_authority.state is AuthorityState.READY
+        assert restarted._attachment_manager.inventory("captures") == ()
+        restarted.close()
+    finally:
+        if restarted_authority.state is not AuthorityState.CLOSED:
+            restarted_authority.close()
+
+
+def test_n1_k0_rollback_uncertainty_and_capture_cleanup_uncertainty_poison(
+    tmp_path: Path, monkeypatch
+):
+    source = tmp_path / "uncertain.txt"
+    source.write_bytes(b"uncertain K0")
+    authority, store = _open_store(tmp_path / "rollback")
+    original_execute = Connection.execute
+    original_rollback = Connection.rollback
+    statement_failed = False
+
+    def fail_statement(self, statement, *args, **kwargs):
+        nonlocal statement_failed
+        if not statement_failed and "INSERT INTO ATTACHMENT_BLOBS" in str(statement).upper():
+            statement_failed = True
+            raise OSError("injected statement failure")
+        return original_execute(self, statement, *args, **kwargs)
+
+    def fail_rollback(self):
+        raise OSError("injected rollback failure")
+
+    monkeypatch.setattr(Connection, "execute", fail_statement)
+    monkeypatch.setattr(Connection, "rollback", fail_rollback)
+    try:
+        with pytest.raises(StateError, match="rollback is uncertain"):
+            store.ingest_attachment(source)
+        assert store._poisoned is True
+        assert authority.state is AuthorityState.POISONED
+    finally:
+        if authority.state is not AuthorityState.CLOSED:
+            authority.close()
+
+    authority, store = _open_store(tmp_path / "cleanup")
+    statement_failed = False
+    original_discard = type(store._attachment_manager).discard_capture
+    monkeypatch.setattr(Connection, "rollback", original_rollback)
+
+    def fail_discard(manager, operation_id):
+        if manager is store._attachment_manager:
+            raise OSError("injected capture cleanup failure")
+        return original_discard(manager, operation_id)
+
+    monkeypatch.setattr(Connection, "execute", fail_statement)
+    monkeypatch.setattr(type(store._attachment_manager), "discard_capture", fail_discard)
+    try:
+        with pytest.raises(StateError, match="capture cleanup failed"):
+            store.ingest_attachment(source)
+        assert store._poisoned is True
+        assert authority.state is AuthorityState.POISONED
+    finally:
+        if authority.state is not AuthorityState.CLOSED:
+            authority.close()
+
+
+def test_n1_close_after_prior_rollback_poison_remains_terminal(
+    tmp_path: Path, monkeypatch
+):
+    root = tmp_path / "root"
+    source = tmp_path / "prior-poison.txt"
+    source.write_bytes(b"prior rollback poison then close")
+    authority, store = _open_store(root)
+    original_execute = Connection.execute
+    original_rollback = Connection.rollback
+    original_discard = type(store._attachment_manager).discard_capture
+    statement_failed = False
+    rollback_calls = 0
+    discard_calls = 0
+    poison_events: list[tuple[str, AuthorityState, bool]] = []
+    original_poison = authority.poison
+
+    def record_poison(reason):
+        poison_events.append((reason, authority.state, store._poisoned))
+        return original_poison(reason)
+
+    def fail_statement(self, statement, *args, **kwargs):
+        nonlocal statement_failed
+        if not statement_failed and "INSERT INTO ATTACHMENT_BLOBS" in str(statement).upper():
+            statement_failed = True
+            raise OSError("injected statement failure before prior poison")
+        return original_execute(self, statement, *args, **kwargs)
+
+    def fail_rollback(self):
+        nonlocal rollback_calls
+        rollback_calls += 1
+        raise OSError("injected prior rollback failure")
+
+    def count_discard(manager, operation_id):
+        nonlocal discard_calls
+        if manager is store._attachment_manager:
+            discard_calls += 1
+        return original_discard(manager, operation_id)
+
+    monkeypatch.setattr(authority, "poison", record_poison)
+    monkeypatch.setattr(Connection, "execute", fail_statement)
+    monkeypatch.setattr(Connection, "rollback", fail_rollback)
+    monkeypatch.setattr(type(store._attachment_manager), "discard_capture", count_discard)
+    selected = _arm_selected_connection_close(monkeypatch, post_real=True)
+    try:
+        with pytest.raises(StateError, match="connection close is uncertain") as raised:
+            store.ingest_attachment(source)
+        assert isinstance(raised.value.__cause__, OSError)
+        assert statement_failed is True
+        assert rollback_calls >= 1
+        assert discard_calls == 0
+        assert selected["connection"] is not None
+        assert selected["close_calls"] == 1
+        assert len(poison_events) >= 2
+        assert poison_events[0][0].startswith(
+            "attachment transaction rollback failed:"
+        )
+        assert poison_events[1][0].startswith("attachment lifecycle failure:")
+        assert poison_events[1][1] is AuthorityState.POISONED
+        assert poison_events[1][2] is True
+        assert store._poisoned is True
+        assert authority.state is AuthorityState.POISONED
+
+        before_rejection = _tree_fingerprint(root)
+        with pytest.raises(StateError, match="not admitting work"):
+            store.list_attachments()
+        with pytest.raises(StateError, match="not admitting work"):
+            store.create_chat(
+                Chat(
+                    id=str(uuid7()),
+                    title="rejected after prior poison",
+                    created_at=datetime.now(UTC),
+                    updated_at=datetime.now(UTC),
+                )
+            )
+        assert _tree_fingerprint(root) == before_rejection
+
+        # A later successful release cannot reopen this same poisoned authority.
+        monkeypatch.undo()
+        selected["connection"].close()
+        assert selected["close_calls"] == 1
+        assert store._poisoned is True
+        assert authority.state is AuthorityState.POISONED
+    finally:
+        if authority.state is not AuthorityState.CLOSED:
+            authority.close()
+
+    blobs, attachments, areas = _raw_attachment_lifecycle(root)
+    assert blobs == []
+    assert attachments == []
+    assert areas["captures"]
+    assert areas["staging"] == ()
+    assert areas["objects"] == ()
+    recovered_authority, recovered = _open_store(root)
+    try:
+        assert recovered_authority.state is AuthorityState.READY
+        assert _raw_attachment_lifecycle(root) == (
+            [],
+            [],
+            {"captures": (), "staging": (), "objects": (), "gc": ()},
+        )
+    finally:
+        if recovered_authority.state is not AuthorityState.CLOSED:
+            recovered_authority.close()
+
+
+def test_n3_legacy_auth_provenance_mismatch_rejects_before_any_effect(tmp_path: Path):
+    authority, store = _open_store(tmp_path / "root")
+    backend = LegacyRecordingBackend()
+    backend.api_key_env = "BACKEND_KEY"
+    ids = Uuid7Factory()
+    try:
+        with pytest.raises(StateError, match="binding is inconsistent"):
+            BotsApplication(
+                store,
+                EventBus(SystemClock(), ids),
+                backend,
+                generation_mode=GenerationMode.LEGACY_PHASE3_LOCAL_OPENAI,
+                backend_id=backend.backend_id,
+                provider_id=backend.provider_id,
+                base_url=backend.base_url,
+                api_key_env="CONSTRUCTOR_KEY",
+            )
+        assert backend.requests == []
+        assert store.list_chats() == ()
+        with _private_engine_connection(store) as connection:
+            assert connection.exec_driver_sql(
+                "SELECT count(*) FROM generation_attempts"
+            ).scalar_one() == 0
+    finally:
+        if authority.state is not AuthorityState.CLOSED:
+            authority.close()
+
+
+def test_n2_acquisition_replays_all_ten_labelled_topology_edges(
+    tmp_path: Path, monkeypatch
+):
+    observed: list[str] = []
+    original = DataRootAuthority._sync_topology_parent
+
+    def record(self, parent_fd, edge_label):
+        observed.append(edge_label)
+        return original(self, parent_fd, edge_label)
+
+    monkeypatch.setattr(DataRootAuthority, "_sync_topology_parent", record)
+    authority = DataRootAuthority(tmp_path / "root").acquire()
+    try:
+        assert tuple(observed) == TOPOLOGY_EDGE_LABELS
+    finally:
+        authority.close()
+
+
+@pytest.mark.parametrize("edge_label", TOPOLOGY_EDGE_LABELS)
+def test_n2_persistent_topology_barrier_failure_is_retried_before_ready(
+    tmp_path: Path, monkeypatch, edge_label: str
+):
+    original = DataRootAuthority._sync_topology_parent
+    attempts: list[str] = []
+
+    def fail_selected(self, parent_fd, current_label):
+        attempts.append(current_label)
+        if current_label == edge_label:
+            raise OSError(f"persistent barrier fault: {current_label}")
+        return original(self, parent_fd, current_label)
+
+    monkeypatch.setattr(DataRootAuthority, "_sync_topology_parent", fail_selected)
+    with pytest.raises(AuthorityError):
+        DataRootAuthority(tmp_path / "root").acquire()
+    first_count = attempts.count(edge_label)
+    with pytest.raises(AuthorityError):
+        DataRootAuthority(tmp_path / "root").acquire()
+    assert attempts.count(edge_label) > first_count
+    monkeypatch.setattr(DataRootAuthority, "_sync_topology_parent", original)
+    authority = DataRootAuthority(tmp_path / "root").acquire()
+    try:
+        assert authority.acquired
+    finally:
+        authority.close()
 
 
 def _revision(database: Path) -> str:
@@ -590,8 +2826,16 @@ try:
 except BaseException:
     pass
 assert authority.state is AuthorityState.FAILED_CLOSED
-assert ('logical-root', 'HELD' if barrier != 'logical-close' else 'UNKNOWN') in authority.claim_inventory
-if barrier != 'logical-close':
+if barrier in {'store-close', 'main-fsync'}:
+    assert authority._physical_release_complete is True
+    assert ('logical-root', 'RELEASED') in authority.claim_inventory
+    if barrier == 'main-fsync':
+        os.fsync = original
+    successor = DataRootAuthority(root).acquire()
+    successor.close()
+    os._exit(0)
+assert ('logical-root', 'HELD' if barrier == 'vfs-close' else 'UNKNOWN') in authority.claim_inventory
+if barrier == 'vfs-close':
     assert any(status == 'HELD' for label, status in authority.claim_inventory if label != 'logical-root')
 try:
     DataRootAuthority(root).acquire()
@@ -641,17 +2885,23 @@ else:
     os._exit(20)
 assert authority.state is AuthorityState.FAILED_CLOSED
 assert 'rooted VFS private close incomplete' in error
-expected = ['RELEASED', 'RELEASED', 'RELEASED']
+try:
+    authority.close()
+except AuthorityError as replayed:
+    assert str(replayed) == error
+else:
+    os._exit(25)
+expected = ['RELEASED', 'RELEASED', 'RELEASED', 'RELEASED']
 expected[slot - 1] = 'UNKNOWN'
 assert [status for _, status in vfs.close_inventory] == expected
 authority_vfs = [
     status for label, status in authority.claim_inventory
     if label.startswith('rooted-vfs[')
 ]
-assert authority_vfs[-3:] == expected
+assert authority_vfs[-4:] == expected
 assert ('logical-root', 'HELD') in authority.claim_inventory
-assert any(
-    status == 'HELD'
+assert all(
+    status == 'RELEASED'
     for label, status in authority.claim_inventory
     if label.startswith('descendant:') or label == 'root'
 )
@@ -671,7 +2921,7 @@ def assert_wrappers_reject():
     else:
         os._exit(22)
 if mode == 2:
-    # All three close calls consumed their original fds.  Force every old
+    # All three retained private close calls consumed their original fds. Force every old
     # number to identify an unrelated directory and prove retained wrappers
     # never close or use a recycled number.
     identities = []
@@ -777,7 +3027,7 @@ def test_send_persists_one_frozen_v3_plan_and_exact_wire(tmp_path: Path):
             await _finish(application, attempt.id)
             snapshot = json.loads(attempt.request_snapshot)
             plan = snapshot["context_plan"]
-            with store._engine.connect() as connection:
+            with _private_engine_connection(store) as connection:
                 persisted = connection.execute(
                     text(
                         "SELECT canonical_digest, wire_representation_digest "
@@ -811,7 +3061,7 @@ def test_no_public_path_store_or_migration_facade_and_no_legacy_schema_fields(tm
         paths = resolve_app_paths(root)
         assert not hasattr(paths, "database")
         assert not hasattr(paths, "authority_lock")
-        with store._engine.connect() as connection:
+        with _private_engine_connection(store) as connection:
             columns = {
                 row[1]
                 for row in connection.exec_driver_sql(
@@ -979,7 +3229,7 @@ def test_rooted_vfs_open_count_mixing_and_forbidden_sql(tmp_path: Path):
         assert first_authority._vfs is not None
         vfs = first_authority._vfs
         assert vfs.open_count == 0
-        with first._engine.connect() as connection:
+        with _private_engine_connection(first) as connection:
             assert vfs.open_count == 1
             for statement in (
                 "ATTACH DATABASE 'escape.sqlite3' AS escape",
@@ -1018,7 +3268,7 @@ def test_rooted_vfs_uses_no_ambient_tmpdir_and_static_sqlite_fails_closed(tmp_pa
     os.environ["TMPDIR"] = os.fspath(ambient)
     authority, store = _open_store(tmp_path / "root")
     try:
-        with store._engine.connect() as connection:
+        with _private_engine_connection(store) as connection:
             assert connection.exec_driver_sql("PRAGMA temp_store").scalar_one() == 2
             assert connection.exec_driver_sql(
                 "WITH RECURSIVE values_to_sort(value) AS ("
@@ -1051,6 +3301,253 @@ def test_rooted_vfs_uses_no_ambient_tmpdir_and_static_sqlite_fails_closed(tmp_pa
     assert completed.returncode != 0
     error = completed.stdout + completed.stderr
     assert "SQLite" in error and ("instance" in error or "rooted" in error)
+
+
+def _assert_fresh_inventory_has_an_independent_stream(root: Path) -> None:
+    authority = _new_authority(root)
+    retained = authority._directory_fd("attachments/objects")
+    try:
+        os.lseek(retained, 0, os.SEEK_SET)
+        tuple(os.listdir(retained))
+        retained_offset = os.lseek(retained, 0, os.SEEK_CUR)
+        leaf = "0" * 64
+        descriptor = os.open(
+            leaf,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=retained,
+        )
+        os.close(descriptor)
+        assert leaf in authority.fresh_directory_inventory("attachments/objects")
+        assert os.lseek(retained, 0, os.SEEK_CUR) == retained_offset
+        assert authority.claim_inventory[-2] == (
+            "fresh-view:attachments/objects",
+            "RELEASED",
+        )
+    finally:
+        authority.close()
+
+
+def test_f1_first_production_inventory_after_mutation_is_fresh_on_btrfs():
+    build = REPO / "build"
+    build.mkdir(exist_ok=True)
+    filesystem = subprocess.run(
+        ["findmnt", "-T", os.fspath(build), "-no", "FSTYPE"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert filesystem == "btrfs"
+    with tempfile.TemporaryDirectory(prefix="phase6-f1-btrfs-", dir=build) as value:
+        _assert_fresh_inventory_has_an_independent_stream(Path(value))
+
+
+def test_f1_production_fresh_inventory_has_same_contract_on_tmpfs(tmp_path: Path):
+    filesystem = subprocess.run(
+        ["findmnt", "-T", os.fspath(tmp_path), "-no", "FSTYPE"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert filesystem == "tmpfs"
+    _assert_fresh_inventory_has_an_independent_stream(tmp_path / "root")
+
+
+def test_f1_fresh_view_identity_failure_returns_no_tuple_and_poisons(tmp_path: Path):
+    authority = _new_authority(tmp_path / "root")
+    objects_fd = authority._directory_fd("attachments/objects")
+    os.fchmod(objects_fd, 0o755)
+    try:
+        with pytest.raises(AuthorityError, match="unsafe owner or permissions"):
+            authority.fresh_directory_inventory("attachments/objects")
+        assert authority.state is AuthorityState.FAILED_STARTUP
+        assert authority.claim_inventory[-2] == (
+            "fresh-view:attachments/objects",
+            "RELEASED",
+        )
+    finally:
+        os.fchmod(objects_fd, 0o700)
+        authority.close()
+
+
+def test_f1_fresh_view_close_uncertainty_is_process_terminal(tmp_path: Path):
+    source = r'''
+import os
+import sys
+from bots5.core.errors import AuthorityError
+from bots5.infrastructure.data_root_authority import AuthorityState, DataRootAuthority
+root = sys.argv[1]
+authority = DataRootAuthority(root).acquire()
+original = authority._close_claim
+def uncertain(claim):
+    if claim.label.startswith('fresh-view:'):
+        claim.fd = None
+        claim.status = 'UNKNOWN'
+        raise AuthorityError('injected fresh close uncertainty')
+    return original(claim)
+authority._close_claim = uncertain
+try:
+    authority.fresh_directory_inventory('attachments/objects')
+except AuthorityError:
+    pass
+else:
+    os._exit(20)
+assert authority.state is AuthorityState.FAILED_CLOSED
+assert ('fresh-view:attachments/objects', 'UNKNOWN') in authority.claim_inventory
+assert ('logical-root', 'HELD') in authority.claim_inventory
+try:
+    DataRootAuthority(root).acquire()
+except AuthorityError:
+    os._exit(0)
+os._exit(21)
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", source, os.fspath(tmp_path / "root")],
+        cwd=REPO,
+        env={**os.environ, "PYTHONPATH": os.fspath(REPO / "src")},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+
+
+@pytest.mark.parametrize("preexisting", (False, True))
+def test_f3_native_delete_full_trace_orders_parent_barriers_before_main_write(
+    tmp_path: Path, preexisting: bool
+):
+    root = tmp_path / "root"
+    authority, store = _open_store(root)
+    vfs = authority._vfs
+    assert vfs is not None
+    if preexisting:
+        journal = root / "database" / "state.sqlite3-journal"
+        journal.write_bytes(b"")
+        journal.chmod(0o600)
+    vfs._test_reset_trace()
+    now = datetime.now(UTC)
+    store.create_chat(Chat(str(uuid7()), "trace", now, now))
+    trace = vfs._test_trace()
+    assert 10 in trace  # MAIN_JOURNAL carried SQLITE_OPEN_CREATE.
+    assert trace.index(3) < trace.index(5) < trace.index(1)
+    assert trace.index(2) < trace.index(6) < trace.index(8)
+    assert 12 not in trace
+    store.close()
+
+
+def test_f3_parent_sync_failure_excludes_cache_spill_main_writes(tmp_path: Path):
+    source = r'''
+import os
+import sys
+from datetime import UTC, datetime
+from uuid6 import uuid7
+from bots5.domain.clock import utc_iso
+from bots5.infrastructure.data_root_authority import DataRootAuthority
+root = sys.argv[1]
+authority = DataRootAuthority(root).acquire()
+store = authority.open_store()
+vfs = authority._vfs
+vfs._test_reset_trace()
+vfs._test_inject_io_fault(5)
+operation = authority.operation()
+operation.__enter__()
+connection = store._engine.connect()
+failed = False
+try:
+    connection.exec_driver_sql('PRAGMA cache_size=1')
+    connection.exec_driver_sql('BEGIN IMMEDIATE')
+    try:
+        for index in range(256):
+            now = utc_iso(datetime.now(UTC))
+            connection.exec_driver_sql(
+                'INSERT INTO chats(id,title,created_at,updated_at,head_message_id,revision) '
+                'VALUES(?,?,?,?,NULL,0)',
+                (str(uuid7()), str(index) + ':' + ('x' * 16384), now, now),
+            )
+        connection.commit()
+    except BaseException:
+        failed = True
+    trace = vfs._test_trace()
+    assert failed
+    assert 10 in trace and 3 in trace and 5 in trace
+    assert 1 not in trace
+finally:
+    try:
+        connection.rollback()
+    except BaseException:
+        pass
+    connection.close()
+    operation.__exit__(None, None, None)
+os._exit(0)
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", source, os.fspath(tmp_path / "root")],
+        cwd=REPO,
+        env={**os.environ, "PYTHONPATH": os.fspath(REPO / "src")},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+
+
+def test_f3_absent_delete_still_parent_syncs_and_reports_failure(tmp_path: Path):
+    authority, store = _open_store(tmp_path / "root")
+    vfs = authority._vfs
+    assert vfs is not None
+    vfs._test_reset_trace()
+    vfs._test_inject_io_fault(8)
+    assert vfs._test_delete_journal() != 0
+    assert vfs._test_trace() == (8,)
+    vfs._test_reset_trace()
+    assert vfs._test_delete_journal() == 0
+    assert vfs._test_trace() == (8,)
+    store.close()
+
+
+def test_f3_delete_proof_close_uncertainty_still_syncs_and_latches_unknown(
+    tmp_path: Path,
+):
+    source = r'''
+import os
+import sys
+from bots5.core.errors import AuthorityError
+from bots5.infrastructure.data_root_authority import DataRootAuthority
+root = sys.argv[1]
+authority = DataRootAuthority(root).acquire()
+store = authority.open_store()
+journal = os.path.join(root, 'database', 'state.sqlite3-journal')
+with open(journal, 'wb'):
+    pass
+os.chmod(journal, 0o600)
+vfs = authority._vfs
+vfs._test_reset_trace()
+vfs._test_inject_io_fault(9)
+assert vfs._test_delete_journal() != 0
+trace = vfs._test_trace()
+assert trace == (6, 9, 8)
+try:
+    store.close()
+except AuthorityError:
+    pass
+else:
+    os._exit(20)
+assert ('native-open-files', 'UNKNOWN') in vfs.close_inventory
+assert ('logical-root', 'HELD') in authority.claim_inventory
+os._exit(0)
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", source, os.fspath(tmp_path / "root")],
+        cwd=REPO,
+        env={**os.environ, "PYTHONPATH": os.fspath(REPO / "src")},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
 
 
 @pytest.mark.parametrize("replacement", ("directory", "symlink"))
@@ -1130,6 +3627,8 @@ def test_concurrent_close_has_one_owner_and_one_success_result(
 ):
     root = tmp_path / "root"
     authority, store = _open_store(root)
+    operation = authority.operation()
+    operation.__enter__()
     connection = store._engine.connect()
     original = store._close_under_authority
     teardown_calls = 0
@@ -1163,10 +3662,11 @@ def test_concurrent_close_has_one_owner_and_one_success_result(
     _await_state(authority, AuthorityState.CLOSING)
     _await_condition_waiters(authority, caller_count)
     assert connection.exec_driver_sql("SELECT 1").scalar_one() == 1
-    with pytest.raises(AuthorityError):
-        with authority.operation():
-            pass
+    # The already-admitted owner may still nest while close drains it.
+    with authority.operation():
+        pass
     connection.close()
+    operation.__exit__(None, None, None)
     for caller in callers:
         caller.join(10)
         assert not caller.is_alive()
@@ -1252,6 +3752,8 @@ def fail_once(claim):
             root_close_calls += 1
         fault_entered.set()
         assert release_fault.wait(10)
+        claim.fd = None
+        claim.status = 'UNKNOWN'
         raise AuthorityError('injected terminal close')
     return original(claim)
 
@@ -1281,7 +3783,7 @@ for thread in threads:
     thread.join(10)
 assert all(not thread.is_alive() for thread in threads)
 assert root_close_calls == 1
-assert results == [('AuthorityError', 'injected terminal close')] * 8
+assert results == [('AuthorityError', 'data-root authority close failed')] * 8
 assert authority.state is AuthorityState.FAILED_CLOSED
 try:
     DataRootAuthority(root).acquire()
@@ -1314,6 +3816,8 @@ from bots5.infrastructure.data_root_authority import DataRootAuthority
 root = sys.argv[1]
 authority = DataRootAuthority(root).acquire()
 store = authority.open_store()
+operation = authority.operation()
+operation.__enter__()
 connection = store._engine.connect()
 read_fd, write_fd = os.pipe()
 fork_pid = os.fork()
@@ -1356,6 +3860,7 @@ while len(authority._condition._waiters) < 4 and __import__('time').monotonic() 
     __import__('time').sleep(0.001)
 assert len(authority._condition._waiters) >= 4
 connection.close()
+operation.__exit__(None, None, None)
 for thread in threads:
     thread.join(10)
 assert all(not thread.is_alive() for thread in threads)
@@ -1412,7 +3917,7 @@ def test_admitted_ingest_retains_attachment_and_database_authority_during_close(
     closer = threading.Thread(target=store.close)
     closer.start()
     _await_state(authority, AuthorityState.CLOSING)
-    with pytest.raises(AuthorityError):
+    with pytest.raises(StateError):
         store.list_attachments()
     release.set()
     worker.join(10)
@@ -1462,7 +3967,7 @@ def test_admitted_gc_retains_filesystem_and_database_authority_during_close(
     closer = threading.Thread(target=store.close)
     closer.start()
     _await_state(authority, AuthorityState.CLOSING)
-    with pytest.raises(AuthorityError):
+    with pytest.raises(StateError):
         store.gc_attachments()
     release.set()
     worker.join(10)
@@ -1642,6 +4147,7 @@ def test_clean_native_vfs_close_releases_exact_private_inventory(tmp_path: Path)
         ("database-directory", "RELEASED"),
         ("main-claim", "RELEASED"),
         ("temp-directory", "RELEASED"),
+        ("native-open-files", "RELEASED"),
     )
     for fd in old_fds:
         with pytest.raises(OSError) as captured:
@@ -1693,9 +4199,351 @@ os._exit(3)
     successor.close()
 
 
+@pytest.mark.parametrize("barrier", ("main", "database-directory"))
+def test_r1_prephysical_close_failure_is_strongly_pinned_in_same_process(
+    tmp_path: Path, barrier: str
+):
+    source = r'''
+import gc
+import os
+import sys
+import weakref
+from bots5.core.errors import AuthorityError
+from bots5.infrastructure import data_root_authority as module
+from bots5.infrastructure.data_root_authority import AuthorityState, DataRootAuthority
+
+root, barrier = sys.argv[1:]
+authority = DataRootAuthority(root).acquire()
+store = authority.open_store()
+target = (
+    authority._main_claim.fd
+    if barrier == 'main'
+    else authority._descendant_claims['database'].fd
+)
+original_fsync = os.fsync
+def fail_target(fd):
+    if fd == target:
+        raise OSError(5, 'private injected payload')
+    return original_fsync(fd)
+os.fsync = fail_target
+try:
+    authority.close()
+except AuthorityError as failure:
+    first = str(failure)
+else:
+    os._exit(20)
+finally:
+    os.fsync = original_fsync
+assert first == 'data-root authority close failed'
+try:
+    authority.close()
+except AuthorityError as replay:
+    assert str(replay) == first
+else:
+    os._exit(21)
+assert authority.state is AuthorityState.FAILED_CLOSED
+assert authority._physical_release_complete is True
+assert ('logical-root', 'RELEASED') in authority.claim_inventory
+assert all(status == 'RELEASED' for _, status in authority.claim_inventory)
+reference = weakref.ref(authority)
+store = None
+authority = None
+gc.collect()
+retained = reference()
+assert retained is None
+successor = DataRootAuthority(root).acquire()
+successor.close()
+os._exit(0)
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", source, os.fspath(tmp_path / barrier), barrier],
+        cwd=REPO,
+        env={**os.environ, "PYTHONPATH": os.fspath(REPO / "src")},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, (
+        completed.returncode,
+        completed.stdout,
+        completed.stderr,
+    )
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    (
+        "rejected-xopen",
+        "rejected-xdelete",
+        "auxiliary-cleanup",
+        "temporary-cleanup",
+        "registration-unwind-1",
+        "registration-unwind-2",
+        "registration-unwind-3",
+    ),
+)
+@pytest.mark.parametrize("mode", (1, 2))
+def test_r2_untracked_native_close_uncertainty_is_terminal(
+    tmp_path: Path, scenario: str, mode: int
+):
+    source = r'''
+import fcntl
+import gc
+import os
+import sys
+import weakref
+from bots5.core.errors import AuthorityError
+from bots5.infrastructure import data_root_authority as module
+from bots5.infrastructure.data_root_authority import AuthorityState, DataRootAuthority
+from bots5.infrastructure.rooted_sqlite_vfs import (
+    _test_inject_registration_cleanup_fault,
+)
+
+root, scenario, mode_text = sys.argv[1:]
+mode = int(mode_text)
+authority = DataRootAuthority(root).acquire()
+external_fd = None
+external_identity = None
+if scenario.startswith('registration-unwind-'):
+    slot = int(scenario.rsplit('-', 1)[1])
+    _test_inject_registration_cleanup_fault(slot, mode)
+    try:
+        authority.open_store()
+    except AuthorityError as failure:
+        assert str(failure) == 'rooted VFS registration cleanup incomplete'
+    else:
+        os._exit(30)
+    assert authority.state is AuthorityState.FAILED_CLOSED
+else:
+    store = authority.open_store()
+    vfs = authority._vfs
+    assert vfs is not None
+    site = {
+        'rejected-xopen': 1,
+        'rejected-xdelete': 2,
+        'auxiliary-cleanup': 3,
+        'temporary-cleanup': 4,
+    }[scenario]
+    if scenario == 'rejected-xdelete':
+        journal = os.path.join(root, 'database', 'state.sqlite3-journal')
+        created = os.open(
+            journal,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+            0o600,
+        )
+        os.close(created)
+    vfs._test_inject_untracked_close_fault(site, mode)
+    result = (
+        vfs._test_delete_journal()
+        if scenario == 'rejected-xdelete'
+        else vfs._test_open_cleanup_path(site)
+    )
+    assert result != 0
+    recycled = vfs._test_last_untracked_fd()
+    if scenario == 'rejected-xdelete':
+        os.unlink(journal)
+        os.fsync(authority._descendant_claims['database'].fd)
+    if mode == 1:
+        os.fstat(recycled)
+    else:
+        external = root + '-external'
+        os.mkdir(external, 0o700)
+        with open(os.path.join(external, 'sentinel'), 'wb') as stream:
+            stream.write(b'unrelated')
+        opened = os.open(external, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        high = fcntl.fcntl(opened, fcntl.F_DUPFD_CLOEXEC, 200)
+        os.close(opened)
+        os.dup2(high, recycled, inheritable=False)
+        os.close(high)
+        external_fd = recycled
+        external_identity = os.fstat(external_fd)
+    try:
+        authority.close()
+    except AuthorityError as failure:
+        assert str(failure) == 'rooted VFS private close incomplete'
+    else:
+        os._exit(31)
+    assert dict(vfs.close_inventory)['native-open-files'] == 'UNKNOWN'
+    if mode == 1:
+        os.fstat(recycled)
+    else:
+        current = os.fstat(external_fd)
+        assert (current.st_dev, current.st_ino) == (
+            external_identity.st_dev,
+            external_identity.st_ino,
+        )
+        os.close(external_fd)
+        external_fd = None
+assert authority.state is AuthorityState.FAILED_CLOSED
+assert any(
+    label.endswith(':native-open-files') and status == 'UNKNOWN'
+    for label, status in authority.claim_inventory
+)
+assert ('logical-root', 'HELD') in authority.claim_inventory
+assert authority in module._TERMINAL_AUTHORITIES
+reference = weakref.ref(authority)
+store = None
+vfs = None
+authority = None
+gc.collect()
+assert reference() is not None
+try:
+    DataRootAuthority(root).acquire()
+except AuthorityError:
+    os._exit(0)
+os._exit(32)
+'''
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            source,
+            os.fspath(tmp_path / f"{scenario}-{mode}"),
+            scenario,
+            str(mode),
+        ],
+        cwd=REPO,
+        env={**os.environ, "PYTHONPATH": os.fspath(REPO / "src")},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    assert completed.returncode == 0, (
+        completed.returncode,
+        completed.stdout,
+        completed.stderr,
+    )
+
+
+def test_r3_fresh_inventory_admission_serializes_with_close(
+    tmp_path: Path, monkeypatch
+):
+    authority, store = _open_store(tmp_path / "first")
+    native = authority_module._native()
+    entered = threading.Event()
+    release = threading.Event()
+    inventory: list[tuple[str, ...]] = []
+    failures: list[BaseException] = []
+
+    class PausedNative:
+        def __getattr__(self, name):
+            return getattr(native, name)
+
+        def bots5_open_fresh_directory(self, retained_fd):
+            entered.set()
+            assert release.wait(10)
+            return native.bots5_open_fresh_directory(retained_fd)
+
+    monkeypatch.setattr(authority_module, "_native", lambda: PausedNative())
+
+    def observe():
+        try:
+            inventory.append(
+                authority.fresh_directory_inventory("attachments/objects")
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    def close():
+        try:
+            authority.close()
+        except BaseException as exc:
+            failures.append(exc)
+
+    observer = threading.Thread(target=observe)
+    observer.start()
+    assert entered.wait(10)
+    closer = threading.Thread(target=close)
+    closer.start()
+    time.sleep(0.05)
+    assert closer.is_alive()
+    assert authority.state is AuthorityState.CLOSING
+    release.set()
+    observer.join(10)
+    closer.join(10)
+    assert not observer.is_alive() and not closer.is_alive()
+    assert failures == []
+    assert inventory == [()]
+    assert authority.state is AuthorityState.CLOSED
+    assert all(status == "RELEASED" for _, status in authority.claim_inventory)
+
+    monkeypatch.undo()
+    second, second_store = _open_store(tmp_path / "second")
+    entered_close = threading.Event()
+    release_close = threading.Event()
+    close_errors: list[BaseException] = []
+    original_store_close = second_store._close_under_authority
+
+    def paused_store_close():
+        entered_close.set()
+        assert release_close.wait(10)
+        return original_store_close()
+
+    second_store._close_under_authority = paused_store_close
+
+    def close_second():
+        try:
+            second.close()
+        except BaseException as exc:
+            close_errors.append(exc)
+
+    second_closer = threading.Thread(target=close_second)
+    second_closer.start()
+    assert entered_close.wait(10)
+    before = second.claim_inventory
+    with pytest.raises(AuthorityError, match="rejected in CLOSING"):
+        second.fresh_directory_inventory("attachments/objects")
+    assert second.claim_inventory == before
+    release_close.set()
+    second_closer.join(10)
+    assert not second_closer.is_alive()
+    assert close_errors == []
+    assert second.state is AuthorityState.CLOSED
+    assert all(status == "RELEASED" for _, status in second.claim_inventory)
+
+    third, third_store = _open_store(tmp_path / "third")
+    admitted = threading.Event()
+    continue_admitted = threading.Event()
+    admitted_inventory: list[tuple[str, ...]] = []
+    admitted_errors: list[BaseException] = []
+
+    def admitted_observer():
+        try:
+            with third.operation():
+                admitted.set()
+                assert continue_admitted.wait(10)
+                admitted_inventory.append(
+                    third.fresh_directory_inventory("attachments/objects")
+                )
+        except BaseException as exc:
+            admitted_errors.append(exc)
+
+    admitted_thread = threading.Thread(target=admitted_observer)
+    admitted_thread.start()
+    assert admitted.wait(10)
+    third_closer = threading.Thread(target=third.close)
+    third_closer.start()
+    deadline = time.monotonic() + 10
+    while third.state is not AuthorityState.CLOSING and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert third.state is AuthorityState.CLOSING
+    continue_admitted.set()
+    admitted_thread.join(10)
+    third_closer.join(10)
+    assert not admitted_thread.is_alive() and not third_closer.is_alive()
+    assert admitted_errors == []
+    assert admitted_inventory == [()]
+    assert third.state is AuthorityState.CLOSED
+    assert all(status == "RELEASED" for _, status in third.claim_inventory)
+
+
 def test_fork_child_is_failed_closed_and_parent_remains_live(tmp_path: Path):
     authority, store = _open_store(tmp_path / "root")
     manager = store._attachment_manager
+    operation = authority.operation()
+    operation.__enter__()
     connection = store._engine.connect()
     read_fd, write_fd = os.pipe()
     pid = os.fork()
@@ -1724,6 +4572,7 @@ def test_fork_child_is_failed_closed_and_parent_remains_live(tmp_path: Path):
     assert child_result == b"api-closed,vfs-closed,attachment-fs-closed"
     assert connection.exec_driver_sql("SELECT count(*) FROM chats").scalar_one() >= 0
     connection.close()
+    operation.__exit__(None, None, None)
     exec_pid = os.fork()
     if exec_pid == 0:
         os.execl("/bin/true", "true")
@@ -1880,19 +4729,25 @@ def test_attachment_service_is_nonconstructible_and_tokens_are_not_bearers(tmp_p
     try:
         with pytest.raises(TypeError, match="authority-private"):
             _AttachmentFS(first_authority, object())
-        captured = first._attachment_manager.capture(source)
-        with pytest.raises(AttachmentIntegrityError):
-            second._attachment_manager.verify_capture(
+        with first_authority.operation():
+            captured = first._attachment_manager.capture(source)
+        with second._authority.operation():
+            with pytest.raises(AttachmentIntegrityError):
+                second._attachment_manager.verify_capture(
+                    captured.operation_id, captured.digest, captured.byte_size
+                )
+        with first_authority.operation():
+            with pytest.raises(AttachmentIntegrityError, match="identity"):
+                first._attachment_manager.verify_capture(
+                    captured.operation_id, b"x" * 32, captured.byte_size
+                )
+            first._attachment_manager.capture_to_stage(
                 captured.operation_id, captured.digest, captured.byte_size
             )
-        with pytest.raises(AttachmentIntegrityError, match="identity"):
-            first._attachment_manager.verify_capture(
-                captured.operation_id, b"x" * 32, captured.byte_size
+            first._attachment_manager.capture_to_stage(
+                captured.operation_id, captured.digest, captured.byte_size
             )
-        first._attachment_manager.capture_to_stage(captured.operation_id)
-        with pytest.raises((AttachmentIntegrityError, OSError)):
-            first._attachment_manager.capture_to_stage(captured.operation_id)
-        first._attachment_manager.discard_stage(captured.operation_id)
+            first._attachment_manager.discard_stage(captured.operation_id)
         first._attachment_manager.close()
         with pytest.raises(AttachmentIntegrityError, match="closed"):
             first._attachment_manager.capture(source)
@@ -1967,8 +4822,8 @@ def test_retained_attachment_helper_rejects_every_fd_operation_after_reuse(
         lambda: manager.verify_stage(stage_id, stage_digest, 5),
         lambda: manager.read_verified(digest, expected_size=6),
         lambda: manager.discard_capture(operation_id),
-        lambda: manager.capture_to_stage(operation_id),
-        lambda: manager.stage_to_object(stage_id, stage_digest),
+        lambda: manager.capture_to_stage(operation_id, digest, 6),
+        lambda: manager.stage_to_object(stage_id, stage_digest, 5),
         lambda: manager.discard_stage(stage_id),
         lambda: manager.create_tombstone(gc_id, digest),
         lambda: manager._remove_gc_temp(gc_id, digest),
@@ -2027,7 +4882,7 @@ def test_attachment_helper_rejects_unadmitted_call_while_authority_closes(
     closer.start()
     assert entered.wait(10)
     assert authority.state is AuthorityState.CLOSING
-    with pytest.raises(AuthorityError, match="not live"):
+    with pytest.raises(AuthorityError, match="operation rejected"):
         manager.inventory("objects")
     release.set()
     closer.join(10)
@@ -2044,7 +4899,7 @@ def test_concurrent_identical_capture_deduplicates_without_reservations(tmp_path
         results = tuple(executor.map(lambda _: store.ingest_attachment(source), range(2)))
     assert results[0].id != results[1].id
     assert results[0].blob_digest == results[1].blob_digest
-    with store._engine.connect() as connection:
+    with _private_engine_connection(store) as connection:
         assert connection.exec_driver_sql(
             "SELECT count(*) FROM attachment_blobs"
         ).scalar_one() == 1
@@ -2078,7 +4933,7 @@ def test_staging_crash_states_recover_privately(
     store.close()
     monkeypatch.undo()
     _, recovered = _open_store(root)
-    with recovered._engine.connect() as connection:
+    with _private_engine_connection(recovered) as connection:
         assert connection.exec_driver_sql(
             "SELECT state FROM attachment_blobs"
         ).scalar_one() == "ready"
@@ -2115,7 +4970,7 @@ def test_attachment_publication_forced_death_matrix_recovers_idempotently(
     _attachment_fault_process(root, source, point)
     for _ in range(2):
         _, recovered = _open_store(root)
-        with recovered._engine.connect() as connection:
+        with _private_engine_connection(recovered) as connection:
             rows = connection.exec_driver_sql(
                 "SELECT state FROM attachment_blobs"
             ).fetchall()
@@ -2127,6 +4982,132 @@ def test_attachment_publication_forced_death_matrix_recovers_idempotently(
         assert recovered._attachment_manager.inventory("staging") == ()
         if rows and attachment_count == 0:
             assert recovered.gc_attachments()
+        recovered.close()
+
+
+def _staging_row(root: Path) -> tuple[str, str, int]:
+    with sqlite3.connect(root / "database" / "state.sqlite3") as connection:
+        digest, byte_size, operation_id = connection.execute(
+            "SELECT digest, byte_size, operation_id FROM attachment_blobs "
+            "WHERE state='staging'"
+        ).fetchone()
+    return bytes(digest).hex(), int(byte_size), str(operation_id)
+
+
+@pytest.mark.parametrize("duplicate", ("capture_stage", "stage_canonical"))
+def test_f2_verified_duplicate_publication_recovers_then_survives_second_restart(
+    tmp_path: Path, duplicate: str
+):
+    root = tmp_path / "root"
+    source = tmp_path / "payload.txt"
+    source.write_bytes(b"verified duplicate publication")
+    point = (
+        "before-capture-stage-rename"
+        if duplicate == "capture_stage"
+        else "before-stage-object-rename"
+    )
+    _attachment_fault_process(root, source, point)
+    digest, _, operation_id = _staging_row(root)
+    captures = root / "attachments" / "captures"
+    staging = root / "attachments" / "staging"
+    objects = root / "attachments" / "objects"
+    if duplicate == "capture_stage":
+        destination = staging / operation_id
+        destination.write_bytes((captures / operation_id).read_bytes())
+    else:
+        destination = objects / digest
+        destination.write_bytes((staging / operation_id).read_bytes())
+    destination.chmod(0o600)
+    for _ in range(2):
+        authority, recovered = _open_store(root)
+        assert authority.state is AuthorityState.READY
+        with _private_engine_connection(recovered) as connection:
+            assert connection.exec_driver_sql(
+                "SELECT state FROM attachment_blobs"
+            ).fetchall() == [("ready",)]
+        assert recovered._attachment_manager.inventory("captures") == ()
+        assert recovered._attachment_manager.inventory("staging") == ()
+        assert recovered._attachment_manager.inventory("objects") == (digest,)
+        recovered.close()
+
+
+@pytest.mark.parametrize(
+    "mixed",
+    ("capture_canonical", "all_three", "conflicting_capture_stage"),
+)
+def test_f2_unauthorized_or_conflicting_mixed_publication_is_preserved(
+    tmp_path: Path, mixed: str
+):
+    root = tmp_path / "root"
+    source = tmp_path / "payload.txt"
+    source.write_bytes(b"mixed publication evidence")
+    _attachment_fault_process(root, source, "before-capture-stage-rename")
+    digest, _, operation_id = _staging_row(root)
+    capture = root / "attachments" / "captures" / operation_id
+    if mixed == "conflicting_capture_stage":
+        destination = root / "attachments" / "staging" / operation_id
+        destination.write_bytes(b"conflicting bytes")
+    else:
+        destination = root / "attachments" / "objects" / digest
+        destination.write_bytes(capture.read_bytes())
+        if mixed == "all_three":
+            stage = root / "attachments" / "staging" / operation_id
+            stage.write_bytes(capture.read_bytes())
+            stage.chmod(0o600)
+    destination.chmod(0o600)
+    before = {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in (root / "attachments").glob("*/*")
+    }
+    authority = _new_authority(root)
+    try:
+        with pytest.raises(RuntimeError, match="attachment storage failed"):
+            authority.open_store()
+    finally:
+        authority.close()
+    after = {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in (root / "attachments").glob("*/*")
+    }
+    assert after == before
+
+
+def test_f2_second_recovery_interruption_converges_without_ambiguous_bytes(
+    tmp_path: Path,
+):
+    root = tmp_path / "root"
+    source_path = tmp_path / "payload.txt"
+    source_path.write_bytes(b"second recovery interruption")
+    _attachment_fault_process(root, source_path, "before-capture-stage-rename")
+    recovery_source = r'''
+import os
+import sys
+from bots5.infrastructure import attachments
+from bots5.infrastructure.data_root_authority import DataRootAuthority
+root = sys.argv[1]
+def die(point):
+    if point == 'after-staging-directory-fsync':
+        os._exit(91)
+attachments._TEST_FAULT_HOOK = die
+DataRootAuthority(root).acquire().open_store()
+os._exit(20)
+'''
+    interrupted = subprocess.run(
+        [sys.executable, "-c", recovery_source, os.fspath(root)],
+        cwd=REPO,
+        env={**os.environ, "PYTHONPATH": os.fspath(REPO / "src")},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert interrupted.returncode == 91, (interrupted.stdout, interrupted.stderr)
+    digest, _, _ = _staging_row(root)
+    for _ in range(2):
+        _, recovered = _open_store(root)
+        assert recovered._attachment_manager.inventory("captures") == ()
+        assert recovered._attachment_manager.inventory("staging") == ()
+        assert recovered._attachment_manager.inventory("objects") == (digest,)
         recovered.close()
 
 
@@ -2171,7 +5152,7 @@ def test_gc_d0_through_d4_recover_idempotently(
     monkeypatch.undo()
     for _ in range(2):
         _, recovered = _open_store(root)
-        with recovered._engine.connect() as connection:
+        with _private_engine_connection(recovered) as connection:
             assert connection.exec_driver_sql(
                 "SELECT count(*) FROM attachment_blobs"
             ).scalar_one() == 0
@@ -2223,11 +5204,185 @@ def test_gc_forced_death_at_every_durable_edge_recovers_idempotently(
             recovered.gc_attachments()
         assert recovered._attachment_manager.inventory("objects") == ()
         assert recovered._attachment_manager.inventory("gc") == ()
-        with recovered._engine.connect() as connection:
+        with _private_engine_connection(recovered) as connection:
             assert connection.exec_driver_sql(
                 "SELECT count(*) FROM attachment_blobs"
             ).scalar_one() == 0
         recovered.close()
+
+
+def _deleting_state(root: Path, source: Path) -> tuple[str, str, bytes]:
+    _, store = _open_store(root)
+    attachment = store.ingest_attachment(source)
+    store.delete_attachment(attachment.id)
+    store.close()
+    _gc_fault_process(root, "after-gc-deleting-commit")
+    with sqlite3.connect(root / "database" / "state.sqlite3") as connection:
+        digest, gc_id = connection.execute(
+            "SELECT digest, gc_id FROM attachment_blobs WHERE state='deleting'"
+        ).fetchone()
+    return bytes(digest).hex(), str(gc_id), source.read_bytes()
+
+
+@pytest.mark.parametrize(
+    "object_state,gc_state",
+    (
+        ("payload", "absent"),
+        ("payload", "tombstone"),
+        ("tombstone", "payload"),
+        ("payload", "payload"),
+        ("tombstone", "tombstone"),
+        ("tombstone", "absent"),
+        ("absent", "payload"),
+        ("absent", "absent"),
+    ),
+)
+def test_f4_every_attributable_gc_mixed_state_converges_twice(
+    tmp_path: Path, object_state: str, gc_state: str
+):
+    root = tmp_path / f"root-{object_state}-{gc_state}"
+    source = tmp_path / f"source-{object_state}-{gc_state}.txt"
+    source.write_bytes(b"total GC recovery matrix")
+    digest, gc_id, payload = _deleting_state(root, source)
+    object_leaf = root / "attachments" / "objects" / digest
+    gc_leaf = root / "attachments" / "gc" / gc_id
+    tombstone = _AttachmentFS.tombstone_bytes(gc_id, bytes.fromhex(digest))
+
+    if object_state == "tombstone":
+        object_leaf.write_bytes(tombstone)
+        object_leaf.chmod(0o600)
+    elif object_state == "absent":
+        object_leaf.unlink()
+    if gc_state == "payload":
+        gc_leaf.write_bytes(payload)
+        gc_leaf.chmod(0o600)
+    elif gc_state == "tombstone":
+        gc_leaf.write_bytes(tombstone)
+        gc_leaf.chmod(0o600)
+
+    for _ in range(2):
+        _, recovered = _open_store(root)
+        with _private_engine_connection(recovered) as connection:
+            assert connection.exec_driver_sql(
+                "SELECT count(*) FROM attachment_blobs"
+            ).scalar_one() == 0
+        assert recovered._attachment_manager.inventory("objects") == ()
+        assert recovered._attachment_manager.inventory("gc") == ()
+        recovered.close()
+
+
+def test_f4_ready_to_deleting_database_handoff_precedes_first_file_mutation(
+    tmp_path: Path, monkeypatch
+):
+    authority, store = _open_store(tmp_path / "root")
+    source = tmp_path / "payload.txt"
+    source.write_bytes(b"database handoff")
+    attachment = store.ingest_attachment(source)
+    store.delete_attachment(attachment.id)
+    events: list[str] = []
+    original_fence = authority.database_durability_fence
+    original_tombstone = type(store._attachment_manager).create_tombstone
+
+    def fence():
+        events.append("database-fence")
+        return original_fence()
+
+    def tombstone(self, *args, **kwargs):
+        events.append("file-mutation")
+        return original_tombstone(self, *args, **kwargs)
+
+    monkeypatch.setattr(authority, "database_durability_fence", fence)
+    monkeypatch.setattr(type(store._attachment_manager), "create_tombstone", tombstone)
+    assert store.gc_attachments()
+    assert events[:2] == ["database-fence", "file-mutation"]
+    store.close()
+
+
+def test_f4_d4_sync_failure_retains_deleting_intent_until_clean_restart(
+    tmp_path: Path, monkeypatch
+):
+    root = tmp_path / "root"
+    source = tmp_path / "payload.txt"
+    source.write_bytes(b"D4 durable absence")
+    _deleting_state(root, source)
+    (root / "attachments" / "objects" / next(
+        path.name for path in (root / "attachments" / "objects").iterdir()
+    )).unlink()
+    original = _AttachmentFS.sync_namespace
+
+    def fail_gc_sync(self, area):
+        if area == "gc":
+            raise OSError(errno.EIO, "injected D4 parent sync failure")
+        return original(self, area)
+
+    monkeypatch.setattr(_AttachmentFS, "sync_namespace", fail_gc_sync)
+    authority = _new_authority(root)
+    try:
+        with pytest.raises(RuntimeError, match="attachment storage failed"):
+            authority.open_store()
+    finally:
+        authority.close()
+    with sqlite3.connect(root / "database" / "state.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT state FROM attachment_blobs"
+        ).fetchone() == ("deleting",)
+    monkeypatch.undo()
+    _, recovered = _open_store(root)
+    with _private_engine_connection(recovered) as connection:
+        assert connection.exec_driver_sql(
+            "SELECT count(*) FROM attachment_blobs"
+        ).scalar_one() == 0
+    recovered.close()
+
+
+def test_a5_shared_close_is_nonexceptional_data_and_drops_secret_traceback_graph(
+    tmp_path: Path, monkeypatch
+):
+    class SecretPayload:
+        pass
+
+    async def scenario() -> BotsApplication:
+        application, _, authority = _configured_application(tmp_path / "root")
+        started = asyncio.Event()
+        release = asyncio.Event()
+        holder: dict[str, SecretPayload] = {"value": SecretPayload()}
+        holder["value"].secret_api_key = "sk-stage-c-must-not-survive"
+        reference = weakref.ref(holder["value"])
+
+        async def fail_shutdown():
+            payload = holder.pop("value")
+            started.set()
+            await release.wait()
+            raise RuntimeError("custom nested shutdown failure", payload)
+
+        monkeypatch.setattr(application._execution, "shutdown", fail_shutdown)
+        cancelled = asyncio.create_task(application.close())
+        await started.wait()
+        joiner = asyncio.create_task(application.close())
+        cancelled.cancel()
+        result = (await asyncio.gather(cancelled, return_exceptions=True))[0]
+        assert isinstance(result, asyncio.CancelledError)
+        release.set()
+        with pytest.raises(StateError) as first:
+            await joiner
+        assert str(first.value) == "application close failed during execution"
+        with pytest.raises(StateError) as replay:
+            await application.close()
+        assert str(replay.value) == str(first.value)
+        assert application._close_task is None
+        assert application._close_result is not None
+        assert application._close_result.errors[0].stage == "execution"
+        assert "sk-stage-c" not in repr(application.__dict__)
+        assert authority.state is AuthorityState.CLOSED
+        del result, cancelled, joiner, first, replay
+        await asyncio.sleep(0)
+        gc.collect()
+        assert reference() is None
+        return application
+
+    application = asyncio.run(scenario())
+    with pytest.raises(StateError, match="application close failed during execution"):
+        asyncio.run(application.close())
 
 
 def test_gc_rechecks_after_stale_enumeration_before_tombstone(
@@ -2254,7 +5409,7 @@ def test_gc_rechecks_after_stale_enumeration_before_tombstone(
     worker.start()
     assert entered.wait(2)
     attachment_id = str(uuid7())
-    with store._engine.begin() as connection:
+    with _private_engine_connection(store, transaction=True) as connection:
         arm_phase6_attachment_insert(connection, attachment_id)
         try:
             connection.exec_driver_sql(
@@ -2501,7 +5656,7 @@ def test_deleting_blob_rejects_service_and_stock_fk_off_attachment_insertion(
     monkeypatch.setattr(owner, "create_tombstone", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("stop")))
     with pytest.raises(StateError, match="deleting intent retained"):
         store.gc_attachments()
-    with pytest.raises(StateError, match="poisoned"):
+    with pytest.raises(StateError, match="not admitting work"):
         store.ingest_attachment(source)
     store.close()
     monkeypatch.undo()
@@ -2744,6 +5899,40 @@ def test_committed_prior_migration_bytes_are_exactly_unchanged():
         path.name: hashlib.sha256(path.read_bytes()).hexdigest()
         for path in sorted(directory.glob("000[1-8]_*.py"))
     } == PRIOR_MIGRATION_SHA256
+
+
+def test_f3_migration_connection_is_delete_full_before_first_alembic_write(
+    tmp_path: Path, monkeypatch
+):
+    from bots5.infrastructure.persistence import migration_runner
+
+    root = tmp_path / "root"
+    _historical_root(root, "0008_catalogue_refresh_outcomes")
+    original = migration_runner.command.upgrade
+    observed: list[tuple[str, int]] = []
+
+    def checked_upgrade(config, revision):
+        connection = config.attributes["connection"]
+        observed.append(
+            (
+                str(
+                    connection.exec_driver_sql("PRAGMA journal_mode").scalar_one()
+                ).lower(),
+                int(connection.exec_driver_sql("PRAGMA synchronous").scalar_one()),
+            )
+        )
+        return original(config, revision)
+
+    monkeypatch.setattr(migration_runner.command, "upgrade", checked_upgrade)
+    authority, store = _open_store(root)
+    assert observed == [("delete", 2)]
+    assert _revision(root / "database" / "state.sqlite3") == HEAD
+    store.close()
+    assert all(
+        status == "RELEASED"
+        for label, status in authority.claim_inventory
+        if label.startswith("scoped:migration:")
+    )
 
 
 @pytest.mark.parametrize(

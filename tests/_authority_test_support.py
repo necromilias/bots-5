@@ -74,7 +74,13 @@ class SQLiteAppStateStore:
         except BaseException:
             if canonical.exists() and not path.exists() and not path.is_symlink():
                 path.symlink_to(canonical)
-            authority.close()
+            try:
+                authority.close()
+            except BaseException:
+                # Startup rejection is the assertion target in a number of
+                # tests.  Terminal close still performs the best-effort
+                # release, but must not replace that original exception.
+                pass
             raise
 
 

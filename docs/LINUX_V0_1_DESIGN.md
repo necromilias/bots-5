@@ -94,6 +94,18 @@ Future Android/remote clients must talk to the authority rather than opening its
 
 Use SQLite as the authoritative mutable application-state database, local to the authority host.
 
+Runtime data-root effects obey one ownership law. `DataRootAuthority` issues
+PID-, epoch- and execution-owner-bound grants whose state is forward-valid,
+cleanup-only, or released. Public application commands, EventBus publication,
+all public store families and direct database resources acquire or join these
+grants at their callee boundaries. An invalidation request immediately closes
+new admission and revokes the discovering grant; unrelated work already
+admitted may settle its authorized mutation, transaction, resource close and
+producer delivery before the monotonic terminal state is published. Startup,
+migration/recovery and healthy teardown use narrower phase grants. Cleanup
+after invalidation may release known bearers but may not open recovery sessions,
+advance GC, reconcile generations or perform ordinary business writes.
+
 Use SQLAlchemy 2 Core behind an AppStateStore boundary and Alembic for explicit schema migrations.
 Enable SQLite foreign keys explicitly and configure WAL/concurrency deliberately.
 
@@ -163,6 +175,16 @@ Impossible or integrity-threatening state fails loudly rather than being silentl
 plausible shape.
 
 ## Generation backend contract
+
+The desktop `local_openai` backend is an explicitly selected Phase 3
+desktop-testing/compatibility mode. Its inspectable generation mode is
+`LEGACY_PHASE3_LOCAL_OPENAI` with `phase6_enabled=false`; plain text sends
+retain the legacy request path and make no Phase 6 planning, accounting, or
+provenance claim. Attachment selection and direct Phase 6 context planning
+are rejected before persistence or provider dispatch. Normal configured
+Phase 6 sends require their exact registered planning/accounting adapter and
+must fail closed when it is unavailable; they cannot fall through to this
+legacy route.
 
 B.O.T.S. owns a generation-capability contract rather than an OpenAI-defined internal model.
 

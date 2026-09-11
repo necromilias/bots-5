@@ -1,11 +1,27 @@
 from __future__ import annotations
 
-from typing import Protocol
+from typing import ContextManager, Protocol
 
 from bots5.domain.models import Attachment, Chat, GenerationAttempt, Message, WorkspaceWindowState
 
 
 class AppStateStore(Protocol):
+    def command_admission(self, *, independent: bool = False) -> ContextManager[None]:
+        """Acquire or join one complete forward-effect grant."""
+        ...
+
+    def event_admission(self, *, independent: bool = False) -> ContextManager[None]:
+        """Acquire or join the grant used by the bound event producer."""
+        ...
+
+    def issued_event_effect(self) -> ContextManager[None]:
+        """Retain already-issued producer delivery until it settles."""
+        ...
+
+    def assert_admitting(self) -> None:
+        """Raise when the durable store has been poisoned or closed."""
+        ...
+
     def ingest_attachment(self, source, *, filename: str | None = None) -> Attachment:
         ...
 

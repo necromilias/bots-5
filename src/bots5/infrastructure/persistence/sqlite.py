@@ -5,16 +5,18 @@ import hashlib
 import re
 import sqlite3
 
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 from datetime import UTC, datetime
+from functools import wraps
 
 from sqlalchemy import Engine, create_engine, delete, event, func, insert, select, text, update
 from sqlalchemy.pool import NullPool
 from sqlalchemy.exc import IntegrityError
 from uuid6 import uuid7
 
-from bots5.core.errors import RevisionConflict, StateError
+from bots5.core.errors import AuthorityError, RevisionConflict, StateError
 from bots5.domain.clock import parse_utc, utc_iso
 from bots5.domain.models import (
     AttemptState,
@@ -86,8 +88,10 @@ from .phase5_store import (
 )
 from .phase6_schema import validate_phase6_schema
 from bots5.infrastructure.attachments import (
+    AttachmentCleanupUncertain,
     AttachmentIntegrityError,
     _open_attachment_fs,
+    classify_attachment_text,
     digest_to_text,
 )
 
@@ -1122,8 +1126,6 @@ def _attachment(row) -> Attachment:
         raise StateError("attachment record is malformed") from exc
     if len(value.blob_digest) != 64 or len(value.filename) > 255:
         raise StateError("attachment record is malformed")
-    if value.text_representation_id is not None and value.text_digest is None:
-        raise StateError("attachment text representation is malformed")
     return value
 
 
@@ -1976,6 +1978,10 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         except BaseException:
             engine.dispose()
             raise
+        # SQLite has now drained any hot-journal recovery.  Attachment intent
+        # is interpreted only after the recovered main inode and its namespace
+        # have crossed the explicit core-owned durability handoff.
+        authority.database_durability_fence()
         try:
             store = cls(
                 engine,
@@ -1994,7 +2000,9 @@ class SQLiteAppStateStore(Phase5StoreMixin):
             if phase6_tables:
                 store._reconcile_attachments_startup()
         except BaseException as exc:
-            store._close_under_authority()
+            # Startup verification has failed.  Release existing bearers only;
+            # do not open another database connection from the caught path.
+            store._release_after_invalidation()
             raise RuntimeError("durable Phase 6 attachment storage failed verification") from exc
         lease.publish_ready(store)
         return store
@@ -2002,8 +2010,96 @@ class SQLiteAppStateStore(Phase5StoreMixin):
     def _ensure_open(self) -> None:
         if self._closed:
             raise StateError("state store is closed")
-        if self._poisoned:
-            raise StateError("state store is poisoned; restart recovery is required")
+
+    def assert_admitting(self) -> None:
+        """Reject every application command after an uncertain lifecycle commit."""
+        with self.command_admission():
+            pass
+
+    @contextmanager
+    def command_admission(self, *, independent: bool = False):
+        """Hold authoritative admission for one complete application command."""
+        self._ensure_open()
+        try:
+            with self._authority.application_operation(independent=independent):
+                yield
+        except AuthorityError as exc:
+            raise StateError(
+                "state store is not admitting work; fresh-authority recovery is required"
+            ) from exc
+
+    @contextmanager
+    def event_admission(self, *, independent: bool = False):
+        with self.command_admission(independent=independent):
+            yield
+
+    @contextmanager
+    def issued_event_effect(self):
+        try:
+            with self._authority.issued_effect():
+                yield
+        except AuthorityError as exc:
+            raise StateError("event publication authority is unavailable") from exc
+
+    def _commit_attachment_transaction(self, connection, operation: str) -> None:
+        """Classify an attachment-consequential commit at its only call site."""
+        try:
+            connection.commit()
+        except BaseException as exc:
+            self._poisoned = True
+            self._authority.poison(
+                f"uncertain attachment transaction commit: {operation}"
+            )
+            try:
+                connection.rollback()
+            except BaseException:
+                pass
+            raise StateError(
+                "attachment transaction outcome is uncertain; restart recovery is required"
+            ) from exc
+
+    def _rollback_attachment_transaction(self, connection, operation: str) -> None:
+        """Establish a known abort or poison when rollback itself is uncertain."""
+        try:
+            connection.rollback()
+        except BaseException as exc:
+            self._poisoned = True
+            self._authority.poison(
+                f"attachment transaction rollback failed: {operation}"
+            )
+            raise StateError(
+                "attachment transaction rollback is uncertain; restart recovery is required"
+            ) from exc
+
+    def _poison_attachment_lifecycle(self, operation: str) -> None:
+        self._poisoned = True
+        self._authority.poison(f"attachment lifecycle failure: {operation}")
+
+    def _close_attachment_connection(self, connection, operation: str) -> None:
+        """Classify an uncertain close at a live attachment boundary."""
+        try:
+            connection.close()
+        except BaseException as exc:
+            self._poison_attachment_lifecycle(
+                f"{operation} database connection close outcome uncertain"
+            )
+            raise StateError(
+                "attachment database connection close is uncertain; "
+                "restart recovery is required"
+            ) from exc
+
+    def _discard_capture_or_poison(self, captured, operation: str) -> None:
+        try:
+            self._attachment_manager.discard_capture(captured.operation_id)
+        except BaseException as exc:
+            self._poison_attachment_lifecycle(f"{operation} capture cleanup failed")
+            raise StateError(
+                "attachment capture cleanup failed; restart recovery is required"
+            ) from exc
+
+    def _rollback_and_discard_capture(self, connection, captured, operation: str) -> None:
+        self._rollback_attachment_transaction(connection, operation)
+        self._discard_capture_or_poison(captured, operation)
 
     def _ensure_phase6(self) -> None:
         """Require the normal Phase 6 current schema; never repair lazily."""
@@ -2039,6 +2135,14 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         with self._authority.transition():
             try:
                 captured = self._attachment_manager.capture(source, filename=filename)
+            except AttachmentCleanupUncertain as exc:
+                self._poison_attachment_lifecycle(
+                    "capture cleanup durability is uncertain"
+                )
+                raise StateError(
+                    "attachment capture cleanup durability is uncertain; "
+                    "restart recovery is required"
+                ) from exc
             except AttachmentIntegrityError as exc:
                 raise StateError(str(exc)) from exc
             created_at = utc_iso(datetime.now(UTC))
@@ -2046,7 +2150,10 @@ class SQLiteAppStateStore(Phase5StoreMixin):
             # The non-reentrant transition gate is owned continuously from
             # source capture through the final durable lifecycle commit.
             with __import__("contextlib").nullcontext():
-                with self._engine.connect() as connection:
+                connection = None
+                transaction_committed = False
+                try:
+                    connection = self._engine.connect()
                     connection.exec_driver_sql("BEGIN IMMEDIATE")
                     existing = connection.execute(
                         select(attachment_blobs).where(
@@ -2055,7 +2162,9 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     ).first()
                     if existing is not None:
                         if existing.state != "ready" or int(existing.byte_size) != captured.byte_size:
-                            connection.rollback()
+                            self._rollback_attachment_transaction(
+                                connection, "T1 abnormal existing lifecycle row"
+                            )
                             self._poisoned = True
                             self._authority.poison("live attachment lifecycle row is not ready")
                             raise StateError("attachment lifecycle requires restart recovery")
@@ -2082,7 +2191,10 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                                 raise StateError("attachment insertion did not affect one row")
                         finally:
                             clear_phase6(connection)
-                        connection.commit()
+                        self._commit_attachment_transaction(
+                            connection, "T1 deduplicated attachment identity"
+                        )
+                        transaction_committed = True
                         try:
                             self._attachment_manager.discard_capture(captured.operation_id)
                         except BaseException as exc:
@@ -2094,9 +2206,16 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                                 "attachment cleanup failed; restart recovery is required"
                             ) from exc
                         row = connection.execute(
-                            select(attachments).where(attachments.c.id == attachment_id)
+                            select(attachments, attachment_blobs.c.byte_size)
+                            .select_from(
+                                attachments.join(
+                                    attachment_blobs,
+                                    attachments.c.blob_digest == attachment_blobs.c.digest,
+                                )
+                            )
+                            .where(attachments.c.id == attachment_id)
                         ).first()
-                        return _attachment(row)
+                        return self._attachment_from_authoritative_row(row)
                     arm_phase6_blob_transition(
                         connection,
                         captured.digest,
@@ -2123,23 +2242,39 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                             raise StateError("blob staging did not affect one row")
                     finally:
                         clear_phase6(connection)
-                    connection.commit()
+                    self._commit_attachment_transaction(
+                        connection, "T2 initial staging intent"
+                    )
+                    transaction_committed = True
+                except BaseException:
+                    if not transaction_committed and not self._poisoned and connection is not None:
+                        self._rollback_and_discard_capture(connection, captured, "T1/T2 known pre-commit abort")
+                    elif not transaction_committed and not self._poisoned and connection is None:
+                        self._discard_capture_or_poison(
+                            captured, "T1/T2 checkout before transaction"
+                        )
+                    raise
+                finally:
+                    if connection is not None:
+                        self._close_attachment_connection(
+                            connection, "T1/T2 attachment transaction"
+                        )
             _fault("after-staging-row-commit")
             try:
-                self._attachment_manager.capture_to_stage(captured.operation_id)
+                self._attachment_manager.capture_to_stage(
+                    captured.operation_id, captured.digest, captured.byte_size
+                )
+                self._attachment_manager.stage_to_object(
+                    captured.operation_id, captured.digest, captured.byte_size
+                )
+                self._attachment_manager.prove_staging_publication(
+                    captured.operation_id, captured.digest, captured.byte_size
+                )
+                connection = None
+                commit_attempted = False
                 try:
-                    self._attachment_manager.stage_to_object(
-                        captured.operation_id, captured.digest
-                    )
-                except FileExistsError:
-                    self._attachment_manager.read_verified(
-                        captured.digest, expected_size=captured.byte_size
-                    )
-                    self._attachment_manager.verify_stage(
-                        captured.operation_id, captured.digest, captured.byte_size
-                    )
-                    self._attachment_manager.discard_stage(captured.operation_id)
-                with self._engine.begin() as connection:
+                    connection = self._engine.connect()
+                    connection.exec_driver_sql("BEGIN IMMEDIATE")
                     arm_phase6_blob_transition(
                         connection,
                         captured.digest,
@@ -2188,9 +2323,32 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     finally:
                         clear_phase6(connection)
                     row = connection.execute(
-                        select(attachments).where(attachments.c.id == attachment_id)
+                        select(attachments, attachment_blobs.c.byte_size)
+                        .select_from(
+                            attachments.join(
+                                attachment_blobs,
+                                attachments.c.blob_digest == attachment_blobs.c.digest,
+                            )
+                        )
+                        .where(attachments.c.id == attachment_id)
                     ).first()
                     _fault("before-ready-commit")
+                    commit_attempted = True
+                    self._commit_attachment_transaction(
+                        connection, "T3 final publication"
+                    )
+                except BaseException:
+                    if not commit_attempted and not self._poisoned and connection is not None:
+                        self._rollback_attachment_transaction(
+                            connection, "T3 final publication K0"
+                        )
+                        self._poison_attachment_lifecycle(
+                            "T3 final publication known abort"
+                        )
+                    raise
+                finally:
+                    if connection is not None:
+                        connection.close()
                 _fault("after-ready-commit")
             except BaseException as exc:
                 self._poisoned = True
@@ -2198,26 +2356,46 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                 raise StateError(
                     "attachment publication failed; restart recovery is required"
                 ) from exc
-        return _attachment(row)
+        return self._attachment_from_authoritative_row(row)
 
     def get_attachment(self, attachment_id: str) -> Attachment | None:
         self._ensure_open()
         with self._authority.operation(), self._engine.connect() as connection:
             row = connection.execute(
-                select(attachments).where(attachments.c.id == attachment_id)
+                select(attachments, attachment_blobs.c.byte_size)
+                .select_from(
+                    attachments.join(
+                        attachment_blobs,
+                        attachments.c.blob_digest == attachment_blobs.c.digest,
+                    )
+                )
+                .where(attachments.c.id == attachment_id)
             ).first()
-        return None if row is None else _attachment(row)
+        return None if row is None else self._attachment_from_authoritative_row(row)
 
     def list_attachments(self) -> tuple[Attachment, ...]:
         self._ensure_open()
         with self._authority.operation(), self._engine.connect() as connection:
-            rows = connection.execute(select(attachments).order_by(attachments.c.created_at, attachments.c.id)).fetchall()
-        return tuple(_attachment(row) for row in rows)
+            rows = connection.execute(
+                select(attachments, attachment_blobs.c.byte_size)
+                .select_from(
+                    attachments.join(
+                        attachment_blobs,
+                        attachments.c.blob_digest == attachment_blobs.c.digest,
+                    )
+                )
+                .order_by(attachments.c.created_at, attachments.c.id)
+            ).fetchall()
+        return tuple(self._attachment_from_authoritative_row(row) for row in rows)
 
     def delete_attachment(self, attachment_id: str) -> None:
         self._ensure_open()
         with self._authority.transition():
-            with self._engine.begin() as connection:
+            connection = None
+            commit_attempted = False
+            try:
+                connection = self._engine.connect()
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
                 refs = connection.execute(
                     select(message_attachments.c.message_id).where(message_attachments.c.attachment_id == attachment_id)
                 ).first()
@@ -2236,46 +2414,95 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     clear_phase6(connection)
                 if result.rowcount != 1:
                     raise StateError(f"attachment not found: {attachment_id}")
+                commit_attempted = True
+                self._commit_attachment_transaction(
+                    connection, "T4 reusable attachment deletion"
+                )
+            except BaseException:
+                if not commit_attempted and not self._poisoned and connection is not None:
+                    self._rollback_attachment_transaction(
+                        connection, "T4 reusable attachment deletion K0"
+                    )
+                raise
+            finally:
+                if connection is not None:
+                    self._close_attachment_connection(
+                        connection, "T4 reusable attachment deletion"
+                    )
 
     def read_attachment_bytes(self, attachment_id: str) -> bytes:
         self._ensure_open()
         with self._authority.transition():
             with self._engine.connect() as connection:
                 row = connection.execute(
-                    select(attachments.c.blob_digest, attachment_blobs.c.byte_size)
+                    select(
+                        attachments.c.blob_digest,
+                        attachments.c.text_representation_id,
+                        attachments.c.text_digest,
+                        attachments.c.ineligibility_reason,
+                        attachment_blobs.c.byte_size,
+                    )
                     .select_from(attachments.join(attachment_blobs, attachments.c.blob_digest == attachment_blobs.c.digest))
                     .where(attachments.c.id == attachment_id)
                 ).first()
             if row is None:
                 raise StateError(f"attachment not found: {attachment_id}")
             try:
-                return self._attachment_manager.read_verified(
+                raw = self._attachment_manager.read_verified(
                     row.blob_digest, expected_size=row.byte_size
                 )
             except AttachmentIntegrityError as exc:
                 raise StateError(str(exc)) from exc
+            self._validated_authoritative_attachment_representation(
+                row,
+                attachment_id,
+                raw=raw,
+            )
+            return raw
 
     def list_message_attachments(self, message_id: str) -> tuple[Attachment, ...]:
         self._ensure_open()
         with self._authority.operation(), self._engine.connect() as connection:
             rows = connection.execute(
                 select(attachments)
-                .select_from(message_attachments.join(attachments, message_attachments.c.attachment_id == attachments.c.id))
+                .add_columns(attachment_blobs.c.byte_size)
+                .select_from(
+                    message_attachments
+                    .join(
+                        attachments,
+                        message_attachments.c.attachment_id == attachments.c.id,
+                    )
+                    .join(
+                        attachment_blobs,
+                        attachments.c.blob_digest == attachment_blobs.c.digest,
+                    )
+                )
                 .where(message_attachments.c.message_id == message_id)
                 .order_by(message_attachments.c.ordinal)
             ).fetchall()
-        return tuple(_attachment(row) for row in rows)
+        return tuple(self._attachment_from_authoritative_row(row) for row in rows)
 
     def list_attempt_attachments(self, attempt_id: str) -> tuple[Attachment, ...]:
         self._ensure_open()
         with self._authority.operation(), self._engine.connect() as connection:
             rows = connection.execute(
                 select(attachments)
-                .select_from(attempt_attachments.join(attachments, attempt_attachments.c.attachment_id == attachments.c.id))
+                .add_columns(attachment_blobs.c.byte_size)
+                .select_from(
+                    attempt_attachments
+                    .join(
+                        attachments,
+                        attempt_attachments.c.attachment_id == attachments.c.id,
+                    )
+                    .join(
+                        attachment_blobs,
+                        attachments.c.blob_digest == attachment_blobs.c.digest,
+                    )
+                )
                 .where(attempt_attachments.c.attempt_id == attempt_id)
                 .order_by(attempt_attachments.c.ordinal)
             ).fetchall()
-        return tuple(_attachment(row) for row in rows)
+        return tuple(self._attachment_from_authoritative_row(row) for row in rows)
 
     def gc_attachments(self) -> tuple[str, ...]:
         """Linearize deletion, durably mark deleting, then remove bytes."""
@@ -2285,7 +2512,10 @@ class SQLiteAppStateStore(Phase5StoreMixin):
             rows = self._enumerate_unreferenced_blobs()
             for row in rows:
                 gc_id = str(uuid7())
-                with self._engine.connect() as connection:
+                connection = None
+                commit_attempted = False
+                try:
+                    connection = self._engine.connect()
                     connection.exec_driver_sql("BEGIN IMMEDIATE")
                     current = connection.execute(
                         select(attachment_blobs.c.state, attachment_blobs.c.byte_size)
@@ -2294,7 +2524,9 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     if current is None or current.state != "ready" or connection.execute(
                         select(attachments.c.id).where(attachments.c.blob_digest == row.digest)
                     ).first() is not None:
-                        connection.rollback()
+                        self._rollback_attachment_transaction(
+                            connection, "T7 GC authorization no-op K0"
+                        )
                         continue
                     self._attachment_manager.read_verified(
                         row.digest, expected_size=int(row.byte_size)
@@ -2324,59 +2556,27 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     finally:
                         clear_phase6(connection)
                     _fault("before-gc-deleting-commit")
-                    connection.commit()
-                    _fault("after-gc-deleting-commit")
-                try:
-                    self._attachment_manager.create_tombstone(gc_id, row.digest)
-                    self._attachment_manager.exchange_object_to_gc(row.digest, gc_id)
-                    self._attachment_manager.verify_gc_payload(
-                        gc_id, row.digest, int(row.byte_size)
+                    commit_attempted = True
+                    self._commit_attachment_transaction(
+                        connection, "T7 GC authorization"
                     )
-                    _fault("after-gc-payload-verification")
-                    self._attachment_manager.delete_gc_payload(gc_id)
-                    if not self._attachment_manager.canonical_tombstone_present(
-                        gc_id, row.digest
-                    ):
-                        raise AttachmentIntegrityError("canonical GC tombstone is invalid")
-                    self._attachment_manager.delete_canonical_tombstone(row.digest)
-                    with self._engine.connect() as connection:
-                        connection.exec_driver_sql("BEGIN IMMEDIATE")
-                        current = connection.execute(
-                            select(attachment_blobs.c.state, attachment_blobs.c.gc_id)
-                            .where(attachment_blobs.c.digest == row.digest)
-                        ).first()
-                        if (
-                            current is None
-                            or current.state != "deleting"
-                            or current.gc_id != gc_id
-                        ):
-                            connection.rollback()
-                            raise StateError("attachment garbage collection state changed")
-                        if connection.execute(
-                            select(attachments.c.id).where(
-                                attachments.c.blob_digest == row.digest
-                            )
-                        ).first() is not None:
-                            connection.rollback()
-                            raise StateError("attachment appeared after GC authorization")
-                        arm_phase6_blob_delete(connection, row.digest, gc_id)
-                        try:
-                            _fault("before-gc-row-delete")
-                            result = connection.execute(
-                                delete(attachment_blobs).where(
-                                    attachment_blobs.c.digest == row.digest
-                                )
-                            )
-                            require_phase6_consumed(connection)
-                            if result.rowcount != 1:
-                                raise StateError(
-                                    "attachment garbage collection completion lost its row"
-                                )
-                        finally:
-                            clear_phase6(connection)
-                        _fault("before-gc-row-delete-commit")
-                        connection.commit()
-                        _fault("after-gc-row-delete-commit")
+                    _fault("after-gc-deleting-commit")
+                except BaseException:
+                    if not commit_attempted and not self._poisoned and connection is not None:
+                        self._rollback_attachment_transaction(
+                            connection, "T7 GC authorization K0"
+                        )
+                    raise
+                finally:
+                    if connection is not None:
+                        self._close_attachment_connection(
+                            connection, "T7 GC authorization"
+                        )
+                try:
+                    self._authority.database_durability_fence()
+                    self._recover_deleting_blob(
+                        bytes(row.digest), int(row.byte_size), gc_id
+                    )
                 except BaseException as exc:
                     self._poisoned = True
                     self._authority.poison(
@@ -2413,6 +2613,21 @@ class SQLiteAppStateStore(Phase5StoreMixin):
             raise StateError(str(exc)) from exc
 
     def _recover_attachment_rows(self, rows) -> None:
+        with self._engine.connect() as connection:
+            dangling = connection.exec_driver_sql(
+                "SELECT 1 FROM message_attachments m "
+                "LEFT JOIN attachments a ON a.id=m.attachment_id "
+                "WHERE a.id IS NULL LIMIT 1"
+            ).first()
+            dangling_attempt = connection.exec_driver_sql(
+                "SELECT 1 FROM attempt_attachments r "
+                "LEFT JOIN attachments a ON a.id=r.attachment_id "
+                "WHERE a.id IS NULL LIMIT 1"
+            ).first()
+        if dangling is not None or dangling_attempt is not None:
+            raise AttachmentIntegrityError(
+                "historical attachment reference has no reusable identity"
+            )
         expected_operations = {
             str(row.operation_id) for row in rows if row.state == "staging"
         }
@@ -2427,24 +2642,33 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                 continue
             if row.state == "staging":
                 operation_id = str(row.operation_id)
-                capture = self._attachment_manager.capture_present(operation_id)
-                stage = self._attachment_manager.stage_present(operation_id)
-                canonical = self._attachment_manager.object_present(digest)
-                if sum((capture, stage, canonical)) != 1 and not (stage and canonical and not capture):
+                capture = operation_id in self._attachment_manager.inventory("captures")
+                stage = operation_id in self._attachment_manager.inventory("staging")
+                canonical = digest_to_text(digest) in self._attachment_manager.inventory("objects")
+                if not (capture or stage or canonical):
+                    raise AttachmentIntegrityError(
+                        "durable staging row has no attributable payload"
+                    )
+                if capture and canonical:
                     raise AttachmentIntegrityError("staging attachment state is ambiguous")
                 if capture:
                     self._attachment_manager.verify_capture(operation_id, digest, size)
-                    self._attachment_manager.capture_to_stage(operation_id)
+                    self._attachment_manager.capture_to_stage(
+                        operation_id, digest, size
+                    )
                     stage = True
-                if stage and not canonical:
-                    self._attachment_manager.verify_stage(operation_id, digest, size)
-                    self._attachment_manager.stage_to_object(operation_id, digest)
-                elif stage and canonical:
-                    self._attachment_manager.verify_stage(operation_id, digest, size)
-                    self._attachment_manager.read_verified(digest, expected_size=size)
-                    self._attachment_manager.discard_stage(operation_id)
-                self._attachment_manager.read_verified(digest, expected_size=size)
-                with self._engine.begin() as connection:
+                if stage:
+                    self._attachment_manager.stage_to_object(
+                        operation_id, digest, size
+                    )
+                self._attachment_manager.prove_staging_publication(
+                    operation_id, digest, size
+                )
+                connection = None
+                commit_attempted = False
+                try:
+                    connection = self._engine.connect()
+                    connection.exec_driver_sql("BEGIN IMMEDIATE")
                     arm_phase6_blob_transition(
                         connection, digest, "staging", "ready", byte_size=size
                     )
@@ -2466,6 +2690,19 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                             )
                     finally:
                         clear_phase6(connection)
+                    commit_attempted = True
+                    self._commit_attachment_transaction(
+                        connection, "T8 startup staging recovery"
+                    )
+                except BaseException:
+                    if not commit_attempted and not self._poisoned and connection is not None:
+                        self._rollback_attachment_transaction(
+                            connection, "T8 startup staging recovery K0"
+                        )
+                    raise
+                finally:
+                    if connection is not None:
+                        connection.close()
                 continue
             if row.state == "deleting":
                 self._recover_deleting_blob(digest, size, str(row.gc_id))
@@ -2478,6 +2715,9 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     )
                 )
             }
+        # Seal visible absence left by any rowless cleanup and every prior
+        # cross-directory edge before the authority can publish READY.
+        self._attachment_manager.sync_all_namespaces()
         if set(self._attachment_manager.inventory("objects")) != ready:
             raise AttachmentIntegrityError("attachment object inventory is not authoritative")
         if self._attachment_manager.inventory("staging"):
@@ -2488,29 +2728,56 @@ class SQLiteAppStateStore(Phase5StoreMixin):
             raise AttachmentIntegrityError("attachment GC inventory is not empty")
 
     def _recover_deleting_blob(self, digest: bytes, size: int, gc_id: str) -> None:
-        object_present = self._attachment_manager.object_present(digest)
-        gc_present = self._attachment_manager.gc_payload_present(gc_id)
-        canonical_marker = (
-            object_present
-            and self._attachment_manager.canonical_tombstone_present(gc_id, digest)
+        temporary = self._attachment_manager.tombstone_temp(gc_id)
+        if temporary in self._attachment_manager.inventory("gc"):
+            self._attachment_manager._remove_gc_temp(gc_id, digest)
+        object_state, gc_state = self._attachment_manager.gc_content_state(
+            digest, size, gc_id
         )
-        if object_present and not canonical_marker:
-            self._attachment_manager.read_verified(digest, expected_size=size)
-            if not gc_present:
-                self._attachment_manager.create_tombstone(gc_id, digest)
-            elif not self._attachment_manager.tombstone_present(gc_id, digest):
-                raise AttachmentIntegrityError("GC leaf is not the authorized tombstone")
+        if (object_state, gc_state) == ("payload", "absent"):
+            self._attachment_manager.create_tombstone(gc_id, digest)
+            object_state, gc_state = self._attachment_manager.gc_content_state(
+                digest, size, gc_id
+            )
+        if (object_state, gc_state) == ("payload", "tombstone"):
             self._attachment_manager.exchange_object_to_gc(digest, gc_id)
-            canonical_marker = True
-            gc_present = True
-        if canonical_marker:
-            if gc_present:
-                self._attachment_manager.verify_gc_payload(gc_id, digest, size)
-                self._attachment_manager.delete_gc_payload(gc_id)
+            object_state, gc_state = self._attachment_manager.gc_content_state(
+                digest, size, gc_id
+            )
+        if (object_state, gc_state) == ("tombstone", "payload"):
+            self._attachment_manager.sync_namespace("gc")
+            self._attachment_manager.sync_namespace("objects")
+            self._attachment_manager.verify_gc_payload(gc_id, digest, size)
+            _fault("after-gc-payload-verification")
+            self._attachment_manager.delete_gc_payload(gc_id)
             self._attachment_manager.delete_canonical_tombstone(digest)
-        elif gc_present:
-            raise AttachmentIntegrityError("GC payload exists without canonical tombstone")
-        with self._engine.connect() as connection:
+        elif (object_state, gc_state) == ("payload", "payload"):
+            self._attachment_manager.delete_canonical_payload(digest)
+            self._attachment_manager.delete_gc_payload(gc_id)
+        elif (object_state, gc_state) == ("tombstone", "tombstone"):
+            self._attachment_manager.sync_namespace("gc")
+            self._attachment_manager.sync_namespace("objects")
+            self._attachment_manager.delete_gc_tombstone(gc_id)
+            self._attachment_manager.delete_canonical_tombstone(digest)
+        elif (object_state, gc_state) == ("tombstone", "absent"):
+            self._attachment_manager.delete_canonical_tombstone(digest)
+        elif (object_state, gc_state) == ("absent", "payload"):
+            self._attachment_manager.delete_gc_payload(gc_id)
+        elif (object_state, gc_state) != ("absent", "absent"):
+            raise AttachmentIntegrityError(
+                "GC names do not match an authorized recovery state"
+            )
+        self._attachment_manager.sync_namespace("gc")
+        self._attachment_manager.sync_namespace("objects")
+        object_state, gc_state = self._attachment_manager.gc_content_state(
+            digest, size, gc_id
+        )
+        if (object_state, gc_state) != ("absent", "absent"):
+            raise AttachmentIntegrityError("GC D4 absence is not authoritative")
+        connection = None
+        commit_attempted = False
+        try:
+            connection = self._engine.connect()
             connection.exec_driver_sql("BEGIN IMMEDIATE")
             current = connection.execute(
                 select(attachment_blobs.c.state, attachment_blobs.c.gc_id).where(
@@ -2527,6 +2794,7 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                 raise AttachmentIntegrityError("deleting blob gained an attachment")
             arm_phase6_blob_delete(connection, digest, gc_id)
             try:
+                _fault("before-gc-row-delete")
                 result = connection.execute(
                     delete(attachment_blobs).where(attachment_blobs.c.digest == digest)
                 )
@@ -2537,7 +2805,24 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     )
             finally:
                 clear_phase6(connection)
-            connection.commit()
+            _fault("before-gc-row-delete-commit")
+            commit_attempted = True
+            self._commit_attachment_transaction(
+                connection, "T9 GC final intent deletion"
+            )
+            _fault("after-gc-row-delete-commit")
+        except BaseException:
+            if not commit_attempted and not self._poisoned and connection is not None:
+                self._rollback_attachment_transaction(
+                    connection, "T9 GC final intent deletion K0"
+                )
+                self._poison_attachment_lifecycle(
+                    "T9 GC final intent deletion known abort"
+                )
+            raise
+        finally:
+            if connection is not None:
+                connection.close()
 
     def _validate_attachment_payload_rows(self) -> None:
         """Verify representation identity/eligibility against the owned bytes."""
@@ -2564,23 +2849,27 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                 )
             except AttachmentIntegrityError as exc:
                 raise StateError("durable attachment payload integrity failed") from exc
-            try:
-                decoded = raw.decode("utf-8", errors="strict")
-            except UnicodeDecodeError:
-                if row.text_representation_id is not None or row.ineligibility_reason != "invalid_utf8":
-                    raise StateError("durable attachment UTF-8 representation is malformed")
-                continue
-            if b"\x00" in raw:
-                if row.text_representation_id is not None or row.ineligibility_reason != "contains_nul":
-                    raise StateError("durable attachment NUL representation is malformed")
-                continue
-            digest = hashlib.sha256(raw).digest()
-            if (
-                row.text_representation_id != digest
-                or row.text_digest != digest
-                or row.ineligibility_reason is not None
-                or decoded.encode("utf-8") != raw
-            ):
+            classification = classify_attachment_text(raw)
+            expected_representation = classification.representation_id
+            persisted = (
+                row.text_representation_id,
+                row.text_digest,
+                row.ineligibility_reason,
+            )
+            expected = (
+                expected_representation,
+                expected_representation,
+                classification.ineligibility_reason,
+            )
+            if persisted != expected:
+                if classification.ineligibility_reason == "invalid_utf8":
+                    raise StateError(
+                        "durable attachment UTF-8 representation is malformed"
+                    )
+                if classification.ineligibility_reason == "contains_nul":
+                    raise StateError(
+                        "durable attachment NUL representation is malformed"
+                    )
                 raise StateError("durable attachment representation is malformed")
 
     def list_chats(self) -> tuple[Chat, ...]:
@@ -2918,6 +3207,85 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         if result.rowcount != 1:
             raise RevisionConflict(f"chat revision changed: {chat.id}")
 
+    def _attachment_from_authoritative_row(self, row) -> Attachment:
+        attachment_id = str(row._mapping["id"])
+        try:
+            raw = self._attachment_manager.read_verified(
+                row.blob_digest,
+                expected_size=int(row.byte_size),
+            )
+        except AttachmentIntegrityError as exc:
+            raise StateError("attachment payload integrity failed") from exc
+        self._validated_authoritative_attachment_representation(
+            row,
+            attachment_id,
+            raw=raw,
+        )
+        return _attachment(row)
+
+    def _validated_authoritative_attachment_representation(
+        self,
+        attachment_row,
+        attachment_id: str,
+        *,
+        raw: bytes,
+    ) -> str | None:
+        """Classify persisted text evidence before any application consumes it."""
+        representation_id = attachment_row.text_representation_id
+        representation_digest = attachment_row.text_digest
+        ineligibility_reason = attachment_row.ineligibility_reason
+        classification = classify_attachment_text(raw)
+
+        def corruption(message: str, cause: BaseException | None = None) -> None:
+            # Keep ``_poisoned`` false so the existing transaction can perform
+            # its known rollback.  The authority request is monotonic and
+            # revokes this logical grant before that cleanup begins.
+            self._authority.poison(
+                "required attachment text representation integrity failure"
+            )
+            error = StateError(message)
+            if cause is not None:
+                raise error from cause
+            raise error
+
+        if representation_id is None and representation_digest is not None:
+            corruption("selected attachment text representation metadata is inconsistent")
+        if representation_id is not None and representation_digest is None:
+            corruption("attachment text representation is malformed")
+        if (
+            representation_id is not None
+            and representation_digest is not None
+            and representation_id != representation_digest
+        ):
+            corruption("selected attachment text representation identity disagrees with its digest")
+
+        if representation_id is None:
+            if (
+                classification.representation_id is not None
+                or ineligibility_reason != classification.ineligibility_reason
+            ):
+                corruption(
+                    "selected attachment ineligibility metadata disagrees with its payload"
+                )
+            return None
+
+        if ineligibility_reason is not None:
+            corruption(
+                "selected attachment text representation conflicts with ineligibility metadata"
+            )
+        if classification.ineligibility_reason == "invalid_utf8":
+            corruption(
+                f"selected attachment is not valid UTF-8: {attachment_id}",
+                classification.decode_error,
+            )
+        if classification.ineligibility_reason == "contains_nul":
+            corruption(
+                f"selected attachment text representation contains NUL: {attachment_id}"
+            )
+        if classification.representation_id != representation_digest:
+            corruption("selected attachment text representation digest mismatches its payload")
+        return classification.text
+
     def _persist_phase6_evidence(
         self,
         connection,
@@ -2965,6 +3333,7 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                         attachments.c.blob_digest,
                         attachments.c.text_representation_id,
                         attachments.c.text_digest,
+                        attachments.c.ineligibility_reason,
                         attachment_blobs.c.byte_size,
                     )
                     .select_from(
@@ -2984,14 +3353,15 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     )
                 except AttachmentIntegrityError as exc:
                     raise StateError("selected attachment payload integrity failed") from exc
-                if attachment_row.text_representation_id is None or attachment_row.text_digest is None:
-                    raise StateError(f"selected attachment is not context-eligible: {attachment_id}")
-                try:
-                    text_content = raw.decode("utf-8", errors="strict")
-                except UnicodeDecodeError as exc:
-                    raise StateError(f"selected attachment is not valid UTF-8: {attachment_id}") from exc
-                if hashlib.sha256(text_content.encode("utf-8")).digest() != attachment_row.text_digest:
-                    raise StateError("selected attachment text representation digest mismatches its payload")
+                text_content = self._validated_authoritative_attachment_representation(
+                    attachment_row,
+                    attachment_id,
+                    raw=raw,
+                )
+                if text_content is None:
+                    raise StateError(
+                        f"selected attachment is not context-eligible: {attachment_id}"
+                    )
                 if (
                     source.representation_id
                     != digest_to_text(attachment_row.text_representation_id)
@@ -3046,7 +3416,27 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         # write transaction.  This ordering prevents GC (gate -> BEGIN
         # IMMEDIATE) from deadlocking generation (BEGIN -> gate).
         with self._authority.transition():
-            with self._engine.begin() as connection:
+            with ExitStack() as stack:
+                if attachment_ids:
+                    connection = self._engine.connect()
+                    stack.callback(
+                        self._close_attachment_connection,
+                        connection,
+                        "T5 generation start with attachments",
+                    )
+                    connection.exec_driver_sql("BEGIN IMMEDIATE")
+                    explicit = True
+                else:
+                    connection = stack.enter_context(self._engine.begin())
+                    explicit = False
+                commit_succeeded = False
+                if explicit:
+                    def rollback_k0() -> None:
+                        if not commit_succeeded and not self._poisoned:
+                            self._rollback_attachment_transaction(
+                                connection, "T5 generation start with attachments K0"
+                            )
+                    stack.callback(rollback_k0)
                 self._insert_messages_and_attempt(
                     connection,
                     (user_message, assistant_message),
@@ -3065,6 +3455,12 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     assistant_message.id,
                     expected_chat_revision,
                 )
+                if explicit:
+                    commit_attempted = True
+                    self._commit_attachment_transaction(
+                        connection, "T5 generation start with attachments"
+                    )
+                    commit_succeeded = True
 
     def persist_regeneration_start(
         self,
@@ -3078,7 +3474,27 @@ class SQLiteAppStateStore(Phase5StoreMixin):
     ) -> None:
         self._ensure_open()
         with self._authority.transition():
-            with self._engine.begin() as connection:
+            with ExitStack() as stack:
+                if attachment_ids:
+                    connection = self._engine.connect()
+                    stack.callback(
+                        self._close_attachment_connection,
+                        connection,
+                        "T6 regeneration with attachments",
+                    )
+                    connection.exec_driver_sql("BEGIN IMMEDIATE")
+                    explicit = True
+                else:
+                    connection = stack.enter_context(self._engine.begin())
+                    explicit = False
+                commit_succeeded = False
+                if explicit:
+                    def rollback_k0() -> None:
+                        if not commit_succeeded and not self._poisoned:
+                            self._rollback_attachment_transaction(
+                                connection, "T6 regeneration with attachments K0"
+                            )
+                    stack.callback(rollback_k0)
                 self._insert_messages_and_attempt(connection, (assistant_message,), attempt)
                 self._persist_phase6_evidence(
                     connection,
@@ -3094,6 +3510,12 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     assistant_message.id,
                     expected_chat_revision,
                 )
+                if explicit:
+                    commit_attempted = True
+                    self._commit_attachment_transaction(
+                        connection, "T6 regeneration with attachments"
+                    )
+                    commit_succeeded = True
 
     def update_streaming_message(self, message: Message) -> None:
         self._ensure_open()
@@ -3388,11 +3810,119 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     mode = str(
                         connection.exec_driver_sql("PRAGMA journal_mode").scalar_one()
                     ).casefold()
+                    synchronous = int(
+                        connection.exec_driver_sql("PRAGMA synchronous").scalar_one()
+                    )
                     if mode != "delete":
                         raise StateError("steady SQLite journal mode changed before close")
+                    if synchronous != 2:
+                        raise StateError("steady SQLite synchronous mode changed before close")
             finally:
                 self._attachment_manager.close()
                 self._engine.dispose()
 
+    def _release_after_invalidation(self) -> None:
+        """Release bearers only; never open a recovery/inspection connection."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._attachment_manager.close()
+        finally:
+            self._engine.dispose()
+
     def close(self) -> None:
         self._authority.close()
+
+
+def _authority_store_operation(method):
+    """Give every public store operation a callee-owned logical grant."""
+
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        try:
+            with self._authority.operation():
+                return method(self, *args, **kwargs)
+        except AuthorityError as exc:
+            raise StateError(
+                "state store is not admitting work; fresh-authority recovery is required"
+            ) from exc
+
+    return guarded
+
+
+_SQLITE_OPERATION_METHODS = (
+    "create_chat",
+    "ingest_attachment",
+    "get_attachment",
+    "list_attachments",
+    "delete_attachment",
+    "read_attachment_bytes",
+    "list_message_attachments",
+    "list_attempt_attachments",
+    "gc_attachments",
+    "list_chats",
+    "get_chat",
+    "get_message",
+    "list_messages",
+    "list_branch_messages",
+    "list_revisions",
+    "list_generation_attempts",
+    "list_active_generation_attempts",
+    "get_generation_attempt",
+    "next_message_sequence",
+    "persist_generation_start",
+    "persist_regeneration_start",
+    "update_streaming_message",
+    "finalize_generation",
+    "reconcile_interrupted_generations",
+    "update_attempt",
+    "list_workspace_windows",
+    "save_workspace_window",
+    "delete_workspace_window",
+)
+
+_PHASE5_OPERATION_METHODS = (
+    "list_provider_connections",
+    "get_provider_connection",
+    "create_provider_connection",
+    "update_provider_connection",
+    "set_provider_connection_enabled",
+    "retire_provider_connection",
+    "list_model_catalogue_entries",
+    "get_model_catalogue_entry",
+    "get_model_catalogue_entry_by_provider_id",
+    "add_manual_model",
+    "refresh_model_catalogue",
+    "list_capability_facts",
+    "set_capability_fact",
+    "list_capability_overrides",
+    "set_capability_override",
+    "add_capability_observation",
+    "get_application_generation_config",
+    "get_application_generation_settings",
+    "set_application_generation_settings",
+    "set_application_default_model",
+    "get_model_generation_settings",
+    "get_model_generation_config",
+    "set_model_generation_settings",
+    "get_chat_model_generation_settings",
+    "get_chat_model_generation_config",
+    "set_chat_model_generation_settings",
+    "get_chat_model_selection",
+    "set_chat_model_selection",
+)
+
+for _method_name in _SQLITE_OPERATION_METHODS:
+    setattr(
+        SQLiteAppStateStore,
+        _method_name,
+        _authority_store_operation(getattr(SQLiteAppStateStore, _method_name)),
+    )
+
+for _method_name in _PHASE5_OPERATION_METHODS:
+    setattr(
+        Phase5StoreMixin,
+        _method_name,
+        _authority_store_operation(getattr(Phase5StoreMixin, _method_name)),
+    )

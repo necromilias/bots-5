@@ -34,6 +34,10 @@ class AttachmentIntegrityError(RuntimeError):
     pass
 
 
+class AttachmentCleanupUncertain(AttachmentIntegrityError):
+    """A capture cleanup mutation lacks its mandatory namespace barrier."""
+
+
 @dataclass(frozen=True, slots=True)
 class CapturedAttachment:
     digest: bytes
@@ -43,6 +47,40 @@ class CapturedAttachment:
     text: str | None
     representation_id: bytes | None
     ineligibility_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class AttachmentTextClassification:
+    """Pure semantic classification of canonical attachment bytes."""
+
+    text: str | None
+    representation_id: bytes | None
+    ineligibility_reason: str | None
+    decode_error: UnicodeDecodeError | None = None
+
+
+def classify_attachment_text(raw: bytes) -> AttachmentTextClassification:
+    """Derive the one Phase 6 text-representation meaning of canonical bytes."""
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        return AttachmentTextClassification(
+            text=None,
+            representation_id=None,
+            ineligibility_reason="invalid_utf8",
+            decode_error=exc,
+        )
+    if "\x00" in text:
+        return AttachmentTextClassification(
+            text=None,
+            representation_id=None,
+            ineligibility_reason="contains_nul",
+        )
+    return AttachmentTextClassification(
+        text=text,
+        representation_id=hashlib.sha256(raw).digest(),
+        ineligibility_reason=None,
+    )
 
 
 def _component(value: str) -> str:
@@ -212,6 +250,30 @@ class _AttachmentFS:
         self._mount_id = None
         self._authority = None
 
+    def _track_fd(self, label: str, fd: int) -> None:
+        self._authority._claim_scoped_fd(f"attachment:{label}", fd)
+
+    def _close_fd(self, fd: int) -> None:
+        claim = next(
+            (
+                item
+                for item in self._authority._claims
+                if item.fd == fd
+                and item.status == "HELD"
+                and item.label.startswith("scoped:attachment:")
+            ),
+            None,
+        )
+        if claim is None:
+            raise AttachmentIntegrityError("attachment descriptor has no owner")
+        try:
+            self._authority._release_scoped_fd(claim)
+        except BaseException as exc:
+            self._authority.poison("attachment descriptor close outcome is uncertain")
+            raise AttachmentIntegrityError(
+                "attachment descriptor close outcome is uncertain"
+            ) from exc
+
     def _open_source(self, source: object) -> tuple[int, str]:
         self._live()
         raw = os.fspath(source)
@@ -243,6 +305,7 @@ class _AttachmentFS:
                     os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
                     resolve=_RESOLVE_WALK,
                 )
+                self._track_fd("source-directory", child)
                 opened.append(child)
                 parent = child
             fd = _open_component(
@@ -251,9 +314,10 @@ class _AttachmentFS:
                 os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
                 resolve=_RESOLVE_WALK,
             )
+            self._track_fd("source-file", fd)
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode):
-                os.close(fd)
+                self._close_fd(fd)
                 raise AttachmentIntegrityError(
                     "attachment source must be a regular file"
                 )
@@ -263,8 +327,15 @@ class _AttachmentFS:
                 "attachment source cannot be opened safely"
             ) from exc
         finally:
+            close_error: BaseException | None = None
             for descriptor in reversed(opened):
-                os.close(descriptor)
+                try:
+                    self._close_fd(descriptor)
+                except BaseException as exc:
+                    if close_error is None:
+                        close_error = exc
+            if close_error is not None:
+                raise close_error
 
     def capture(
         self, source: object, *, filename: str | None = None
@@ -281,6 +352,7 @@ class _AttachmentFS:
                 0o600,
                 dir_fd=self._captures_fd,
             )
+            self._track_fd("capture", capture_fd)
             os.fchmod(capture_fd, 0o600)
             digest = hashlib.sha256()
             raw = bytearray()
@@ -295,6 +367,8 @@ class _AttachmentFS:
                 byte_count += len(chunk)
             os.fsync(capture_fd)
             _fault("after-capture-file-fsync")
+            os.fsync(self._captures_fd)
+            _fault("after-capture-directory-fsync")
             after = os.fstat(source_fd)
             stable = (
                 before.st_dev,
@@ -315,37 +389,45 @@ class _AttachmentFS:
                 )
         except BaseException:
             if capture_fd >= 0:
-                os.close(capture_fd)
+                closing_fd = capture_fd
                 capture_fd = -1
+                self._close_fd(closing_fd)
             try:
                 os.unlink(operation_id, dir_fd=self._captures_fd)
                 os.fsync(self._captures_fd)
             except FileNotFoundError:
                 pass
+            except BaseException as exc:
+                raise AttachmentCleanupUncertain(
+                    "attachment capture cleanup durability is uncertain"
+                ) from exc
             raise
         finally:
+            close_error: BaseException | None = None
             if capture_fd >= 0:
-                os.close(capture_fd)
-            os.close(source_fd)
-        try:
-            text = bytes(raw).decode("utf-8", errors="strict")
-            if "\x00" in text:
-                text = None
-                reason = "contains_nul"
-            else:
-                reason = None
-        except UnicodeDecodeError:
-            text = None
-            reason = "invalid_utf8"
+                closing_fd = capture_fd
+                capture_fd = -1
+                try:
+                    self._close_fd(closing_fd)
+                except BaseException as exc:
+                    close_error = exc
+            try:
+                self._close_fd(source_fd)
+            except BaseException as exc:
+                if close_error is None:
+                    close_error = exc
+            if close_error is not None:
+                raise close_error
+        classification = classify_attachment_text(bytes(raw))
         value = digest.digest()
         return CapturedAttachment(
             digest=value,
             byte_size=byte_count,
             operation_id=operation_id,
             filename=_safe_filename(filename or source_name),
-            text=text,
-            representation_id=value if text is not None else None,
-            ineligibility_reason=reason,
+            text=classification.text,
+            representation_id=classification.representation_id,
+            ineligibility_reason=classification.ineligibility_reason,
         )
 
     def _open_owned(self, directory_fd: int, leaf: str) -> int:
@@ -357,11 +439,12 @@ class _AttachmentFS:
                 _component(leaf),
                 os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
             )
+            self._track_fd("artifact-proof", fd)
             _check_regular(fd, mount_id=self._mount_id)
             return fd
         except BaseException as exc:
             if fd >= 0:
-                os.close(fd)
+                self._close_fd(fd)
             raise AttachmentIntegrityError(
                 "attachment artifact cannot be opened safely"
             ) from exc
@@ -379,7 +462,7 @@ class _AttachmentFS:
                 )
             os.unlink(leaf, dir_fd=directory_fd)
         finally:
-            os.close(fd)
+            self._close_fd(fd)
         os.fsync(directory_fd)
 
     def _read_verified(
@@ -405,7 +488,7 @@ class _AttachmentFS:
                     "attachment artifact changed while read"
                 )
         finally:
-            os.close(fd)
+            self._close_fd(fd)
         result = bytes(value)
         if (
             len(result) != byte_size
@@ -454,42 +537,123 @@ class _AttachmentFS:
 
     def read_verified(self, digest: bytes, *, expected_size: int) -> bytes:
         self._live()
-        return self._read_verified(
-            self._objects_fd, digest_to_text(digest), digest, expected_size
-        )
+        leaf = digest_to_text(digest)
+        try:
+            return self._read_verified(
+                self._objects_fd, leaf, digest, expected_size
+            )
+        except AttachmentIntegrityError:
+            # ``read_verified`` is the canonical-object boundary: its digest
+            # and size are durable authority-owned facts supplied by the
+            # store, not untrusted request validation.  Once those bytes are
+            # absent, unsafe, or different, the discovering grant may unwind
+            # but must never be reused for forward work.
+            self._authority.poison(
+                "required attachment payload integrity failure"
+            )
+            raise
 
     def discard_capture(self, operation_id: str) -> None:
         self._live()
         self._unlink_owned(self._captures_fd, _uuid7(operation_id))
 
-    def capture_to_stage(self, operation_id: str) -> None:
+    def capture_to_stage(
+        self, operation_id: str, digest: bytes, byte_size: int
+    ) -> None:
         self._live()
         operation_id = _uuid7(operation_id)
-        _fault("before-capture-stage-rename")
-        _rename_noreplace(
-            self._captures_fd, operation_id, self._staging_fd, operation_id
-        )
-        _fault("after-capture-stage-rename")
-        os.fsync(self._captures_fd)
-        _fault("after-captures-directory-fsync")
-        os.fsync(self._staging_fd)
-        _fault("after-staging-directory-fsync")
+        captures = set(self.inventory("captures"))
+        staging = set(self.inventory("staging"))
+        source = operation_id in captures
+        destination = operation_id in staging
+        if source:
+            self.verify_capture(operation_id, digest, byte_size)
+        if destination:
+            self.verify_stage(operation_id, digest, byte_size)
+        if source and not destination:
+            _fault("before-capture-stage-rename")
+            _rename_noreplace(
+                self._captures_fd, operation_id, self._staging_fd, operation_id
+            )
+            _fault("after-capture-stage-rename")
+            # Destination first: an interrupted move may leave two names, but
+            # never a durable staging row without attributable bytes.
+            os.fsync(self._staging_fd)
+            _fault("after-staging-directory-fsync")
+            os.fsync(self._captures_fd)
+            _fault("after-captures-directory-fsync")
+        elif source and destination:
+            os.fsync(self._staging_fd)
+            _fault("after-staging-directory-fsync")
+            self.discard_capture(operation_id)
+            _fault("after-captures-directory-fsync")
+        elif not destination:
+            raise AttachmentIntegrityError(
+                "durable staging row has no capture or stage payload"
+            )
+        self.verify_stage(operation_id, digest, byte_size)
+        if operation_id in self.inventory("captures"):
+            raise AttachmentIntegrityError("capture-to-stage source remains")
+        if operation_id not in self.inventory("staging"):
+            raise AttachmentIntegrityError("capture-to-stage destination is absent")
 
-    def stage_to_object(self, operation_id: str, digest: bytes) -> None:
+    def stage_to_object(
+        self, operation_id: str, digest: bytes, byte_size: int
+    ) -> None:
         self._live()
         operation_id = _uuid7(operation_id)
-        _fault("before-stage-object-rename")
-        _rename_noreplace(
-            self._staging_fd,
-            operation_id,
-            self._objects_fd,
-            digest_to_text(digest),
-        )
-        _fault("after-stage-object-rename")
+        object_leaf = digest_to_text(digest)
+        staging = set(self.inventory("staging"))
+        objects = set(self.inventory("objects"))
+        source = operation_id in staging
+        destination = object_leaf in objects
+        if source:
+            self.verify_stage(operation_id, digest, byte_size)
+        if destination:
+            self.read_verified(digest, expected_size=byte_size)
+        if source and not destination:
+            _fault("before-stage-object-rename")
+            _rename_noreplace(
+                self._staging_fd,
+                operation_id,
+                self._objects_fd,
+                object_leaf,
+            )
+            _fault("after-stage-object-rename")
+            os.fsync(self._objects_fd)
+            _fault("after-objects-directory-fsync")
+            os.fsync(self._staging_fd)
+            _fault("after-stage-object-staging-fsync")
+        elif source and destination:
+            os.fsync(self._objects_fd)
+            _fault("after-objects-directory-fsync")
+            self.discard_stage(operation_id)
+            _fault("after-stage-object-staging-fsync")
+        elif not destination:
+            raise AttachmentIntegrityError(
+                "durable staging row has no stage or canonical payload"
+            )
+        self.read_verified(digest, expected_size=byte_size)
+        if operation_id in self.inventory("staging"):
+            raise AttachmentIntegrityError("stage-to-object source remains")
+        if object_leaf not in self.inventory("objects"):
+            raise AttachmentIntegrityError("stage-to-object destination is absent")
+
+    def prove_staging_publication(
+        self, operation_id: str, digest: bytes, byte_size: int
+    ) -> None:
+        self._live()
+        operation_id = _uuid7(operation_id)
+        os.fsync(self._captures_fd)
         os.fsync(self._staging_fd)
-        _fault("after-stage-object-staging-fsync")
         os.fsync(self._objects_fd)
-        _fault("after-objects-directory-fsync")
+        if operation_id in self.inventory("captures"):
+            raise AttachmentIntegrityError("publication capture source remains")
+        if operation_id in self.inventory("staging"):
+            raise AttachmentIntegrityError("publication stage source remains")
+        if digest_to_text(digest) not in self.inventory("objects"):
+            raise AttachmentIntegrityError("publication canonical destination is absent")
+        self.read_verified(digest, expected_size=byte_size)
 
     def discard_stage(self, operation_id: str) -> None:
         self._live()
@@ -516,6 +680,7 @@ class _AttachmentFS:
                 0o600,
                 dir_fd=self._gc_fd,
             )
+            self._track_fd("gc-tombstone-temp", fd)
             _fault("after-gc-tombstone-temp-create")
         except FileExistsError:
             self._remove_gc_temp(gc_id, digest)
@@ -525,6 +690,7 @@ class _AttachmentFS:
                 0o600,
                 dir_fd=self._gc_fd,
             )
+            self._track_fd("gc-tombstone-temp", fd)
             _fault("after-gc-tombstone-temp-create")
         try:
             os.fchmod(fd, 0o600)
@@ -533,7 +699,7 @@ class _AttachmentFS:
             os.fsync(fd)
             _fault("after-gc-tombstone-file-fsync")
         finally:
-            os.close(fd)
+            self._close_fd(fd)
         _fault("before-gc-tombstone-rename")
         _rename_noreplace(self._gc_fd, temporary, self._gc_fd, final)
         _fault("after-gc-tombstone-rename")
@@ -552,7 +718,7 @@ class _AttachmentFS:
             observed = os.read(fd, len(expected) + 1)
             after = _identity(fd)
         finally:
-            os.close(fd)
+            self._close_fd(fd)
         if before != after or observed != expected[: len(observed)] or len(observed) > len(expected):
             raise AttachmentIntegrityError(
                 "GC tombstone temporary evidence is not attributable"
@@ -570,7 +736,7 @@ class _AttachmentFS:
             payload = os.read(fd, 58)
             after = _identity(fd)
         finally:
-            os.close(fd)
+            self._close_fd(fd)
         return before == after and payload == self.tombstone_bytes(gc_id, digest)
 
     def canonical_tombstone_present(self, gc_id: str, digest: bytes) -> bool:
@@ -582,7 +748,7 @@ class _AttachmentFS:
         try:
             payload = os.read(fd, 58)
         finally:
-            os.close(fd)
+            self._close_fd(fd)
         return payload == self.tombstone_bytes(gc_id, digest)
 
     def gc_payload_present(self, gc_id: str) -> bool:
@@ -607,10 +773,10 @@ class _AttachmentFS:
             _uuid7(gc_id),
         )
         _fault("after-gc-exchange")
-        os.fsync(self._objects_fd)
-        _fault("after-gc-objects-directory-fsync")
         os.fsync(self._gc_fd)
         _fault("after-gc-directory-fsync")
+        os.fsync(self._objects_fd)
+        _fault("after-gc-objects-directory-fsync")
 
     def delete_gc_payload(self, gc_id: str) -> None:
         self._live()
@@ -624,7 +790,15 @@ class _AttachmentFS:
         self._unlink_owned(self._objects_fd, digest_to_text(digest))
         _fault("after-gc-tombstone-unlink-fsync")
 
-    def inventory(self, area: str) -> tuple[str, ...]:
+    def delete_canonical_payload(self, digest: bytes) -> None:
+        self._live()
+        self._unlink_owned(self._objects_fd, digest_to_text(digest))
+
+    def delete_gc_tombstone(self, gc_id: str) -> None:
+        self._live()
+        self._unlink_owned(self._gc_fd, _uuid7(gc_id))
+
+    def sync_namespace(self, area: str) -> None:
         self._live()
         descriptor = {
             "objects": self._objects_fd,
@@ -633,8 +807,68 @@ class _AttachmentFS:
             "gc": self._gc_fd,
         }.get(area)
         if descriptor is None:
-            raise AttachmentIntegrityError("unknown attachment inventory")
-        return tuple(sorted(os.listdir(descriptor)))
+            raise AttachmentIntegrityError("unknown attachment namespace")
+        os.fsync(descriptor)
+
+    def sync_all_namespaces(self) -> None:
+        self._live()
+        for area in ("captures", "staging", "objects", "gc"):
+            self.sync_namespace(area)
+
+    def gc_content_state(
+        self, digest: bytes, byte_size: int, gc_id: str
+    ) -> tuple[str, str]:
+        self._live()
+        object_leaf = digest_to_text(digest)
+        gc_leaf = _uuid7(gc_id)
+        objects = set(self.inventory("objects"))
+        gc_names = set(self.inventory("gc"))
+
+        def classify_object() -> str:
+            if object_leaf not in objects:
+                return "absent"
+            if self.canonical_tombstone_present(gc_id, digest):
+                return "tombstone"
+            self.read_verified(digest, expected_size=byte_size)
+            return "payload"
+
+        def classify_gc() -> str:
+            if gc_leaf not in gc_names:
+                return "absent"
+            if self.tombstone_present(gc_id, digest):
+                return "tombstone"
+            self.verify_gc_payload(gc_id, digest, byte_size)
+            return "payload"
+
+        return classify_object(), classify_gc()
+
+    def inventory(self, area: str) -> tuple[str, ...]:
+        if self._closed or self._authority is None:
+            self._live()
+        authority = self._authority
+        assert authority is not None
+        with authority.operation():
+            self._live()
+            descriptor = {
+                "objects": self._objects_fd,
+                "staging": self._staging_fd,
+                "captures": self._captures_fd,
+                "gc": self._gc_fd,
+            }.get(area)
+            if descriptor is None:
+                raise AttachmentIntegrityError("unknown attachment inventory")
+            relative = {
+                "objects": "attachments/objects",
+                "staging": "attachments/staging",
+                "captures": "attachments/captures",
+                "gc": "attachments/gc",
+            }[area]
+            try:
+                return self._authority.fresh_directory_inventory(relative)
+            except BaseException as exc:
+                raise AttachmentIntegrityError(
+                    "attachment inventory cannot be observed safely"
+                ) from exc
 
 
 def _open_attachment_fs(authority: DataRootAuthority) -> _AttachmentFS:

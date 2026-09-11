@@ -36,13 +36,14 @@ def test_phase2_schema_has_lineage_columns_and_is_idempotent(tmp_path: Path):
     upgrade_database(database)
     store = SQLiteAppStateStore.open(database)
     try:
-        columns = {column["name"] for column in inspect(store.engine).get_columns("messages")}
-        assert {"lineage_id", "revision", "supersedes_id"} <= columns
-        chat_columns = {column["name"] for column in inspect(store.engine).get_columns("chats")}
-        assert {"head_message_id", "revision"} <= chat_columns
-        with store.engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0009_phase6_context_attachments"
-        foreign_keys = inspect(store.engine).get_foreign_keys("chats")
+        with store.command_admission():
+            columns = {column["name"] for column in inspect(store.engine).get_columns("messages")}
+            assert {"lineage_id", "revision", "supersedes_id"} <= columns
+            chat_columns = {column["name"] for column in inspect(store.engine).get_columns("chats")}
+            assert {"head_message_id", "revision"} <= chat_columns
+            with store.engine.connect() as connection:
+                assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0009_phase6_context_attachments"
+            foreign_keys = inspect(store.engine).get_foreign_keys("chats")
         assert any(
             foreign_key["referred_table"] == "messages"
             and foreign_key["constrained_columns"] == ["head_message_id"]
@@ -207,7 +208,7 @@ def test_database_rejects_cross_chat_lineage_reference(tmp_path: Path):
     store = SQLiteAppStateStore.open(database)
     try:
         with pytest.raises(DatabaseError, match="same chat"):
-            with store.engine.begin() as connection:
+            with store.command_admission(), store.engine.begin() as connection:
                 connection.execute(
                     text("INSERT INTO chats (id, title, created_at, updated_at, revision) VALUES ('chat-1', 'One', '2026-09-03T00:00:00.000Z', '2026-09-03T00:00:00.000Z', 0), ('chat-2', 'Two', '2026-09-03T00:00:00.000Z', '2026-09-03T00:00:00.000Z', 0)")
                 )
@@ -424,7 +425,7 @@ def test_terminal_message_cannot_be_rewritten(tmp_path: Path):
     store = SQLiteAppStateStore.open(database)
     try:
         with pytest.raises(DatabaseError):
-            with store.engine.begin() as connection:
+            with store.command_admission(), store.engine.begin() as connection:
                 connection.execute(
                     text("INSERT INTO chats (id, title, created_at, updated_at, revision) VALUES ('chat', 'Chat', '2026-09-03T00:00:00.000Z', '2026-09-03T00:00:00.000Z', 0)")
                 )
@@ -600,7 +601,7 @@ def test_sqlite_rejects_invalid_states_sequences_and_chat_revision_jumps(tmp_pat
             expected_chat_revision=0,
         )
         with pytest.raises(DatabaseError):
-            with store.engine.begin() as connection:
+            with store.command_admission(), store.engine.begin() as connection:
                 connection.execute(
                     text(
                         "INSERT INTO messages (id, chat_id, parent_id, sequence, role, state, content, created_at, lineage_id, revision) "
@@ -608,7 +609,7 @@ def test_sqlite_rejects_invalid_states_sequences_and_chat_revision_jumps(tmp_pat
                     )
                 )
         with pytest.raises(DatabaseError):
-            with store.engine.begin() as connection:
+            with store.command_admission(), store.engine.begin() as connection:
                 connection.execute(text("UPDATE chats SET revision = 9 WHERE id = 'chat'"))
         assert store.get_chat("chat").revision == 1
     finally:
@@ -638,10 +639,10 @@ def test_sqlite_rejects_unpaired_terminal_transitions(tmp_path: Path):
             expected_chat_revision=0,
         )
         with pytest.raises(DatabaseError):
-            with store.engine.begin() as connection:
+            with store.command_admission(), store.engine.begin() as connection:
                 connection.execute(text("UPDATE messages SET state = 'complete' WHERE id = 'assistant'"))
         with pytest.raises(DatabaseError):
-            with store.engine.begin() as connection:
+            with store.command_admission(), store.engine.begin() as connection:
                 connection.execute(
                     text(
                         "UPDATE generation_attempts SET state = 'complete', ended_at = '2026-09-03T00:00:01.000Z' "
@@ -676,12 +677,12 @@ def test_raw_sqlite_cannot_arm_or_bypass_the_transition_guard(tmp_path: Path):
         expected_chat_revision=0,
     )
     with pytest.raises(DatabaseError):
-        with store.engine.begin() as connection:
+        with store.command_admission(), store.engine.begin() as connection:
             connection.execute(
                 text("UPDATE chats SET updated_at = '2026-09-03T24:01:00.000Z' WHERE id = 'chat'")
             )
     with pytest.raises(DatabaseError, match="active head"):
-        with store.engine.begin() as connection:
+        with store.command_admission(), store.engine.begin() as connection:
             connection.execute(
                 text(
                     "INSERT INTO messages (id, chat_id, parent_id, sequence, role, state, content, created_at, lineage_id, revision) "
@@ -770,7 +771,7 @@ def test_upgrade_from_existing_phase2_revision_installs_integrity_boundary(tmp_p
     upgrade_database(database)
     store = SQLiteAppStateStore.open(database)
     try:
-        with store.engine.connect() as connection:
+        with store.command_admission(), store.engine.connect() as connection:
             assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0009_phase6_context_attachments"
             assert connection.execute(
                 text("SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'messages_validate_insert'")
