@@ -1,24 +1,20 @@
 # Linux v0.1 accepted design
 
-Status: accepted target design; Phase 1 and Phase 2 are implemented and independently validated, and
-the bounded Phase 3 real-generation slice is implemented, deterministically validated, manually
-accepted against a local Qwen endpoint, independently audited through fresh Round 21 Sol/xhigh
-`PASS`, and human-closed in the current unstaged candidate. Landing remains separately pending.
-The retained Phase 2 recovery-artifact interaction remains a separate human-adjudication boundary.
+Status: accepted build-facing design. **Phases 1 through 6 are implemented, independently validated,
+committed, and landed on `main`. Phase 7 (search and exact navigation) is next.** Phase 6 closure and
+landing are recorded in `docs/LINUX_V0_1_PHASE6_CLOSURE_REPORT.md`.
 
-This document is the build-facing technical contract for the first native Linux B.O.T.S. desktop
-application. Organisational Memory owns the full decision rationale and supersession history. This
+This document remains the build-facing technical contract for the first native Linux B.O.T.S. desktop
+application. Organisational Memory owns the broader decision rationale and supersession history; this
 repository remains authoritative for what is actually implemented.
 
-Current implemented V0/V0.2 behaviour remains unchanged, and the accepted Phase 1/Phase 2 desktop
-candidate is recorded separately in `docs/LINUX_V0_1_PHASE1_PHASE2_CLOSURE_REPORT.md`. The Phase 3
-implementation record is `docs/LINUX_V0_1_PHASE3_IMPLEMENTATION_REPORT.md`. Future phases remain
-separately approved work.
+Current implementation records are preserved per phase. Historical status language inside earlier reports
+describes the candidate at that checkpoint and is not current landing state.
 
 ## Product target
 
-Linux v0.1 is a real native Linux desktop application. Web UI, PWA, Electron, browser wrappers,
-Flatpak, and Snap are not accepted substitutes/distribution requirements for this milestone.
+Linux v0.1 is a real native Linux desktop application. Web UI, PWA, Electron, browser wrappers, Flatpak,
+and Snap are not accepted substitutes/distribution requirements for this milestone.
 
 The first useful workload is persistent multi-chat with:
 
@@ -85,8 +81,8 @@ persistent daemon is required for v0.1.
 Clients use commands for mutation, queries for authoritative state, and events for changes that already
 occurred. Clients never directly mutate persistence.
 
-The core owns asynchronous work through a central execution manager. Abort targets individual
-operations. Meaningful progress is durable; presentation updates may be transient.
+The core owns asynchronous work through a central execution manager. Abort targets individual operations.
+Meaningful progress is durable; presentation updates may be transient.
 
 Future Android/remote clients must talk to the authority rather than opening its database.
 
@@ -94,20 +90,22 @@ Future Android/remote clients must talk to the authority rather than opening its
 
 Use SQLite as the authoritative mutable application-state database, local to the authority host.
 
-Runtime data-root effects obey one ownership law. `DataRootAuthority` issues
-PID-, epoch- and execution-owner-bound grants whose state is forward-valid,
-cleanup-only, or released. Public application commands, EventBus publication,
-all public store families and direct database resources acquire or join these
-grants at their callee boundaries. An invalidation request immediately closes
-new admission and revokes the discovering grant; unrelated work already
-admitted may settle its authorized mutation, transaction, resource close and
-producer delivery before the monotonic terminal state is published. Startup,
-migration/recovery and healthy teardown use narrower phase grants. Cleanup
-after invalidation may release known bearers but may not open recovery sessions,
-advance GC, reconcile generations or perform ordinary business writes.
+Runtime data-root effects obey one ownership law. `DataRootAuthority` issues PID-, epoch- and
+execution-owner-bound grants whose state is forward-valid, cleanup-only, or released. Public application
+commands, EventBus publication, all public store families and direct database resources acquire or join
+these grants at their callee boundaries. An invalidation request immediately closes new admission and
+revokes the discovering grant; unrelated work already admitted may settle its authorized mutation,
+transaction, resource close and producer delivery before the monotonic terminal state is published.
+Startup, migration/recovery and healthy teardown use narrower phase grants. Cleanup after invalidation may
+release known bearers but may not open recovery sessions, advance GC, reconcile generations or perform
+ordinary business writes.
 
-Use SQLAlchemy 2 Core behind an AppStateStore boundary and Alembic for explicit schema migrations.
-Enable SQLite foreign keys explicitly and configure WAL/concurrency deliberately.
+Rooted database resources must retain consequential child cursor/statement state until it is settled or
+classified. Parent connection/native resource ownership may not be released before retained children are
+deterministically drained. Correctness must not depend on garbage collection or object destruction timing.
+
+Use SQLAlchemy 2 Core behind an AppStateStore boundary and Alembic for explicit schema migrations. Enable
+SQLite foreign keys explicitly and configure WAL/concurrency deliberately.
 
 Do not place the live authoritative SQLite database on Samba/NFS for multi-host access.
 
@@ -146,8 +144,8 @@ Use a B.O.T.S.-owned asyncio pub/sub event bus, primarily bounded per-subscriber
 adapt events to the UI, but core code does not depend on Qt.
 
 Raw Markdown remains canonical. Parse with markdown-it-py with raw HTML disabled for untrusted content,
-use Pygments for fenced-code analysis/highlighting, and render with native Qt rich-text/document tools.
-Do not use Qt WebEngine.
+use Pygments for fenced-code analysis/highlighting, and render with native Qt rich-text/document tools. Do
+not use Qt WebEngine.
 
 ## Secrets
 
@@ -161,9 +159,8 @@ non-secret configuration, references, and credential status.
 
 ## Diagnostics and failures
 
-Use structured correlation-aware diagnostic logging, initially structlog over Python logging, with
-bounded machine-readable persistent logs. Logs are diagnostic evidence, not authoritative application
-state.
+Use structured correlation-aware diagnostic logging, initially structlog over Python logging, with bounded
+machine-readable persistent logs. Logs are diagnostic evidence, not authoritative application state.
 
 Use structured B.O.T.S.-level failures across subsystem boundaries. Distinguish expected operational
 failure, invalid/stale operation, internal bug/invariant violation, and integrity failure. Preserve
@@ -176,15 +173,12 @@ plausible shape.
 
 ## Generation backend contract
 
-The desktop `local_openai` backend is an explicitly selected Phase 3
-desktop-testing/compatibility mode. Its inspectable generation mode is
-`LEGACY_PHASE3_LOCAL_OPENAI` with `phase6_enabled=false`; plain text sends
-retain the legacy request path and make no Phase 6 planning, accounting, or
-provenance claim. Attachment selection and direct Phase 6 context planning
-are rejected before persistence or provider dispatch. Normal configured
-Phase 6 sends require their exact registered planning/accounting adapter and
-must fail closed when it is unavailable; they cannot fall through to this
-legacy route.
+The desktop `local_openai` backend is an explicitly selected Phase 3 desktop-testing/compatibility mode.
+Its inspectable generation mode is `LEGACY_PHASE3_LOCAL_OPENAI` with `phase6_enabled=false`; plain text
+sends retain the legacy request path and make no Phase 6 planning, accounting, or provenance claim.
+Attachment selection and direct Phase 6 context planning are rejected before persistence or provider
+dispatch. Normal configured Phase 6 sends require their exact registered planning/accounting adapter and
+must fail closed when it is unavailable; they cannot fall through to this legacy route.
 
 B.O.T.S. owns a generation-capability contract rather than an OpenAI-defined internal model.
 
@@ -207,24 +201,23 @@ Generation requests are never invisibly retried once external acceptance or spen
 
 Capability discovery is automatic by default, inspectable always, and manually overrideable.
 
-Resolve capabilities per backend/provider connection plus model. Manual override wins; confirmed
-endpoint behaviour outranks provider metadata; provider metadata outranks trusted registry metadata;
-heuristics are lower; unknown remains valid.
+Resolve capabilities per backend/provider connection plus model. Manual override wins; confirmed endpoint
+behaviour outranks provider metadata; provider metadata outranks trusted registry metadata; heuristics are
+lower; unknown remains valid.
 
 Runtime contradictions are evidence, not automatic permanent overrides unless the failure specifically
 establishes the capability fact.
 
 Configuration precedence is category-specific. Ordinary generation settings inherit broad-to-specific;
-capability data, credentials, bootstrap/storage configuration, and future authority policy remain owned
-by their respective subsystems.
+capability data, credentials, bootstrap/storage configuration, and future authority policy remain owned by
+their respective subsystems.
 
 Consequential effective values retain provenance and freeze into request snapshots.
 
 ## Search
 
-Use SQLite FTS5 as a derived full-text index for v0.1. Authoritative structured metadata remains in
-normal tables. Search failure/staleness cannot invalidate authoritative writes; the index must be
-rebuildable.
+Use SQLite FTS5 as a derived full-text index for v0.1. Authoritative structured metadata remains in normal
+tables. Search failure/staleness cannot invalidate authoritative writes; the index must be rebuildable.
 
 Start with predictable Unicode word search. Revisit the backend when measured indexing/query latency,
 database size, rebuild time, or write amplification becomes materially annoying.
@@ -239,9 +232,9 @@ secrets are excluded unless an explicit future secret-export mechanism is design
 
 Before consequential schema migration, create and verify a recovery point.
 
-Supported forward migrations use Alembic. Refuse databases newer than the running application's
-supported schema. Do not use automatic downgrade as the normal recovery strategy; restore the
-pre-upgrade backup and use a compatible older application.
+Supported forward migrations use Alembic. Refuse databases newer than the running application's supported
+schema. Do not use automatic downgrade as the normal recovery strategy; restore the pre-upgrade backup and
+use a compatible older application.
 
 Backups carry a manifest and integrity information. Restore validates before replacing live state,
 preserves the current installation, stages/verifies restored state where practical, then adopts it.
@@ -268,8 +261,8 @@ Once shutdown begins, reject new consequential commands.
 
 Use a technology-agnostic domain layer; application/core layer for commands, queries, workflows, policy,
 context, configuration/capability resolution, and orchestration; infrastructure adapters for concrete
-persistence/backends/search/secrets/files/diagnostics/campaign/import-export; thin clients such as Qt;
-and a dedicated bootstrap/composition layer that wires concrete implementations.
+persistence/backends/search/secrets/files/diagnostics/campaign/import-export; thin clients such as Qt; and
+a dedicated bootstrap/composition layer that wires concrete implementations.
 
 Dependencies point inward toward B.O.T.S. semantics.
 
@@ -282,8 +275,8 @@ Avoid generic `utils` dumping grounds and abstraction layers that protect no rea
 
 Keep pytest as the test foundation.
 
-Use pytest-asyncio for core concurrency, pytest-qt for native UI behaviour, and Hypothesis selectively
-for invariants/round trips.
+Use pytest-asyncio for core concurrency, pytest-qt for native UI behaviour, and Hypothesis selectively for
+invariants/round trips.
 
 Use real disposable SQLite databases and real migrations in integration tests.
 
@@ -297,8 +290,8 @@ Automated tests must never incur unapproved provider/API spend.
 
 ## Packaging
 
-Use pyside6-deploy/Nuitka. Prefer standalone mode as the canonical packaged application because it is
-more transparent to diagnose.
+Use pyside6-deploy/Nuitka. Prefer standalone mode as the canonical packaged application because it is more
+transparent to diagnose.
 
 AppImage is optional convenience packaging after the standalone build is reliable.
 
@@ -309,14 +302,15 @@ version-controlled.
 
 ## Explicit review triggers
 
-- Python 3.12/qasync: when qasync supports Python 3.14 or QtAsyncio becomes the stronger supported
-  integration, reassess and preferably move the floor to Python 3.14+ if no other dependency blocks it;
+- Python/qasync: the project currently supports `>=3.12,<3.15` and Phase 6 final validation ran on Python
+  3.14.7. Reassess qasync versus QtAsyncio when dependency/runtime support materially changes; do not
+  preserve an artificial 3.12-only floor merely because it was an early design assumption;
 - FTS5: review when measured search/index/rebuild/storage cost becomes materially annoying;
 - structlog: review after real operational data; remove if standard logging is sufficient;
 - Secret Service: review if packaged desktop integration is unreliable or headless deployment becomes
   dominant;
-- Markdown stack: simplify to Qt-native parsing if prototype evidence shows the extra parser layer adds
-  no useful structure;
+- Markdown stack: simplify to Qt-native parsing if prototype evidence shows the extra parser layer adds no
+  useful structure;
 - packaging: change only if the chosen deploy path proves unreliable or real distribution needs justify
   another mechanism.
 
@@ -333,8 +327,8 @@ Build through validated vertical slices:
 4. Phase 3: real generation-backend contract, streaming, cancellation, checkpointing, local-model test;
 5. Phase 4: concurrency, multi-window workspace, shutdown, crash reconciliation;
 6. Phase 5: provider/model usability, secrets, catalogue, capability discovery, settings;
-7. Phase 6: deterministic context and content-addressed attachments;
-8. Phase 7: search and exact navigation;
+7. Phase 6: deterministic context and content-addressed attachments — **closed and landed**;
+8. Phase 7: search and exact navigation — **next**;
 9. Phase 8: inspection/provenance UX;
 10. Phase 9: import/export, backup, verification, and restore;
 11. Phase 10: campaign desktop integration;

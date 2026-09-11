@@ -1,134 +1,116 @@
 # Roadmap
 
-## Closed V0 baseline
+## Closed campaign baseline
 
 B.O.T.S. 5 V0 is closed. Final zero-spend closure validation passed against
 `13e3ac463c44d66e57d4443027f0cc9dfe9b93a5`; see `docs/V0_CLOSURE_REPORT.md`.
 
-The closed baseline includes:
-
-- strict JSON manifest;
-- explicit UTF-8 inputs/prompts;
-- bounded parallel worker phase;
-- optional synthesis;
-- OpenRouter provider boundary;
-- per-stage and overall timeout handling;
-- durable run/stage/event/usage artifacts;
-- disk-only status and inspect;
-- exact-known/unknown cost semantics;
-- zero-spend unit tests.
-
-## V0.1 status
-
-- worker-boundary hardening is implemented;
-- completion telemetry is implemented;
-- final live worker-boundary conformance is satisfied;
-- the first genuinely useful low-stakes repository-audit campaign is recorded in
-  `docs/FIRST_USEFUL_CAMPAIGN_REPORT.md`;
-- the revised useful campaign completed normally and was judged substantively useful;
-- its accepted findings were adjudicated and the blocking CLI, terminal-persistence, and runs-dir
-  symlink defects were corrected and locally validated;
-- the controlled failure-path campaign is preserved under `examples/opv1-controlled-failure/` and
-  exercised terminal provider-response failure, dependency blocking, skipped-stage zero-cost
-  accounting, partial aggregate cost, and durable inspection without exposing a blocking defect;
-- the exact `dependency_incomplete` semantics are additionally covered by deterministic tests and
-  prior real truncation evidence;
-- `docs/OPERATING_PROCEDURE_V1.md` is the frozen normal operating procedure;
-- the OPv1 freeze decision and evidence are recorded in `docs/OPV1_FREEZE_REPORT.md`.
+The closed baseline includes strict manifest validation, explicit UTF-8 inputs, bounded worker
+parallelism, optional synthesis, durable run/stage/event/usage artifacts, disk-only inspection,
+completion-aware state, and exact-known/unknown cost semantics.
 
 ## V0.2 — local OpenAI-compatible provider
 
-Implemented, deterministically validated, and live-proven against a local OpenAI-compatible endpoint.
-The reviewed implementation candidate was fast-forwarded onto `main`; the reviewed implementation
-landing tree is `96673dd0bfc28a89a74ee0745bdab05eb1163da1`, and V0.2 is now the landed repository state.
+Implemented, deterministically validated, live-proven, and landed. Schema v2 adds explicit per-stage
+provider mapping and one built-in non-streaming local OpenAI-compatible provider while preserving the
+closed campaign execution model and schema-v1 OpenRouter behavior.
 
-The V0.2 objective is a narrow generic local OpenAI-compatible provider that coexists with OpenRouter
-while preserving the closed V0 execution model, existing `CompletionRequest -> CompletionResult`
-seam, non-streaming operation, completion semantics, persistence, timeouts, cost accounting,
-synthesis gating, and failure behavior.
+See `docs/V0_2_DESIGN_CAMPAIGN_REPORT.md` and `docs/OPERATING_PROCEDURE_V2.md`.
 
-The V0.2 design swarm produced six normally completed specialist worker outputs. Synthesis recovery
-then exposed and repaired an OpenRouter normalization defect for reasoning-only incomplete responses
-where `message.content` is null with a trustworthy non-stop finish reason. That repair is implemented
-at `2fbb2a591c95f84247888a050a8af4086acaac29`, covered by deterministic tests, and live-proven by a
-24-token reasoning-exhaustion canary.
+## Linux v0.1 — native desktop
 
-A final Kimi K3 synthesis completed normally, after which the accepted implementation specification
-corrected its response-normalization, validated-provider-config, and runner-API contradictions. The
-implementation adds schema v2, explicit per-stage provider mapping, one built-in non-streaming local
-OpenAI-compatible provider, and zero-network deterministic coverage. Schema v1 and the frozen OPv1
-document remain unchanged.
+The Linux v0.1 product, architecture, implementation technology, and phased construction sequence are
+accepted. The build-facing contract is `docs/LINUX_V0_1_DESIGN.md`.
 
-See `docs/V0_2_DESIGN_CAMPAIGN_REPORT.md` for the campaign evidence and implementation closure.
+### Landed status
 
-## Linux v0.1 — native desktop design accepted
+Phases **1 through 6 are implemented, validated, committed, and landed on `main`**.
 
-Linux v0.1 product, architecture, implementation-technology, and construction-sequence decisions have
-been human-adjudicated and accepted. See `docs/LINUX_V0_1_DESIGN.md` for the build-facing contract and
-`docs/LINUX_V0_1_PHASE1_PHASE2_CLOSURE_REPORT.md` for the current implementation and validation record.
+- Phase 1: native walking skeleton, core, persistence, events, fake streaming backend.
+- Phase 2: conversation truth, immutable lineage/revisions, and deterministic fake generation.
+- Phase 3: real generation backend contract, streaming, cancellation, checkpointing, and local-model
+  acceptance.
+- Phase 4: concurrency, multi-window workspace, shutdown, and crash reconciliation.
+- Phase 5: provider/model usability, secrets, catalogue/capability discovery, and settings.
+- Phase 6: deterministic context construction, reusable content-addressed attachments, unified data-root
+  authority/effect grants, rooted SQLite/native durability handling, recovery/fail-closed integrity, and
+  complete resource-lifetime ownership.
 
-### Implemented candidate status
+The Phase 6 landing commit is
+`20847c7a49e26679d0d3dfe99798a2c211bec436`.
 
-Phase 1 and Phase 2 are closed. Phase 3 is implemented in the current unstaged, uncommitted candidate
-and has passed deterministic streaming, migration, persistence/restart, cancellation, offscreen
-Qt/qasync, and legacy campaign regression validation. Fresh Sol/xhigh review found and drove bounded
-repairs for persistence-authority edge cases; fresh Round 21 returned `PASS` with no concrete closure
-blockers, and human closure is approved.
-A separate operator live acceptance also
-completed a real local Qwen generation, exercised explicit mid-stream cancellation to `ABORTED`,
-preserved partial output across restart, and used no paid or OpenRouter request. The initial wrong
-endpoint failures were expected operator/configuration failures and were preserved as failed attempts.
+The final exact Phase 6 candidate passed:
 
-This live evidence is recorded separately from automated validation and independent adversarial review;
-the Phase 3-specific deterministic matrix was `244 passed, 1 skipped`. The current combined candidate
-matrix, including the bounded Draft 1 UI shell, is `254 passed, 1 skipped`. The retained Phase 2
-recovery-artifact interaction remains a separate human-adjudication boundary.
+- complete Phase 6 + authority/grant suite: **616 passed, 0 skipped, 0 failed**;
+- complete repository suite: **956 passed, 1 expected skip, 0 failed**.
 
-The bounded Draft 1 native UI shell is implemented and operator-accepted as **good enough for now** after
-fresh independent Sol/xhigh `PASS`. Its implementation and acceptance record is
-`docs/LINUX_V0_1_UI_DRAFT_1_IMPLEMENTATION_ACCEPTANCE_REPORT.md`. The provisional
-`docs/LINUX_V0_1_UI_UX_DRAFT_1.md` remains provisional/tentative first-draft authority and has not been
-promoted into final design authority.
+The expected skip was the opt-in local-provider acceptance test; no provider was contacted. Final external
+Astra closure disposition was **PASS WITH CAVEATS**, with no concrete current blocker. See
+`docs/LINUX_V0_1_PHASE6_CLOSURE_REPORT.md`.
 
-The candidate is prepared for human commit approval but is not staged, committed, pushed, or otherwise
-landed. Phase 4 remains the next future phase and has not been implemented.
+The cumulative implementation archaeology remains in the phase implementation reports. Earlier
+candidate-status statements such as “unstaged”, “uncommitted”, or “not yet accepted” describe those
+historical checkpoints and do not override the current closure record.
 
-The accepted target is a real native Linux desktop application centred on persistent multi-chat with
-lossless lineage, concurrent streaming generation, deterministic context construction, reusable
-attachments, search, provenance/inspection, backup/recovery, and a thin operational campaign surface.
+### Next phase
 
-The implementation is intentionally sequenced as validated vertical slices: walking skeleton,
-conversation truth, real generation, concurrency/workspace, provider/model usability,
-context/attachments, search, inspection, recovery/import-export, campaign integration, product
-finishing/packaging, and a final torture run.
+**Phase 7 — search and exact navigation** is next.
 
-The current candidate claim is limited to the Phase 1 through Phase 3 scope recorded in the closure and
-implementation reports. The remaining listed desktop capabilities are target design, not implemented.
-Later implementation edits, provider/API calls, commits, and landing remain separately approved
-consequences.
+The accepted desktop sequence remains:
 
-Future Code/Git, Android, persistent daemon/remote clients, MCP/tool frameworks, scheduling, RAG,
-mode-governed capability envelopes, and other Future Fuckery remain deferred unless a concrete Linux
-v0.1 blocker separately promotes a bounded requirement.
+1. Phase 0: durable design authority and live-repo reinspection;
+2. Phase 1: walking skeleton;
+3. Phase 2: conversation truth/lineage/revisions;
+4. Phase 3: real generation;
+5. Phase 4: concurrency/workspace;
+6. Phase 5: provider/model usability;
+7. Phase 6: context and attachments — **closed**;
+8. Phase 7: search and exact navigation — **next**;
+9. Phase 8: inspection/provenance UX;
+10. Phase 9: import/export, backup, verification, and restore;
+11. Phase 10: campaign desktop integration;
+12. Phase 11: product finishing and standalone packaging;
+13. Phase 12: Linux v0.1 torture run and separate closure adjudication.
 
-## Later candidates
+Every phase retains inspect -> propose -> approve -> edit -> validate -> separate commit approval ->
+separate push/landing approval.
 
-- campaign stage-output reuse/resume after partial campaign failure, now supported by observed
-  operational pain but explicitly outside V0.2;
+### Current product target
+
+Linux v0.1 remains a real native Linux desktop application centred on persistent multi-chat with lossless
+lineage, concurrent streaming generation, deterministic context construction, reusable attachments,
+search, provenance/inspection, backup/recovery, and a thin operational campaign surface.
+
+The provisional Draft 1 UI authority remains `docs/LINUX_V0_1_UI_UX_DRAFT_1.md`; it is intentionally not
+promoted to final UI design authority merely because later backend phases have landed.
+
+## Deferred beyond Linux v0.1
+
+Unless a concrete Linux v0.1 blocker separately promotes a bounded requirement, defer:
+
+- Android;
+- Code/Git;
+- persistent daemon/remote clients;
+- MCP/general tool/plugin frameworks;
+- scheduler/automation;
+- remote B.O.T.S. execution nodes;
+- RAG/semantic search;
+- mode-governed capability envelopes and post-training/LoRA mode selection;
+- multi-capability workflow composition.
+
+## Later campaign-harness candidates
+
+The original campaign harness may later gain, under separate authority:
+
+- stage-output reuse/resume after partial campaign failure;
 - planner-generated manifests;
 - richer but still explicit DAG semantics;
 - deliberate retry policy where idempotence is understood;
-- stronger filesystem/tool capability model.
+- stronger filesystem/tool capability models.
 
-## Deferred defect
+These are separate from the bounded Linux v0.1 desktop sequence.
 
-- extremely large JSON integers can escape `_number()` through `float()` overflow instead of a clean
-  validation error; low operational consequence and explicitly carried forward beyond V0 closure.
+## Carried deferred defect
 
-## Speculative
-
-- OMC authority packaging;
-- gated patch application;
-- distributed execution.
-
-None of the speculative items exist in V0.
+Extremely large JSON integers can escape `_number()` through `float()` overflow instead of a clean
+validation error. This remains low operational consequence and explicitly deferred beyond V0 closure.

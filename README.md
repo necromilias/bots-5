@@ -1,65 +1,76 @@
 # B.O.T.S. 5
 
-**V0 CLOSED.** Final zero-spend closure validation passed against baseline
-`13e3ac463c44d66e57d4443027f0cc9dfe9b93a5`: 65 tests passed, compileall passed, all three
-checked-in example manifests validated, and `git diff --check` passed with `OPENROUTER_API_KEY`
-unset and no provider/API calls. See `docs/V0_CLOSURE_REPORT.md`.
+B.O.T.S. is a local-first AI harness and native Linux desktop project built around explicit authority,
+inspectable state, durable evidence, and human-controlled consequential actions.
 
-B.O.T.S. 5 V0 is a small local Python CLI that executes a fixed, reviewable multi-model job:
-strict JSON manifest -> explicit text inputs -> bounded parallel workers -> optional synthesis ->
-durable run artifacts.
+## Current status
 
-It is deliberately not an autonomous agent platform. Models cannot spawn workers, invoke a shell,
+The original campaign harness baseline is closed and preserved. V0.2 adds the built-in
+`local_openai` provider while preserving the bounded manifest-driven execution model.
+
+Linux v0.1 is now implemented and landed through **Phase 6**:
+
+1. native walking skeleton;
+2. conversation truth, immutable lineage/revisions, and deterministic fake generation;
+3. real generation backend, streaming, cancellation, checkpointing, and local-model acceptance;
+4. concurrency, multi-window workspace, shutdown, and crash reconciliation;
+5. provider/model usability, secrets, catalogue/capability discovery, and settings;
+6. deterministic context construction, content-addressed attachments, unified data-root authority,
+   rooted SQLite/native durability handling, and fail-closed effect ownership.
+
+The landed Phase 6 implementation is commit
+`20847c7a49e26679d0d3dfe99798a2c211bec436`. Its final reserved acceptance gates were
+**616 passed** for the complete Phase 6 + authority/grant suite and **956 passed, 1 expected skip** for
+the complete repository suite, with no failures and no provider contacted. See
+`docs/LINUX_V0_1_PHASE6_CLOSURE_REPORT.md` for the final closure and landing record.
+
+**Phase 7, search and exact navigation, is next.**
+
+The build-facing Linux v0.1 contract remains `docs/LINUX_V0_1_DESIGN.md`. The cumulative Phase 6
+implementation history remains in `docs/LINUX_V0_1_PHASE6_IMPLEMENTATION_REPORT.md`; its earlier
+candidate-status statements are historical evidence and are superseded by the Phase 6 closure report.
+
+The provisional UI authority remains `docs/LINUX_V0_1_UI_UX_DRAFT_1.md`; it has not been promoted to
+final design authority.
+
+## Campaign harness
+
+The original B.O.T.S. harness executes fixed, reviewable multi-model jobs:
+
+`strict JSON manifest -> explicit text inputs -> bounded parallel workers -> optional synthesis -> durable run artifacts`
+
+It deliberately does not give models autonomous authority. Models cannot spawn workers, invoke a shell,
 discover repository context, mutate Git, perform RAG, or invent execution topology. The harness owns
 validation, scheduling, persistence, limits, and state.
 
-V0.1 compiles every model system message from a fixed harness-owned execution boundary plus a
-validated six-section worker contract. Declared source and worker outputs remain untrusted data in
-user-message blocks. See `docs/WORKER_CONTRACTS.md` for the exact authority and contract rules.
+V0.1 compiles each model system message from a fixed harness-owned execution boundary plus a validated
+six-section worker contract. Declared source and worker outputs remain untrusted data in user-message
+blocks. See `docs/WORKER_CONTRACTS.md`.
 
-V0.2 adds a schema-v2, built-in non-streaming `local_openai` provider. Schema v1 remains unchanged
-and OpenRouter-only; schema v2 can route each worker and synthesis stage to OpenRouter or an
-operator-supplied local OpenAI-compatible HTTP/HTTPS endpoint.
+V0.2 adds schema-v2 and the built-in non-streaming `local_openai` provider. Schema v1 remains
+OpenRouter-only; schema v2 can route workers and synthesis to OpenRouter or an operator-supplied local
+OpenAI-compatible HTTP/HTTPS endpoint.
 
-## Linux v0.1 desktop direction
+## Linux desktop authority boundary
 
-The Linux v0.1 native desktop product, architecture, implementation-technology baseline, and phased
-construction sequence have been accepted. See `docs/LINUX_V0_1_DESIGN.md` for the build-facing
-contract.
+Linux v0.1 uses one authoritative native core shared by desktop windows. Persisted authoritative state
+outranks in-memory presentation state. Runtime data-root effects are governed by one
+`DataRootAuthority` and effect-grant protocol across public application commands, SQLite/store work,
+EventBus delivery, attachments/GC, startup/migration/recovery, native VFS outcome handoff, and terminal
+teardown.
 
-The current candidate implements and validates Phase 1 (native walking skeleton), Phase 2
-(conversation truth, immutable lineage/revisions, and deterministic fake generation), and the bounded
-Phase 3 real-generation vertical slice. Phase 1 and Phase 2 remain closed; the Phase 3 implementation,
-deterministic validation, independent review, and supplied manual local-Qwen acceptance record are in
-`docs/LINUX_V0_1_PHASE3_IMPLEMENTATION_REPORT.md`. Human closure is approved after fresh independent
-Sol/xhigh Round 21 `PASS`; manual local Qwen completion/cancellation and restart persistence are recorded.
-The same candidate now also contains the bounded Draft 1 native UI shell, operator-accepted as good enough
-for now after a fresh independent Sol/xhigh `PASS`; see
-`docs/LINUX_V0_1_UI_DRAFT_1_IMPLEMENTATION_ACCEPTANCE_REPORT.md`. The combined zero-spend validation
-matrix is `254 passed, 1 skipped`. All Phase 3 and Draft 1 UI changes remain an unstaged, uncommitted
-candidate pending separate landing approval. The retained Phase 2 recovery-artifact interaction remains a
-separate human-adjudication boundary.
+Invalidation closes new admission immediately and revokes the discovering grant. Already-admitted
+unrelated work may settle only within its existing ownership. Database resources, including rooted
+child cursors, remain accounted for until consequential native state has settled or been classified.
+Unknown or integrity-threatening outcomes fail closed rather than being rewritten as success.
 
-The provisional UI authority remains `docs/LINUX_V0_1_UI_UX_DRAFT_1.md`; it has not been promoted to final
-design authority. Phase 4 remains future work and is not advanced by this candidate.
+See `docs/UNIFIED_AUTHORITY_EFFECT_INVENTORY.md` for the finite participation inventory.
 
-The existing CLI, runner, filesystem campaign persistence, manifest semantics, and
-`Provider.complete()` seam remain preserved. Later Linux v0.1 phases remain future work and are not
-advanced by this candidate.
-
-The current uncommitted Phase 6 durability candidate also implements one
-data-root authority/effect-grant protocol across public application commands,
-direct and inherited SQLite store calls, EventBus delivery, attachment and GC
-effects, startup/migration/recovery, native VFS outcome handoff, and terminal
-teardown.  Invalidation closes new admission immediately, revokes the
-discovering grant, and publishes the terminal state only after unrelated
-admitted grants, already-issued deliveries, and owned database resources
-settle.  See `docs/UNIFIED_AUTHORITY_EFFECT_INVENTORY.md`; this is technical
-candidate evidence, not Phase 6 acceptance or closure.
+## Local Phase 3 compatibility route
 
 For opt-in local Phase 3 desktop testing, supply the backend, endpoint, and model explicitly. This
-`local_openai` route is an explicit Phase 3 legacy compatibility mode: it is Phase 6 disabled, makes
-no Phase 6 planning/accounting/provenance claim, and does not permit selecting attachments.
+`local_openai` route is an explicit legacy compatibility mode: it is Phase 6 disabled, makes no Phase 6
+planning/accounting/provenance claim, and does not permit selecting attachments.
 
 ```bash
 bots5-desktop --backend local_openai \
@@ -68,19 +79,13 @@ bots5-desktop --backend local_openai \
   --api-key-env LOCAL_QWEN_API_KEY
 ```
 
-The fake backend remains the default. Phase 3 sends only the current user message, uses one ordinary
-`stream=true` request, and stores provider usage/cost as unknown when the endpoint does not supply it.
-The opt-in acceptance probe is `tests/test_phase3_local_qwen.py`; it skips unless a local endpoint and
-model are explicitly provided through its documented environment variables. It never selects
-OpenRouter.
-
-Remaining Linux v0.1 phases remain separately gated. Future Android, Code/Git, daemon/remote-client,
-MCP/tool frameworks, scheduling, RAG, and operating-mode capability systems remain deferred unless a
-concrete v0.1 blocker separately promotes them.
+The fake backend remains the default. The opt-in acceptance probe is `tests/test_phase3_local_qwen.py`;
+it skips unless a local endpoint and model are explicitly provided through its documented environment
+variables. It never selects OpenRouter.
 
 ## Install
 
-Requires Python 3.12 or 3.13.
+Requires Python `>=3.12,<3.15`.
 
 ```bash
 python -m venv .venv
@@ -88,7 +93,7 @@ source .venv/bin/activate
 pip install -e '.[dev]'
 ```
 
-For real OpenRouter execution:
+For real OpenRouter execution of the campaign harness:
 
 ```bash
 export OPENROUTER_API_KEY='...'
@@ -96,32 +101,23 @@ export OPENROUTER_API_KEY='...'
 
 The key is read only at runtime and is not written to job or run artifacts.
 
-For a local-only schema-v2 job, set its `providers.local_openai.base_url`. Authentication is optional;
-when `api_key_env` is present, only that named environment variable is read. A local-only job does
-not require `OPENROUTER_API_KEY`.
+For a local-only schema-v2 campaign job, set `providers.local_openai.base_url`. Authentication is
+optional; when `api_key_env` is present, only that named environment variable is read. A local-only job
+does not require `OPENROUTER_API_KEY`.
 
-## Validate first
+## Validate and run campaign jobs
 
 ```bash
 bots5 validate examples/example-job.json
 bots5 validate examples/example-job-v2-local-openai.json
+bots5 run examples/example-job.json
 ```
 
 Validation performs no API calls and creates no run directory.
 
-## Run intentionally
-
-```bash
-bots5 run examples/example-job.json
-```
-
-The example writes beneath `examples/.bots5/runs/` because its `runs_dir` is job-relative.
-
-For normal paid-operation preflight, worker selection, completion review, evidence retention, and
-human acceptance, see `docs/OPERATING_PROCEDURE_V1.md`. For local-provider operation, see
+For normal paid-operation preflight, worker selection, completion review, evidence retention, and human
+acceptance, see `docs/OPERATING_PROCEDURE_V1.md`. For local-provider operation, see
 `docs/OPERATING_PROCEDURE_V2.md`.
-
-## Inspect
 
 With the default run location (`./.bots5/runs`):
 
@@ -130,58 +126,48 @@ bots5 status RUN_ID
 bots5 inspect RUN_ID STAGE_ID
 ```
 
-For a custom manifest run directory:
+For custom run directories:
 
 ```bash
 bots5 status RUN_ID --runs-dir PATH
 bots5 inspect RUN_ID STAGE_ID --runs-dir PATH
 ```
 
-A relative CLI `--runs-dir` is interpreted from the current working directory, unlike manifest
-`output.runs_dir`, which is resolved relative to the job file. Both inspection commands are disk-only
-and make no API calls.
+These inspection commands are disk-only and make no API calls.
 
-## V0 constraints
+## Legacy campaign constraints
+
+The following describe the campaign harness, not the native desktop product:
 
 - strict JSON, closed objects, no coercion;
-- mandatory ordered `TASK`, `ALLOWED`, `FORBIDDEN`, `EVIDENCE`, `OUTPUT`, and `STOP CONDITION`
-  sections in every worker and synthesis contract;
-- IDs must match `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`;
-- temperature range is 0 through 2 inclusive;
-- schema v1 accepts only OpenRouter; schema v2 accepts OpenRouter and `local_openai`;
-- local provider endpoints are explicit HTTP/HTTPS API bases; B.O.T.S. appends
-  `/chat/completions` and never discovers endpoints or models;
-- local authentication is optional and environment-indirected through `api_key_env`; resolved
-  secret values are never persisted;
-- non-streaming chat completions;
+- mandatory ordered `TASK`, `ALLOWED`, `FORBIDDEN`, `EVIDENCE`, `OUTPUT`, and `STOP CONDITION` sections;
+- bounded parallel worker execution;
+- no autonomous delegation loop;
+- no model shell/filesystem/Git/RAG/plugin authority;
+- non-streaming V0.2 campaign-provider completions;
 - no retries;
-- exact provider-reported cost when supplied; a stage skipped before any request may carry a
-  harness-known zero because no provider cost was incurred;
-- the cost threshold is only a pre-synthesis gate over the known worker subtotal, not a hard
-  whole-run budget or fail-closed unknown-cost control;
-- local operator trust model, not a hostile sandbox;
-- no database, daemon, web UI, container requirement, RAG, OMC, model tools, or repo mutation.
+- exact-known/unknown provider cost semantics;
+- local operator trust model, not a hostile sandbox.
 
-See `docs/` for the exact contract.
+The Linux desktop adds SQLite, native UI, streaming generation, attachments, wider lifecycle authority,
+and recovery semantics under the accepted Linux design; do not infer desktop capability from the old V0
+non-goal lists.
+
+## Deferred beyond Linux v0.1
+
+Unless a concrete blocker separately promotes bounded work, Android, Code/Git, persistent daemon/remote
+clients, MCP/general tool frameworks, scheduling/automation, remote execution nodes, RAG/semantic search,
+and operating-mode capability frameworks remain deferred.
 
 ## Build provenance
 
-The first candidate was bootstrapped through a temporary Langflow/OpenRouter specialist campaign,
-then integrated and verified locally. See:
+Key records include:
 
-- `docs/BUILD_CAMPAIGN.md` for the method retrospective and failure-shape findings;
-- `docs/V0_BUILD_REPORT.md` for the first candidate's concrete validation record;
-- `docs/V0_1_HARDENING_REPORT.md` for deterministic V0.1 worker-boundary hardening;
-- `docs/V0_1_LIVE_CONFORMANCE_REPORT.md` for the first live conformance canary and truncation
-  finding;
-- `docs/V0_1_FINAL_CONFORMANCE_REPORT.md` for final completion-aware live conformance closure;
-- `docs/FIRST_USEFUL_CAMPAIGN_REPORT.md` for the first ordinary useful-work campaign and the human
-  adjudication of its findings;
-- `examples/opv1-controlled-failure/` for the controlled failure-path campaign assets and observed
-  outcome;
-- `docs/OPV1_FREEZE_REPORT.md` for the freeze decision and supporting evidence;
-- `docs/OPERATING_PROCEDURE_V1.md` for the frozen normal operating procedure;
-- `docs/V0_CLOSURE_REPORT.md` for the final V0 closure validation and decision;
-- `docs/V0_2_DESIGN_CAMPAIGN_REPORT.md` for the V0.2 provider-design swarm, synthesis recovery,
-  reasoning-response normalization defect, live repair proof, and implementation closure;
-- `docs/OPERATING_PROCEDURE_V2.md` for schema-v2 local-provider preflight and review.
+- `docs/BUILD_CAMPAIGN.md` — original build method retrospective;
+- `docs/V0_CLOSURE_REPORT.md` — final V0 closure;
+- `docs/V0_2_DESIGN_CAMPAIGN_REPORT.md` — V0.2 provider design and implementation closure;
+- `docs/LINUX_V0_1_PHASE1_PHASE2_CLOSURE_REPORT.md` — early desktop closure;
+- `docs/LINUX_V0_1_PHASE3_IMPLEMENTATION_REPORT.md` through
+  `docs/LINUX_V0_1_PHASE6_IMPLEMENTATION_REPORT.md` — cumulative phase implementation evidence;
+- `docs/LINUX_V0_1_PHASE6_CLOSURE_REPORT.md` — current Phase 6 closure and landing authority;
+- `docs/LINUX_V0_1_DESIGN.md` — accepted Linux v0.1 build-facing contract.

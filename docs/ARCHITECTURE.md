@@ -1,14 +1,26 @@
 # Architecture
 
-## Responsibilities
+## Repository architecture
 
-The human/planner decides the desired campaign and writes or reviews the job manifest. B.O.T.S. 5
-is the deterministic harness: it validates the manifest, reads only declared text, schedules a
-bounded worker phase, persists each stage, applies synthesis gates, and records observable state.
+B.O.T.S. now contains two related execution surfaces:
+
+1. the closed V0/V0.2 manifest-driven campaign harness; and
+2. the native Linux v0.1 desktop product, landed through Phase 6.
+
+The campaign harness remains a bounded deterministic worker orchestrator. The desktop adds durable
+conversation state, native UI, streaming generation, SQLite-backed application persistence,
+content-addressed attachments, and a stronger authority/durability boundary.
+
+## Campaign harness responsibilities
+
+The human/planner decides the desired campaign and writes or reviews the job manifest. B.O.T.S. validates
+the manifest, reads only declared text, schedules a bounded worker phase, persists each stage, applies
+synthesis gates, and records observable state.
+
 Models are bounded workers. They return text; they do not own topology, permissions, budgets,
 persistence, or consequential actions.
 
-## V0/V0.2 topology
+### V0/V0.2 topology
 
 ```text
 validated job
@@ -21,87 +33,117 @@ validated job
 
 There is no autonomous delegation loop and no worker-to-worker dependency in V0.
 
-## Linux v0.1 Phase 3 generation
+V0.2 ships `OpenRouterProvider` and one built-in non-streaming `OpenAICompatibleProvider`. The runner
+selects the provider mapping declared by each stage. Schema-v2 provider configuration contains only
+non-secret endpoint/configuration material; resolved credentials are not persisted.
 
-The desktop core starts with the fake streaming backend. An explicit `bots5-desktop` selection wires
-the B.O.T.S.-owned `openai_compatible_http` streaming backend to either the local OpenAI-compatible
-provider identity or the existing OpenRouter provider seam. The request snapshot records the selected
-provider, model, normalized non-secret base URL, authentication environment-variable name when used,
-and the exact current user message. It never records the resolved credential.
+## Linux v0.1 landed architecture
 
-The backend emits a dispatch marker before opening the HTTP stream, normalizes SSE deltas and optional
-usage/cost telemetry, and never adds a telemetry-specific alternate request shape. Each delta is
-persisted before its `message_delta` event. Terminal state is persisted before its terminal event. A
-local cancellation cancels the owned task and HTTP stream, preserves committed partial text, records
-`ABORTED`; `remote_outcome_unknown` is true only when dispatch may have occurred, and does not retry.
+The accepted desktop contract is `LINUX_V0_1_DESIGN.md`. Phases 1 through 6 are now landed; Phase 7
+(search and exact navigation) is next.
+
+Linux v0.1 runs as one native Qt/PySide6 desktop process containing one authoritative, separable,
+headless-testable B.O.T.S. core. Multiple windows are clients/views over the same authority.
+
+Clients mutate state through core commands, obtain authoritative state through queries, and receive
+changes through events. UI code does not directly mutate persistence.
+
+### Conversation and generation model
+
+Chats are durable containers over immutable historical message lineage. Edits/regeneration create new
+nodes or sibling attempts rather than rewriting history. Generation attempts and immutable request
+snapshots are first-class provenance.
+
+The desktop generation backend contract is B.O.T.S.-owned rather than OpenAI-defined. Adapters normalize
+provider/local-engine protocols into typed B.O.T.S. output/lifecycle semantics while preserving
+backend-specific capability data where relevant.
+
+A stream ending does not automatically mean successful completion. Cancellation, usage/cost, remote
+outcome, and partial persistence are recorded with their actual certainty. Requests are not invisibly
+retried once external acceptance or spend is uncertain.
+
+### Persistence and data-root authority
+
+SQLite is authoritative mutable application state behind the core-owned store. Attachment payloads are
+filesystem-backed and content-addressed. Persisted authoritative state outranks in-memory/rendered state.
+
+Phase 6 landed one unified data-root authority/effect-grant protocol. `DataRootAuthority` is the root
+admission and invalidation coordinator for public application commands, EventBus delivery, SQLite/store
+work, attachments/GC, startup/migration/recovery, durability fences, native VFS outcome handoff, and
+terminal teardown.
+
+Forward work requires the exact live authority/grant/resource ownership. Invalidation immediately closes
+new admission and revokes the discovering grant. Unrelated already-admitted work may settle only within
+its existing ownership. Cleanup after revocation may release known resources but cannot create fresh
+forward work.
+
+Rooted database resources retain consequential child cursor/statement state until native settlement or
+classification; the parent resource may not be released first. Native/SQLite/filesystem uncertainty is
+handed into the common coordinator rather than silently rewritten as success.
+
+The finite participation inventory is `UNIFIED_AUTHORITY_EFFECT_INVENTORY.md`. Phase 6 closure is recorded
+in `LINUX_V0_1_PHASE6_CLOSURE_REPORT.md`.
+
+### Context and attachments
+
+Phase 6 owns deterministic, inspectable context construction and persistent reusable attachments.
+Attachment originals are content-addressed with SHA-256; metadata/provenance remain separate durable
+records. Canonical payload validation and persisted representation semantics are authority-owned facts.
+Detected authoritative corruption invalidates through the common coordinator before forward use.
+
+The legacy Phase 3 `local_openai` desktop compatibility route remains explicitly Phase 6 disabled and
+cannot be treated as Phase 6 planning/accounting/provenance execution.
+
+### Concurrency and events
+
+The core owns asynchronous work. Event publication/delivery is an authority-participating effect rather
+than a detached notification side channel. Multiple windows share the same state/authority; closing one
+window does not imply core shutdown while other clients remain.
+
+### Secrets
+
+The desktop uses a core-owned SecretStore abstraction. Linux Secret Service via keyring/secretstorage is
+the interactive credential store; environment variables remain an explicit supported source for
+headless/deployment use. Plaintext fallback is not implicit.
 
 ## Trust boundaries
 
-The operator and manifest are trusted. Model output is untrusted text. OpenRouter and the configured
-local OpenAI-compatible endpoint are external service boundaries. The local filesystem rules reduce
-accidental writes but are not a hostile sandbox.
+The operator and explicit configuration are trusted. Model output is untrusted data/proposal. External
+providers/local endpoints are service boundaries. B.O.T.S. does not claim a hostile same-UID local
+sandbox.
 
-Instruction provenance is structural: the harness-owned execution boundary outranks the validated
-worker contract, which outranks all INPUT or WORKER OUTPUT data. Data blocks remain in user messages;
-they never become part of the system prompt. See `WORKER_CONTRACTS.md`.
+The architectural invariant is:
+
+**Intelligence is not capability. Capability is not authority. Authority is not execution location.**
+
+Generated requests do not acquire consequential capability merely because a model emitted them.
 
 ## Determinism
 
-The job schema is strict and closed. Input ordering, prompt loading, dependency ordering, message
-rendering, state vocabulary, and artifact locations are explicit. Model generation remains
-nondeterministic; the shell around it is intended to be predictable.
+The campaign schema, prompt loading, dependency ordering, rendering, state vocabulary, and artifact
+locations are explicit. Linux desktop context construction, request snapshots, lineage, authority state,
+and persistence boundaries are likewise explicit and inspectable. Model generation remains
+nondeterministic.
 
-Contract parsing, boundary compilation, and system/user message separation are deterministic. Model
-obedience to those instructions remains probabilistic.
+## Package boundaries
 
-## Provider boundary
+Use a technology-agnostic domain layer; application/core layer for commands, queries, workflows, policy,
+context, configuration/capability resolution, authority and orchestration; infrastructure adapters for
+persistence/backends/search/secrets/files/diagnostics; thin native clients; and explicit bootstrap/
+composition wiring.
 
-`Provider.complete(CompletionRequest) -> CompletionResult` is the only model-service seam. V0.2 ships
-`OpenRouterProvider` and one built-in non-streaming `OpenAICompatibleProvider`. The runner receives a
-mapping keyed by provider ID and selects the mapping entry named by each declared stage. The provider,
-request, and result contracts do not change.
+Dependencies point inward toward B.O.T.S. semantics.
 
-Schema-v2 provider configuration is validated into the `Job` before execution. The local configuration
-contains only its HTTP/HTTPS base URL and optional credential-environment-variable name; resolved
-credential values are never carried by the job or persisted.
+## Legacy campaign non-goals
 
-## Concurrency
+The following remain non-goals of the **campaign harness itself**: autonomous planning/delegation, model
+shell/filesystem/Git authority, RAG, plugin discovery, retries, or distributed execution.
 
-Workers are scheduled together and use one `asyncio.Semaphore(max_parallelism)`. Each worker persists
-its own terminal state immediately. Synthesis is evaluated only after the full worker phase joins.
+Do not read that list as a repo-wide statement that the Linux desktop lacks a database or GUI; those are
+landed desktop components.
 
-## Explicit non-goals
+## Deferred beyond Linux v0.1
 
-No rich DAG, autonomous planning, agent framework, shell/tools, repository mutation, RAG, OMC,
-database, daemon, web server, GUI, retries, or distributed execution.
-
-## Accepted Linux v0.1 target architecture
-
-The preceding sections describe currently implemented V0/V0.2 behaviour. They remain authoritative for
-what exists until separately approved Linux v0.1 changes land.
-
-The accepted Linux v0.1 target architecture is defined in `LINUX_V0_1_DESIGN.md`. In summary:
-
-- one native Qt/PySide6 desktop process hosts one authoritative, separable/headless-testable B.O.T.S.
-  core for v0.1;
-- clients use commands, queries, and events rather than mutating persistence directly;
-- mutable application state is transactional SQLite behind a core-owned store; attachment payloads and
-  campaign evidence remain filesystem-backed;
-- chats use immutable message lineage; edits/regeneration create new branches/siblings rather than
-  rewriting history;
-- generation attempts and immutable request snapshots are first-class provenance;
-- one execution manager owns concurrent chat, summary, and campaign work;
-- a B.O.T.S.-owned generation-capability contract normalizes provider/local-engine protocols without
-  making OpenAI's schema the internal domain or deleting backend-specific capabilities;
-- deterministic context construction, derived/rebuildable search, structured failure semantics,
-  explicit recovery, and single-authority ownership are core responsibilities;
-- multiple windows share one authority; future Android/remote clients may later talk to that authority,
-  but no daemon/network service is required solely for Linux v0.1.
-
-The architectural invariant is: intelligence is not capability, capability is not authority, and
-authority is not execution location. Model output remains data/proposal until B.O.T.S. authority grants
-a separately defined capability and scope.
-
-The accepted target introduces database, GUI, streaming, wider backend, and recovery concepts that are
-explicitly absent from the current V0/V0.2 implementation. Do not read this target section as evidence
-that those features have already landed.
+Unless separately promoted by a concrete blocker, Android, Code/Git, persistent daemon/remote clients,
+MCP/general tool frameworks, scheduling/automation, remote execution nodes, RAG/semantic search, and
+mode-governed capability frameworks remain future work.
