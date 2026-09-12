@@ -65,6 +65,7 @@ class ComposerEdit(QPlainTextEdit):
 
 class TopBar(QFrame):
     rail_toggle_requested = Signal()
+    search_toggled = Signal(bool)
     details_toggled = Signal(bool)
     model_selected = Signal(str)
     tune_requested = Signal()
@@ -111,6 +112,15 @@ class TopBar(QFrame):
         layout.addWidget(self.tune_button)
 
         layout.addStretch(1)
+
+        self.search_button = self._action_button(
+            "Search",
+            "Search chats, messages, and referenced attachments",
+        )
+        self.search_button.setObjectName("searchToggle")
+        self.search_button.setCheckable(True)
+        self.search_button.toggled.connect(self.search_toggled)
+        layout.addWidget(self.search_button)
 
         self.settings_button = self._action_button("⚙", "Open provider and model settings") if phase5 else self._disabled_button(
             "⚙", "Provider and settings management are unavailable in the legacy runtime."
@@ -166,6 +176,275 @@ class TopBar(QFrame):
             self.model_selector.setCurrentIndex(selected_index)
         finally:
             self.model_selector.blockSignals(False)
+
+
+class SearchPanel(QWidget):
+    """Reusable global/in-chat search controls and result presentation."""
+
+    search_requested = Signal(object)
+    load_more_requested = Signal()
+    result_requested = Signal(object, int)
+    rebuild_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("searchPanel")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        title = QLabel("Search", self)
+        title.setObjectName("searchTitle")
+        layout.addWidget(title)
+
+        self.query_edit = QLineEdit(self)
+        self.query_edit.setObjectName("searchQuery")
+        self.query_edit.setAccessibleName("Literal search query")
+        self.query_edit.setPlaceholderText("Search literal text")
+        self.query_edit.setClearButtonEnabled(True)
+        self.query_edit.returnPressed.connect(self._submit)
+        self.query_edit.textChanged.connect(self._sync_search_enabled)
+        layout.addWidget(self.query_edit)
+
+        form = QFormLayout()
+        self.scope_combo = QComboBox(self)
+        self.scope_combo.setObjectName("searchScope")
+        self.scope_combo.setAccessibleName("Search scope")
+        self.scope_combo.addItem("Every chat", "global")
+        self.scope_combo.addItem("Current chat", "chat")
+        form.addRow("Scope", self.scope_combo)
+
+        kind_widget = QWidget(self)
+        kind_layout = QHBoxLayout(kind_widget)
+        kind_layout.setContentsMargins(0, 0, 0, 0)
+        kind_layout.setSpacing(5)
+        self.chat_kind = QCheckBox("Chats", kind_widget)
+        self.chat_kind.setObjectName("searchKindChats")
+        self.message_kind = QCheckBox("Messages", kind_widget)
+        self.message_kind.setObjectName("searchKindMessages")
+        self.attachment_kind = QCheckBox("Attachments", kind_widget)
+        self.attachment_kind.setObjectName("searchKindAttachments")
+        for checkbox in (self.chat_kind, self.message_kind, self.attachment_kind):
+            checkbox.setChecked(True)
+            kind_layout.addWidget(checkbox)
+        form.addRow("Kinds", kind_widget)
+
+        self.role_combo = QComboBox(self)
+        self.role_combo.setObjectName("searchRole")
+        self.role_combo.setAccessibleName("Message role filter")
+        self.role_combo.addItem("Any role", None)
+        self.role_combo.addItem("User", MessageRole.USER.value)
+        self.role_combo.addItem("Assistant", MessageRole.ASSISTANT.value)
+        form.addRow("Role", self.role_combo)
+
+        self.state_combo = QComboBox(self)
+        self.state_combo.setObjectName("searchState")
+        self.state_combo.setAccessibleName("Message state filter")
+        self.state_combo.addItem("Any durable state", None)
+        for state in MessageState:
+            self.state_combo.addItem(state.value.replace("_", " ").title(), state.value)
+        form.addRow("State", self.state_combo)
+        layout.addLayout(form)
+
+        self.active_only = QCheckBox("Active branch only", self)
+        self.active_only.setObjectName("searchActiveBranchOnly")
+        self.active_only.setToolTip("Exclude surviving revisions and regeneration siblings outside the current branch")
+        layout.addWidget(self.active_only)
+
+        self.include_archived = QCheckBox("Include archived", self)
+        self.include_archived.setObjectName("searchIncludeArchived")
+        self.include_archived.setToolTip("Archived chats are excluded unless this filter is selected")
+        layout.addWidget(self.include_archived)
+
+        action_row = QHBoxLayout()
+        self.search_button = QPushButton("Search", self)
+        self.search_button.setObjectName("searchButton")
+        self.search_button.clicked.connect(self._submit)
+        action_row.addWidget(self.search_button)
+        self.rebuild_button = QPushButton("Rebuild index", self)
+        self.rebuild_button.setObjectName("searchRebuildButton")
+        self.rebuild_button.setToolTip("Deterministically rebuild the derived search index")
+        self.rebuild_button.clicked.connect(lambda: self.rebuild_requested.emit())
+        action_row.addWidget(self.rebuild_button)
+        layout.addLayout(action_row)
+
+        self.status_label = QLabel("Search status has not been checked", self)
+        self.status_label.setObjectName("searchStatus")
+        self.status_label.setWordWrap(True)
+        self.status_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.status_label)
+
+        self.results = QListWidget(self)
+        self.results.setObjectName("searchResults")
+        self.results.setAccessibleName("Search results")
+        self.results.itemActivated.connect(self._activate_item)
+        layout.addWidget(self.results, 1)
+
+        self.load_more_button = QPushButton("Load more", self)
+        self.load_more_button.setObjectName("searchLoadMoreButton")
+        self.load_more_button.clicked.connect(lambda: self.load_more_requested.emit())
+        self.load_more_button.setVisible(False)
+        layout.addWidget(self.load_more_button)
+        self._condition = "UNKNOWN"
+        self._sync_search_enabled()
+
+    def request_payload(self) -> dict[str, object]:
+        kinds = []
+        if self.chat_kind.isChecked():
+            kinds.append("chat")
+        if self.message_kind.isChecked():
+            kinds.append("message")
+        if self.attachment_kind.isChecked():
+            kinds.append("attachment")
+        return {
+            "query": self.query_edit.text(),
+            "scope": self.scope_combo.currentData(),
+            "document_kinds": tuple(kinds),
+            "role": self.role_combo.currentData(),
+            "message_state": self.state_combo.currentData(),
+            "active_branch_only": self.active_only.isChecked(),
+            "include_archived": self.include_archived.isChecked(),
+        }
+
+    def set_in_chat_scope(self) -> None:
+        self.scope_combo.setCurrentIndex(self.scope_combo.findData("chat"))
+
+    def set_current_chat_available(self, available: bool) -> None:
+        model = self.scope_combo.model()
+        item = model.item(self.scope_combo.findData("chat")) if hasattr(model, "item") else None
+        if item is not None:
+            item.setEnabled(available)
+        if not available and self.scope_combo.currentData() == "chat":
+            self.scope_combo.setCurrentIndex(self.scope_combo.findData("global"))
+
+    def set_busy(self, busy: bool) -> None:
+        self.query_edit.setEnabled(not busy)
+        self.scope_combo.setEnabled(not busy)
+        self.chat_kind.setEnabled(not busy)
+        self.message_kind.setEnabled(not busy)
+        self.attachment_kind.setEnabled(not busy)
+        self.role_combo.setEnabled(not busy)
+        self.state_combo.setEnabled(not busy)
+        self.active_only.setEnabled(not busy)
+        self.include_archived.setEnabled(not busy)
+        self.search_button.setEnabled(
+            not busy
+            and self._search_allowed()
+            and bool(self.query_edit.text().strip())
+        )
+        self.load_more_button.setEnabled(not busy)
+        self.rebuild_button.setEnabled(
+            not busy and self._condition not in {"REBUILDING", "UNAVAILABLE"}
+        )
+        if busy:
+            self.status_label.setText("Searching…")
+
+    def show_status(self, status: object) -> None:
+        condition = getattr(getattr(status, "condition", None), "value", "UNKNOWN")
+        source_revision = getattr(status, "source_revision", None)
+        checkpoint_revision = getattr(status, "checkpoint_revision", None)
+        detail = getattr(status, "detail", None)
+        summary = f"{condition} — source {source_revision}, checkpoint {checkpoint_revision}"
+        if detail:
+            summary += f" — {detail}"
+        self._condition = condition
+        self.status_label.setText(summary)
+        self.status_label.setProperty("condition", condition)
+        self._refresh_status_style()
+        self._sync_search_enabled()
+        self.rebuild_button.setEnabled(condition not in {"REBUILDING", "UNAVAILABLE"})
+
+    def show_error(self, condition: str, detail: str, *, clear_results: bool = True) -> None:
+        self._condition = condition
+        self.status_label.setText(f"{condition} — {detail}")
+        self.status_label.setProperty("condition", condition)
+        self._refresh_status_style()
+        self._sync_search_enabled()
+        if clear_results:
+            self.results.clear()
+            self.load_more_button.setVisible(False)
+        self.rebuild_button.setEnabled(condition not in {"REBUILDING", "UNAVAILABLE"})
+
+    def show_pagination_error(self, detail: str) -> None:
+        """Report an expired result page without changing index validity."""
+
+        self.status_label.setText(f"{self._condition} — pagination expired — {detail}")
+        self.status_label.setProperty("condition", self._condition)
+        self._refresh_status_style()
+        self._sync_search_enabled()
+        self.load_more_button.setVisible(False)
+        self.rebuild_button.setEnabled(
+            self._condition not in {"REBUILDING", "UNAVAILABLE"}
+        )
+
+    def show_page(self, page: object, *, append: bool = False) -> None:
+        if not append:
+            self.results.clear()
+        for result in getattr(page, "results", ()):
+            locations = tuple(getattr(result, "locations", ())) or (None,)
+            for location_index, location in enumerate(locations):
+                item = QListWidgetItem(self._result_text(result, location))
+                item.setData(Qt.ItemDataRole.UserRole, (result, location_index))
+                item.setToolTip("Open this exact authoritative result")
+                self.results.addItem(item)
+        self.load_more_button.setVisible(bool(getattr(page, "next_cursor", None)))
+        self.show_status(getattr(page, "status", None))
+        if self.results.count() == 0:
+            self.status_label.setText(f"{self.status_label.text()} — no results")
+
+    def focus_query(self) -> None:
+        self.query_edit.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.query_edit.selectAll()
+
+    def _submit(self) -> None:
+        if not self.query_edit.text().strip():
+            self.show_error("INVALID QUERY", "Enter non-empty literal text")
+            return
+        if not any(
+            checkbox.isChecked()
+            for checkbox in (self.chat_kind, self.message_kind, self.attachment_kind)
+        ):
+            self.show_error("INVALID QUERY", "Select at least one document kind")
+            return
+        self.search_requested.emit(self.request_payload())
+
+    def _sync_search_enabled(self, *_args) -> None:
+        self.search_button.setEnabled(
+            self.query_edit.isEnabled()
+            and self._search_allowed()
+            and bool(self.query_edit.text().strip())
+        )
+
+    def _search_allowed(self) -> bool:
+        return self._condition not in {"STALE", "REBUILDING", "UNAVAILABLE", "INVALID"}
+
+    def _activate_item(self, item: QListWidgetItem) -> None:
+        payload = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(payload, tuple) and len(payload) == 2:
+            result, location_index = payload
+            self.result_requested.emit(result, int(location_index))
+
+    def _refresh_status_style(self) -> None:
+        self.status_label.style().unpolish(self.status_label)
+        self.status_label.style().polish(self.status_label)
+
+    @staticmethod
+    def _result_text(result: object, location: object | None) -> str:
+        kind = getattr(getattr(result, "document_kind", None), "value", "result")
+        title = str(getattr(result, "title", "") or getattr(result, "document_id", ""))
+        badges = [kind.title()]
+        branch_state = getattr(getattr(location, "branch_state", None), "value", None)
+        if branch_state == "historical":
+            badges.append("Historical")
+        archived_at = getattr(location, "archived_at", None)
+        if archived_at is not None:
+            badges.append("Archived")
+        revision = getattr(result, "revision", None)
+        if revision is not None:
+            badges.append(f"revision {revision}")
+        snippet = str(getattr(result, "snippet", "") or "").strip()
+        prefix = " ".join(f"[{badge}]" for badge in badges)
+        return f"{prefix} {title}\n{snippet}" if snippet else f"{prefix} {title}"
 
 
 class TuneDialog(QDialog):
@@ -1223,9 +1502,17 @@ class LeftRail(QFrame):
             if widget is not None:
                 widget.deleteLater()
         self._chat_buttons.clear()
-        self._chat_titles = {chat.id: chat.title for chat in chats}
+        self._chat_titles = {
+            chat.id: (
+                f"{chat.title} [Archived]"
+                if getattr(chat, "archived_at", None) is not None
+                else chat.title
+            )
+            for chat in chats
+        }
         for chat in chats:
-            button = self._icon_button("·", chat.title)
+            title = self._chat_titles[chat.id]
+            button = self._icon_button("·", title)
             button.setObjectName("chatActivityIndicator")
             button.setCheckable(True)
             button.setFixedSize(32, 32)
@@ -1241,8 +1528,12 @@ class LeftRail(QFrame):
             self.chat_list.clear()
             selected_row = -1
             for row, chat in enumerate(chats):
-                item = QListWidgetItem(chat.title)
+                item = QListWidgetItem(self._chat_titles[chat.id])
                 item.setData(Qt.ItemDataRole.UserRole, chat.id)
+                item.setData(
+                    Qt.ItemDataRole.AccessibleDescriptionRole,
+                    "Archived chat" if getattr(chat, "archived_at", None) is not None else "Active chat",
+                )
                 self.chat_list.addItem(item)
                 if chat.id == selected_chat_id:
                     selected_row = row
@@ -1290,6 +1581,8 @@ class MessageRow(QWidget):
     def __init__(self, message: Message, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.message = message
+        self._generation_busy = False
+        self._historical_view = False
         self.setProperty("messageRole", message.role.value)
 
         row_layout = QHBoxLayout(self)
@@ -1320,6 +1613,11 @@ class MessageRow(QWidget):
         )
         self.body.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         bubble_layout.addWidget(self.body)
+
+        self.historical_badge = QLabel("Historical result", self.bubble)
+        self.historical_badge.setObjectName("historicalBadge")
+        self.historical_badge.setVisible(False)
+        bubble_layout.addWidget(self.historical_badge)
 
         self.activity_label = QLabel("● Generating…", self.bubble)
         self.activity_label.setObjectName("messageActivity")
@@ -1391,17 +1689,33 @@ class MessageRow(QWidget):
         return button
 
     def set_generation_busy(self, busy: bool) -> None:
+        self._generation_busy = busy
+        self._sync_mutating_actions()
+        self.set_generation_active(busy)
+
+    def set_historical_view(self, historical: bool, *, exact_result: bool = False) -> None:
+        self._historical_view = historical
+        self.historical_badge.setVisible(historical and exact_result)
+        self._sync_mutating_actions()
+
+    def set_search_focus(self, focused: bool) -> None:
+        self.bubble.setProperty("searchFocus", focused)
+        self.bubble.style().unpolish(self.bubble)
+        self.bubble.style().polish(self.bubble)
+
+    def _sync_mutating_actions(self) -> None:
         self.edit_button.setEnabled(
-            not busy
+            not self._generation_busy
+            and not self._historical_view
             and self.message.role is MessageRole.USER
             and self.message.state is MessageState.SENT
         )
         self.regenerate_action.setEnabled(
-            not busy
+            not self._generation_busy
+            and not self._historical_view
             and self.message.role is MessageRole.ASSISTANT
             and self.message.state is not MessageState.STREAMING
         )
-        self.set_generation_active(busy)
 
     def set_generation_active(self, active: bool) -> None:
         active = bool(
@@ -1441,7 +1755,13 @@ class TranscriptView(QScrollArea):
         self.message_rows: dict[str, MessageRow] = {}
         self._bubble_cap: int | None = None
 
-    def render(self, messages: Iterable[Message], generation_busy: bool = False) -> None:
+    def render(
+        self,
+        messages: Iterable[Message],
+        generation_busy: bool = False,
+        *,
+        historical_leaf_message_id: str | None = None,
+    ) -> None:
         for row in tuple(self.message_rows.values()):
             self._layout.removeWidget(row)
             row.deleteLater()
@@ -1452,10 +1772,28 @@ class TranscriptView(QScrollArea):
             row = MessageRow(message, self.content)
             row.set_generation_busy(generation_busy)
             message_id = getattr(message, "id", f"message-{id(message)}")
+            row.set_historical_view(
+                historical_leaf_message_id is not None,
+                exact_result=message_id == historical_leaf_message_id,
+            )
             self.message_rows[message_id] = row
             self._layout.insertWidget(self._layout.count() - 1, row)
         self._resize_bubbles()
         self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
+
+    def focus_message(self, message_id: str | None) -> bool:
+        for row in self.message_rows.values():
+            row.set_search_focus(False)
+        if message_id is None:
+            return True
+        row = self.message_rows.get(message_id)
+        if row is None:
+            return False
+        row.set_search_focus(True)
+        row.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        row.setFocus(Qt.FocusReason.OtherFocusReason)
+        self.ensureWidgetVisible(row, 18, 18)
+        return True
 
     def _resize_bubbles(self) -> None:
         available = self.viewport().width() - 30

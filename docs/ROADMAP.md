@@ -52,9 +52,13 @@ The cumulative implementation archaeology remains in the phase implementation re
 candidate-status statements such as “unstaged”, “uncommitted”, or “not yet accepted” describe those
 historical checkpoints and do not override the current closure record.
 
-### Next phase
+### Active closure candidate
 
-**Phase 7 — search and exact navigation** is next.
+**Phase 7 — search and exact navigation** has an uncommitted implementation
+candidate awaiting independent external closure, the reserved complete-suite gate,
+and separate commit/push authority. The candidate remains additive to the landed
+Phase 6 authority model and is recorded in
+`LINUX_V0_1_PHASE7_IMPLEMENTATION_REPORT.md`.
 
 The accepted desktop sequence remains:
 
@@ -65,7 +69,7 @@ The accepted desktop sequence remains:
 5. Phase 4: concurrency/workspace;
 6. Phase 5: provider/model usability;
 7. Phase 6: context and attachments — **closed**;
-8. Phase 7: search and exact navigation — **next**;
+8. Phase 7: search and exact navigation — **implementation candidate awaiting external closure**;
 9. Phase 8: inspection/provenance UX;
 10. Phase 9: import/export, backup, verification, and restore;
 11. Phase 10: campaign desktop integration;

@@ -1,7 +1,8 @@
 # Linux v0.1 accepted design
 
 Status: accepted build-facing design. **Phases 1 through 6 are implemented, independently validated,
-committed, and landed on `main`. Phase 7 (search and exact navigation) is next.** Phase 6 closure and
+committed, and landed on `main`. Phase 7 (search and exact navigation) has an
+uncommitted implementation candidate awaiting external closure.** Phase 6 closure and
 landing are recorded in `docs/LINUX_V0_1_PHASE6_CLOSURE_REPORT.md`.
 
 This document remains the build-facing technical contract for the first native Linux B.O.T.S. desktop
@@ -328,7 +329,7 @@ Build through validated vertical slices:
 5. Phase 4: concurrency, multi-window workspace, shutdown, crash reconciliation;
 6. Phase 5: provider/model usability, secrets, catalogue, capability discovery, settings;
 7. Phase 6: deterministic context and content-addressed attachments — **closed and landed**;
-8. Phase 7: search and exact navigation — **next**;
+8. Phase 7: search and exact navigation — **implementation candidate awaiting external closure**;
 9. Phase 8: inspection/provenance UX;
 10. Phase 9: import/export, backup, verification, and restore;
 11. Phase 10: campaign desktop integration;

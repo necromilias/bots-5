@@ -64,14 +64,18 @@ from bots5.infrastructure.persistence.sqlite import SQLiteAppStateStore
 from bots5.infrastructure.persistence.transition_guard import (
     arm_phase6_attachment_insert,
     arm_phase6_blob_transition,
+    arm_phase7_source_mutation,
     clear_phase6,
+    clear_phase7_source_mutation,
     require_phase6_consumed,
+    require_phase7_consumed,
 )
 from tests._authority_test_support import upgrade_to
 
 
 REPO = Path(__file__).resolve().parents[1]
 HEAD = "0009_phase6_context_attachments"
+CURRENT_HEAD = "0010_phase7_search_navigation"
 PRIOR_REVISIONS = (
     "0001_desktop_state",
     "0002_conversation_lineage",
@@ -366,6 +370,20 @@ def _configured_application(root: Path, backend=None):
     return application, store, authority
 
 
+@contextmanager
+def _temporary_tmpfs_directory(prefix: str):
+    with tempfile.TemporaryDirectory(prefix=prefix, dir="/dev/shm") as value:
+        root = Path(value)
+        filesystem = subprocess.run(
+            ["findmnt", "-T", os.fspath(root), "-no", "FSTYPE"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert filesystem == "tmpfs"
+        yield root
+
+
 def _assert_ef1_capture_cleanup_contract(base: Path) -> None:
     clean_root = base / "clean-root"
     clean_source = base / "clean-source.txt"
@@ -498,15 +516,9 @@ def _assert_ef1_capture_cleanup_contract(base: Path) -> None:
             recovered_authority.close()
 
 
-def test_ef1_capture_cleanup_contract_on_tmpfs(tmp_path: Path):
-    filesystem = subprocess.run(
-        ["findmnt", "-T", os.fspath(tmp_path), "-no", "FSTYPE"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    assert filesystem == "tmpfs"
-    _assert_ef1_capture_cleanup_contract(tmp_path)
+def test_ef1_capture_cleanup_contract_on_tmpfs():
+    with _temporary_tmpfs_directory("phase6-ef1-tmpfs-") as root:
+        _assert_ef1_capture_cleanup_contract(root)
 
 
 def test_ef1_capture_cleanup_contract_on_btrfs():
@@ -2585,7 +2597,7 @@ def _converge_after_restore_fault(root: Path) -> None:
                 AuthorityState.FAILED_CLOSED,
             }:
                 authority.close()
-        if _revision(root / "database" / "state.sqlite3") == HEAD:
+        if _revision(root / "database" / "state.sqlite3") == CURRENT_HEAD:
             break
     _restart_twice(root)
 
@@ -2700,7 +2712,7 @@ def _restart_twice(root: Path) -> None:
         authority, store = _open_store(root)
         assert authority.state is AuthorityState.READY
         store.close()
-    assert _revision(root / "database" / "state.sqlite3") == HEAD
+    assert _revision(root / "database" / "state.sqlite3") == CURRENT_HEAD
     assert list((root / "database" / "migration").iterdir()) == []
     assert list((root / "recovery").iterdir()) == []
 
@@ -3342,15 +3354,9 @@ def test_f1_first_production_inventory_after_mutation_is_fresh_on_btrfs():
         _assert_fresh_inventory_has_an_independent_stream(Path(value))
 
 
-def test_f1_production_fresh_inventory_has_same_contract_on_tmpfs(tmp_path: Path):
-    filesystem = subprocess.run(
-        ["findmnt", "-T", os.fspath(tmp_path), "-no", "FSTYPE"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    assert filesystem == "tmpfs"
-    _assert_fresh_inventory_has_an_independent_stream(tmp_path / "root")
+def test_f1_production_fresh_inventory_has_same_contract_on_tmpfs():
+    with _temporary_tmpfs_directory("phase6-f1-tmpfs-") as root:
+        _assert_fresh_inventory_has_an_independent_stream(root / "root")
 
 
 def test_f1_fresh_view_identity_failure_returns_no_tuple_and_poisons(tmp_path: Path):
@@ -4802,7 +4808,11 @@ def test_retained_attachment_helper_rejects_every_fd_operation_after_reuse(
             (directory / leaf).write_bytes(payload)
         expected.append(dict(leaves))
         opened = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-        high = fcntl.fcntl(opened, fcntl.F_DUPFD_CLOEXEC, 200)
+        high = fcntl.fcntl(
+            opened,
+            fcntl.F_DUPFD_CLOEXEC,
+            max(200, max(old_fds) + 1),
+        )
         os.close(opened)
         os.dup2(high, fd, inheritable=False)
         os.close(high)
@@ -5409,8 +5419,10 @@ def test_gc_rechecks_after_stale_enumeration_before_tombstone(
     worker.start()
     assert entered.wait(2)
     attachment_id = str(uuid7())
+    source_revision = None
     with _private_engine_connection(store, transaction=True) as connection:
         arm_phase6_attachment_insert(connection, attachment_id)
+        arm_phase7_source_mutation(connection, "GC race attachment reference test")
         try:
             connection.exec_driver_sql(
                 "INSERT INTO attachments(id, blob_digest, filename, source_kind, "
@@ -5429,8 +5441,12 @@ def test_gc_rechecks_after_stale_enumeration_before_tombstone(
                 ),
             )
             require_phase6_consumed(connection)
+            source_revision = require_phase7_consumed(connection)
         finally:
             clear_phase6(connection)
+            clear_phase7_source_mutation(connection)
+    assert source_revision is not None
+    store._record_committed_search_source_revision(source_revision)
     release.set()
     worker.join(5)
     assert not worker.is_alive()
@@ -5926,7 +5942,7 @@ def test_f3_migration_connection_is_delete_full_before_first_alembic_write(
     monkeypatch.setattr(migration_runner.command, "upgrade", checked_upgrade)
     authority, store = _open_store(root)
     assert observed == [("delete", 2)]
-    assert _revision(root / "database" / "state.sqlite3") == HEAD
+    assert _revision(root / "database" / "state.sqlite3") == CURRENT_HEAD
     store.close()
     assert all(
         status == "RELEASED"

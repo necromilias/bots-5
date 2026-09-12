@@ -362,11 +362,23 @@ def validate_phase6_schema(connection, *, destructive: bool = True) -> None:
         + ")",
         REQUIRED_TABLES,
     ).fetchall()
+    revision = connection.exec_driver_sql(
+        "SELECT version_num FROM alembic_version"
+    ).scalar_one_or_none()
+    phase7_additions: set[str] = set()
+    if revision == "0010_phase7_search_navigation":
+        # Phase 6 remains exact at revision 0009.  Revision 0010 may add only
+        # the closed trigger set whose names are owned and validated by the
+        # Phase 7 schema contract.
+        from .phase7_schema import PHASE7_TRIGGER_NAMES
+
+        phase7_additions = set(PHASE7_TRIGGER_NAMES)
     required_names = {*REQUIRED_TABLES, *REQUIRED_TRIGGERS, *REQUIRED_INDEXES}
     unexpected = sorted(
         str(name)
         for kind, name, table_name, sql in inventory
         if str(name) not in required_names
+        and str(name) not in phase7_additions
         and not (
             kind == "index"
             and sql is None

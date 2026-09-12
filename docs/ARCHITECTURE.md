@@ -5,7 +5,8 @@
 B.O.T.S. now contains two related execution surfaces:
 
 1. the closed V0/V0.2 manifest-driven campaign harness; and
-2. the native Linux v0.1 desktop product, landed through Phase 6.
+2. the native Linux v0.1 desktop product, landed through Phase 6 with an
+   uncommitted Phase 7 implementation candidate awaiting external closure.
 
 The campaign harness remains a bounded deterministic worker orchestrator. The desktop adds durable
 conversation state, native UI, streaming generation, SQLite-backed application persistence,
@@ -39,8 +40,9 @@ non-secret endpoint/configuration material; resolved credentials are not persist
 
 ## Linux v0.1 landed architecture
 
-The accepted desktop contract is `LINUX_V0_1_DESIGN.md`. Phases 1 through 6 are now landed; Phase 7
-(search and exact navigation) is next.
+The accepted desktop contract is `LINUX_V0_1_DESIGN.md`. Phases 1 through 6 are
+landed. Phase 7 (search and exact navigation) has an uncommitted implementation
+candidate awaiting external closure.
 
 Linux v0.1 runs as one native Qt/PySide6 desktop process containing one authoritative, separable,
 headless-testable B.O.T.S. core. Multiple windows are clients/views over the same authority.
@@ -93,6 +95,24 @@ Detected authoritative corruption invalidates through the common coordinator bef
 
 The legacy Phase 3 `local_openai` desktop compatibility route remains explicitly Phase 6 disabled and
 cannot be treated as Phase 6 planning/accounting/provenance execution.
+
+### Search, archive, and exact navigation
+
+Phase 7 keeps SQLite business rows authoritative and treats FTS rows, document-key
+mappings, snippets, rank, checkpoint, generation, active-branch annotations, and
+resolved locations as derived state. A singleton authoritative source revision is
+incremented atomically by every search-visible business transaction. Optional
+in-memory receipts may advance only contiguous derived revisions; a lost receipt or
+restart leaves a mechanically visible source/checkpoint mismatch and search refuses
+service until an explicit deterministic rebuild.
+
+The accepted index is one `unicode61` FTS5 document per authoritative chat, eligible
+message, or attachment identity. Query input is compiled as literal terms. Results
+are filtered and navigated through bounded authoritative joins: inactive messages
+open as a temporary historical leaf without changing the chat head, and disappearing
+identities return typed GONE behaviour. Archived chats are excluded by default;
+inclusion is explicit. Unreferenced attachments remain absent from user-visible
+results. Search has no provider, network, semantic, OCR, or detached-worker path.
 
 ### Concurrency and events
 

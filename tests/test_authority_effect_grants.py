@@ -37,6 +37,7 @@ from bots5.infrastructure.persistence.sqlite import SQLiteAppStateStore
 from bots5.infrastructure.persistence import sqlite as sqlite_store_module
 from bots5.infrastructure.rooted_sqlite_vfs import _RootedConnection, _RootedCursor
 from bots5.core.provider_configuration import ProviderConfiguration
+from tests._authority_test_support import phase7_guarded_raw_mutation
 
 
 def _open_application(root: Path, *, queue_size: int = 4):
@@ -76,6 +77,8 @@ def _corrupt_authoritative_text_representation(
     root: Path,
     attachment_id: str,
     tamper: str,
+    *,
+    store=None,
 ) -> tuple[bytes, bytes | None, bytes | None, str | None]:
     database = root / "database" / "state.sqlite3"
     with sqlite3.connect(database) as connection:
@@ -92,87 +95,92 @@ def _corrupt_authoritative_text_representation(
         ).fetchone()[0]
         connection.execute("DROP TRIGGER phase6_attachment_immutable")
         connection.execute("PRAGMA ignore_check_constraints=ON")
-        if tamper == "representation_id_missing":
-            connection.execute(
-                "UPDATE attachments SET text_representation_id = ?, text_digest = ? "
-                "WHERE id = ?",
-                (None, original_digest, attachment_id),
-            )
-        elif tamper == "representation_digest_missing":
-            connection.execute(
-                "UPDATE attachments SET text_representation_id = ?, text_digest = ? "
-                "WHERE id = ?",
-                (original_representation_id, None, attachment_id),
-            )
-        elif tamper == "identity_digest_disagree":
-            connection.execute(
-                "UPDATE attachments SET text_representation_id = ?, text_digest = ? "
-                "WHERE id = ?",
-                (wrong_digest, original_digest, attachment_id),
-            )
-        elif tamper == "digest_payload_disagree":
-            connection.execute(
-                "UPDATE attachments SET text_representation_id = ?, text_digest = ? "
-                "WHERE id = ?",
-                (wrong_digest, wrong_digest, attachment_id),
-            )
-        elif tamper == "invalid_utf8_claimed_text":
-            assert original_representation_id is None and original_digest is None
-            connection.execute(
-                "UPDATE attachments SET text_representation_id = blob_digest, "
-                "text_digest = blob_digest, ineligibility_reason = NULL WHERE id = ?",
-                (attachment_id,),
-            )
-        elif tamper == "nul_claimed_text":
-            assert original_representation_id is None and original_digest is None
-            connection.execute(
-                "UPDATE attachments SET text_representation_id = blob_digest, "
-                "text_digest = blob_digest, ineligibility_reason = NULL WHERE id = ?",
-                (attachment_id,),
-            )
-        elif tamper == "valid_text_marked_ineligible":
-            assert original_representation_id == original_digest == blob_digest
-            connection.execute(
-                "UPDATE attachments SET text_representation_id = NULL, "
-                "text_digest = NULL, ineligibility_reason = 'invalid_utf8' WHERE id = ?",
-                (attachment_id,),
-            )
-        elif tamper == "valid_text_with_ineligibility_reason":
-            assert original_representation_id == original_digest == blob_digest
-            connection.execute(
-                "UPDATE attachments SET ineligibility_reason = 'contains_nul' WHERE id = ?",
-                (attachment_id,),
-            )
-        elif tamper == "invalid_utf8_wrong_reason":
-            assert original_representation_id is None and original_digest is None
-            connection.execute(
-                "UPDATE attachments SET ineligibility_reason = 'contains_nul' WHERE id = ?",
-                (attachment_id,),
-            )
-        elif tamper == "nul_wrong_reason":
-            assert original_representation_id is None and original_digest is None
-            connection.execute(
-                "UPDATE attachments SET ineligibility_reason = 'invalid_utf8' WHERE id = ?",
-                (attachment_id,),
-            )
-        else:
-            raise AssertionError(f"unknown representation tamper: {tamper}")
+        with phase7_guarded_raw_mutation(
+            connection,
+            f"attachment representation corruption fixture: {tamper}",
+        ):
+            if tamper == "representation_id_missing":
+                connection.execute(
+                    "UPDATE attachments SET text_representation_id = ?, text_digest = ? "
+                    "WHERE id = ?",
+                    (None, original_digest, attachment_id),
+                )
+            elif tamper == "representation_digest_missing":
+                connection.execute(
+                    "UPDATE attachments SET text_representation_id = ?, text_digest = ? "
+                    "WHERE id = ?",
+                    (original_representation_id, None, attachment_id),
+                )
+            elif tamper == "identity_digest_disagree":
+                connection.execute(
+                    "UPDATE attachments SET text_representation_id = ?, text_digest = ? "
+                    "WHERE id = ?",
+                    (wrong_digest, original_digest, attachment_id),
+                )
+            elif tamper == "digest_payload_disagree":
+                connection.execute(
+                    "UPDATE attachments SET text_representation_id = ?, text_digest = ? "
+                    "WHERE id = ?",
+                    (wrong_digest, wrong_digest, attachment_id),
+                )
+            elif tamper in {"invalid_utf8_claimed_text", "nul_claimed_text"}:
+                assert original_representation_id is None and original_digest is None
+                connection.execute(
+                    "UPDATE attachments SET text_representation_id = blob_digest, "
+                    "text_digest = blob_digest, ineligibility_reason = NULL WHERE id = ?",
+                    (attachment_id,),
+                )
+            elif tamper == "valid_text_marked_ineligible":
+                assert original_representation_id == original_digest == blob_digest
+                connection.execute(
+                    "UPDATE attachments SET text_representation_id = NULL, "
+                    "text_digest = NULL, ineligibility_reason = 'invalid_utf8' WHERE id = ?",
+                    (attachment_id,),
+                )
+            elif tamper == "valid_text_with_ineligibility_reason":
+                assert original_representation_id == original_digest == blob_digest
+                connection.execute(
+                    "UPDATE attachments SET ineligibility_reason = 'contains_nul' WHERE id = ?",
+                    (attachment_id,),
+                )
+            elif tamper == "invalid_utf8_wrong_reason":
+                assert original_representation_id is None and original_digest is None
+                connection.execute(
+                    "UPDATE attachments SET ineligibility_reason = 'contains_nul' WHERE id = ?",
+                    (attachment_id,),
+                )
+            elif tamper == "nul_wrong_reason":
+                assert original_representation_id is None and original_digest is None
+                connection.execute(
+                    "UPDATE attachments SET ineligibility_reason = 'invalid_utf8' WHERE id = ?",
+                    (attachment_id,),
+                )
+            else:
+                raise AssertionError(f"unknown representation tamper: {tamper}")
+        committed_revision = connection.execute(
+            "SELECT source_revision FROM search_source_state WHERE singleton_id=1"
+        ).fetchone()[0]
         connection.execute(trigger_sql)
         assert connection.execute(
             "SELECT count(*) FROM sqlite_master WHERE type = 'trigger' "
             "AND name = 'phase6_attachment_immutable'"
         ).fetchone() == (1,)
-        return connection.execute(
+        corrupted_row = connection.execute(
             "SELECT blob_digest, text_representation_id, text_digest, "
             "ineligibility_reason FROM attachments WHERE id = ?",
             (attachment_id,),
         ).fetchone()
+    if store is not None:
+        store._record_committed_search_source_revision(committed_revision)
+    return corrupted_row
 
 
 def _relabel_attachment_to_nul_blob(
     root: Path,
     attachment_id: str,
     nul_attachment_id: str,
+    *,
+    store,
 ) -> None:
     """Install a post-plan NUL text claim while restoring the immutable trigger."""
     database = root / "database" / "state.sqlite3"
@@ -190,21 +198,29 @@ def _relabel_attachment_to_nul_blob(
             "AND name = 'phase6_attachment_immutable'"
         ).fetchone()[0]
         connection.execute("DROP TRIGGER phase6_attachment_immutable")
-        connection.execute(
-            "UPDATE attachments SET blob_digest = ?, text_representation_id = ?, "
-            "text_digest = ?, ineligibility_reason = NULL WHERE id = ?",
-            (
-                nul_blob_digest,
-                nul_blob_digest,
-                nul_blob_digest,
-                attachment_id,
-            ),
-        )
+        with phase7_guarded_raw_mutation(
+            connection,
+            "attachment NUL relabel corruption fixture",
+        ):
+            connection.execute(
+                "UPDATE attachments SET blob_digest = ?, text_representation_id = ?, "
+                "text_digest = ?, ineligibility_reason = NULL WHERE id = ?",
+                (
+                    nul_blob_digest,
+                    nul_blob_digest,
+                    nul_blob_digest,
+                    attachment_id,
+                ),
+            )
+        committed_revision = connection.execute(
+            "SELECT source_revision FROM search_source_state WHERE singleton_id=1"
+        ).fetchone()[0]
         connection.execute(trigger_sql)
         assert connection.execute(
             "SELECT count(*) FROM sqlite_master WHERE type = 'trigger' "
             "AND name = 'phase6_attachment_immutable'"
         ).fetchone() == (1,)
+    store._record_committed_search_source_revision(committed_revision)
 
 
 def _phase6_chat_counts(root: Path, chat_id: str) -> tuple[object, ...]:
@@ -1638,6 +1654,7 @@ def test_authoritative_representation_corruption_matrix_revokes_owner_and_future
             root,
             attachment.id,
             tamper,
+            store=store,
         )
 
         requests: list[tuple[AuthorityState | str, str]] = []
@@ -1781,6 +1798,7 @@ def test_e13_late_representation_corruption_preserves_known_rollback(
                 root,
                 attachment.id,
                 "digest_payload_disagree",
+                store=store,
             )
             return original_persist(*args, **kwargs)
 
@@ -1868,6 +1886,7 @@ def test_e13_post_plan_nul_relabel_preserves_t5_t6_rollback(
                 root,
                 attachment.id,
                 nul_attachment.id,
+                store=store,
             )
             return original_persist(*args, **kwargs)
 

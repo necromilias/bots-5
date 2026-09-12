@@ -37,7 +37,8 @@ from bots5.infrastructure.rooted_sqlite_vfs import (
 )
 
 
-_HEAD = "0009_phase6_context_attachments"
+_LEGACY_HEAD = "0009_phase6_context_attachments"
+_HEAD = "0010_phase7_search_navigation"
 _PRIOR_REVISIONS = (
     "0001_desktop_state",
     "0002_conversation_lineage",
@@ -47,6 +48,7 @@ _PRIOR_REVISIONS = (
     "0006_phase4_workspace",
     "0007_phase5_provider_model_configuration",
     "0008_catalogue_refresh_outcomes",
+    _LEGACY_HEAD,
 )
 _SUPPORTED_REVISIONS = frozenset((*_PRIOR_REVISIONS, _HEAD))
 _JOURNAL = "phase6-journal-v3.json"
@@ -391,7 +393,11 @@ def _validate_record(
 ) -> dict[str, object]:
     if not isinstance(record, dict):
         raise RuntimeError("migration journal is not an object")
-    if record.get("journal_version") != 3 or record.get("target_revision") != _HEAD:
+    target_revision = record.get("target_revision")
+    if (
+        record.get("journal_version") != 3
+        or target_revision not in {_LEGACY_HEAD, _HEAD}
+    ):
         raise RuntimeError("migration journal version or target is unsupported")
     source_kind = record.get("source_kind")
     phase = record.get("phase")
@@ -421,7 +427,12 @@ def _validate_record(
     if raw != _canonical_bytes(record):
         raise RuntimeError("migration journal is not canonical JSON")
     if source_kind == "EXISTING":
-        if record.get("expected_start_revision") not in _PRIOR_REVISIONS:
+        supported_sources = (
+            tuple(item for item in _PRIOR_REVISIONS if item != _LEGACY_HEAD)
+            if target_revision == _LEGACY_HEAD
+            else _PRIOR_REVISIONS
+        )
+        if record.get("expected_start_revision") not in supported_sources:
             raise RuntimeError("migration journal source revision is unsupported")
         if record.get("backup_leaf") != f"migrate-{transaction_id}.backup.sqlite3":
             raise RuntimeError("migration journal backup leaf is invalid")
@@ -475,7 +486,7 @@ def _validate_record(
             type(record.get("candidate_size")) is not int
             or record["candidate_size"] < 1
             or not _valid_sha256(record.get("candidate_sha256"))
-            or record.get("candidate_revision") != _HEAD
+            or record.get("candidate_revision") != target_revision
             or record.get("candidate_quiesced") is not True
             or record.get("validation")
             != "integrity-schema-behavior-rows-attachments"
@@ -952,7 +963,7 @@ def _verify_database(
 
                 _validate_open_connection(
                     connection,
-                    expected_revision=_HEAD,
+                    expected_revision=revision,
                     destructive_phase6=destructive_phase6,
                 )
     finally:
@@ -1167,7 +1178,7 @@ def _candidate_seed(authority: DataRootAuthority, record: dict[str, object]) -> 
         raise
 
 
-def _run_alembic(vfs: RootedSQLiteVfs) -> None:
+def _run_alembic(vfs: RootedSQLiteVfs, target_revision: str) -> None:
     engine = create_engine(
         "sqlite://", creator=vfs.connect, poolclass=NullPool, future=True
     )
@@ -1197,7 +1208,7 @@ def _run_alembic(vfs: RootedSQLiteVfs) -> None:
                 )
             _fault("after-candidate-delete-full-config")
             config.attributes["connection"] = connection
-            command.upgrade(config, _HEAD)
+            command.upgrade(config, target_revision)
     finally:
         engine.dispose()
     if vfs.open_count != 0:
@@ -1230,7 +1241,8 @@ def _build_candidate(
                 )
                 _write_journal(authority, next_record)
                 record = next_record
-            _run_alembic(vfs)
+            target_revision = str(record["target_revision"])
+            _run_alembic(vfs, target_revision)
             _fault("after-candidate-alembic")
             connection = vfs.connect()
             try:
@@ -1249,7 +1261,10 @@ def _build_candidate(
             finally:
                 connection.close()
             _verify_database(
-                vfs, _HEAD, phase6=True, destructive_phase6=True
+                vfs,
+                target_revision,
+                phase6=True,
+                destructive_phase6=True,
             )
         finally:
             if vfs.open_count != 0:
@@ -1282,7 +1297,7 @@ def _build_candidate(
             candidate_identity=_identity_record(candidate_identity),
             candidate_size=candidate_identity.size,
             candidate_sha256=candidate_hash,
-            candidate_revision=_HEAD,
+            candidate_revision=target_revision,
             candidate_quiesced=True,
             validation="integrity-schema-behavior-rows-attachments",
         )
@@ -1441,7 +1456,7 @@ def _validate_promoted(
     except BaseException as exc:
         raise _PromotedValidationError("NORMAL_VFS_OPEN") from exc
     try:
-        _verify_database(vfs, _HEAD, phase6=True)
+        _verify_database(vfs, str(record["target_revision"]), phase6=True)
         _fault("after-promoted-normal-validation")
     except BaseException as exc:
         raise _PromotedValidationError("NORMAL_VFS_VALIDATION") from exc
@@ -1650,47 +1665,85 @@ def _resume(authority: DataRootAuthority, record: dict[str, object]) -> None:
         _require_no_sidecars(
             authority, authority._database_dir_capability, "state.sqlite3"
         )
-        _verify_database(authority._open_rooted_vfs(), _HEAD, phase6=True)
+        _verify_database(
+            authority._open_rooted_vfs(),
+            str(record["target_revision"]),
+            phase6=True,
+        )
         _terminal_cleanup(authority, record)
         return
     raise RuntimeError(f"migration stopped in nonterminal phase: {phase}")
 
 
+def _preflight_fts5() -> None:
+    """Prove FTS5/unicode61 before migration can touch the data root."""
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.execute(
+            "CREATE VIRTUAL TABLE bots5_phase7_fts_probe "
+            "USING fts5(value, tokenize='unicode61')"
+        )
+        connection.execute(
+            "INSERT INTO bots5_phase7_fts_probe(value) VALUES (?)", ("Grüße 東京",)
+        )
+        count = connection.execute(
+            "SELECT count(*) FROM bots5_phase7_fts_probe "
+            "WHERE bots5_phase7_fts_probe MATCH ?",
+            ('"grüße"',),
+        ).fetchone()[0]
+        if int(count) != 1:
+            raise RuntimeError("SQLite FTS5 unicode61 preflight failed")
+    except sqlite3.DatabaseError as exc:
+        raise RuntimeError("SQLite FTS5 unicode61 is unavailable") from exc
+    finally:
+        connection.close()
+
+
 def upgrade_database(*, authority: DataRootAuthority) -> None:
-    """Upgrade the authority's canonical database to the Phase 6 head."""
+    """Upgrade the authority's canonical database to the Phase 7 head."""
     if not isinstance(authority, DataRootAuthority):
         raise TypeError("upgrade_database requires DataRootAuthority")
     authority.assert_live()
+    # This deliberately precedes _begin_migration(), journal creation, source
+    # sidecar recovery, and every canonical database open.
+    _preflight_fts5()
     authority._begin_migration()
     success = False
     try:
-        record = _read_journal(authority)
-        if record is None:
-            _clean_initial_temp(authority)
-            database_fd = authority._database_dir_capability
-            canonical = _leaf_identity(authority, database_fd, "state.sqlite3")
-            transaction_id = str(uuid7())
-            if canonical is None:
-                base = _journal_base(authority, transaction_id, "ABSENT")
-                record = _advance(base, "ABSENT")
-                _write_journal(authority, record, initial=True)
-            else:
-                authority._claim_database()
-                revision = _discover_existing(authority)
-                if revision == _HEAD:
-                    _quiesce_source(authority, _HEAD)
-                    success = True
-                    return
-                base = _journal_base(authority, transaction_id, "EXISTING")
-                base.update(
-                    expected_start_revision=revision,
-                    source_identity=_identity_record(authority._main_identity),
-                    backup_leaf=f"migrate-{transaction_id}.backup.sqlite3",
-                    backup_temp_leaf=f"migrate-{transaction_id}.backup.tmp",
-                )
-                record = _advance(base, "PREPARING")
-                _write_journal(authority, record, initial=True)
-        _resume(authority, record)
-        success = True
+        while True:
+            record = _read_journal(authority)
+            if record is None:
+                _clean_initial_temp(authority)
+                database_fd = authority._database_dir_capability
+                canonical = _leaf_identity(authority, database_fd, "state.sqlite3")
+                transaction_id = str(uuid7())
+                if canonical is None:
+                    base = _journal_base(authority, transaction_id, "ABSENT")
+                    record = _advance(base, "ABSENT")
+                    _write_journal(authority, record, initial=True)
+                else:
+                    authority._claim_database()
+                    revision = _discover_existing(authority)
+                    if revision == _HEAD:
+                        _quiesce_source(authority, _HEAD)
+                        success = True
+                        return
+                    base = _journal_base(authority, transaction_id, "EXISTING")
+                    base.update(
+                        expected_start_revision=revision,
+                        source_identity=_identity_record(authority._main_identity),
+                        backup_leaf=f"migrate-{transaction_id}.backup.sqlite3",
+                        backup_temp_leaf=f"migrate-{transaction_id}.backup.tmp",
+                    )
+                    record = _advance(base, "PREPARING")
+                    _write_journal(authority, record, initial=True)
+            target_revision = str(record["target_revision"])
+            _resume(authority, record)
+            if target_revision == _HEAD:
+                success = True
+                return
+            # A legitimate interrupted 0009 journal has now completed and was
+            # removed.  Start a distinct 0010 transaction/journal rather than
+            # changing the target identity of the recovered record.
     finally:
         authority._finish_migration(success=success)

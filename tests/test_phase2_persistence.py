@@ -16,6 +16,7 @@ from bots5.domain.clock import parse_utc
 from bots5.domain.models import AttemptState, Chat, GenerationAttempt, Message, MessageRole, MessageState
 from tests._authority_test_support import (
     SQLiteAppStateStore,
+    phase7_guarded_raw_mutation,
     upgrade_database,
     upgrade_to as authority_upgrade_to,
 )
@@ -42,7 +43,7 @@ def test_phase2_schema_has_lineage_columns_and_is_idempotent(tmp_path: Path):
             chat_columns = {column["name"] for column in inspect(store.engine).get_columns("chats")}
             assert {"head_message_id", "revision"} <= chat_columns
             with store.engine.connect() as connection:
-                assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0009_phase6_context_attachments"
+                assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0010_phase7_search_navigation"
             foreign_keys = inspect(store.engine).get_foreign_keys("chats")
         assert any(
             foreign_key["referred_table"] == "messages"
@@ -208,7 +209,10 @@ def test_database_rejects_cross_chat_lineage_reference(tmp_path: Path):
     store = SQLiteAppStateStore.open(database)
     try:
         with pytest.raises(DatabaseError, match="same chat"):
-            with store.command_admission(), store.engine.begin() as connection:
+            with store.command_admission(), store._search_source_transaction(
+                "cross-chat lineage constraint test",
+                ("chat:chat-1", "chat:chat-2", "message:m1", "message:m2"),
+            ) as connection:
                 connection.execute(
                     text("INSERT INTO chats (id, title, created_at, updated_at, revision) VALUES ('chat-1', 'One', '2026-09-03T00:00:00.000Z', '2026-09-03T00:00:00.000Z', 0), ('chat-2', 'Two', '2026-09-03T00:00:00.000Z', '2026-09-03T00:00:00.000Z', 0)")
                 )
@@ -338,15 +342,16 @@ def test_current_head_rejects_a_lineage_cycle_on_open(tmp_path: Path):
     store.close()
 
     with sqlite3.connect(database) as connection:
-        connection.execute("DROP TRIGGER messages_parent_same_chat")
-        connection.execute("DROP TRIGGER messages_validate_insert")
-        connection.execute("DROP TRIGGER messages_timestamps_insert")
-        connection.execute("DROP TRIGGER messages_active_head_parent_guard")
-        connection.execute(
-            "INSERT INTO messages (id, chat_id, parent_id, sequence, role, state, content, created_at, lineage_id, revision) "
-            "VALUES ('cycle', 'chat', 'cycle', 3, 'user', 'sent', 'bad', "
-            "'2026-09-03T00:00:00.000Z', 'cycle', 1)"
-        )
+        with phase7_guarded_raw_mutation(connection, "lineage cycle corruption fixture"):
+            connection.execute("DROP TRIGGER messages_parent_same_chat")
+            connection.execute("DROP TRIGGER messages_validate_insert")
+            connection.execute("DROP TRIGGER messages_timestamps_insert")
+            connection.execute("DROP TRIGGER messages_active_head_parent_guard")
+            connection.execute(
+                "INSERT INTO messages (id, chat_id, parent_id, sequence, role, state, content, created_at, lineage_id, revision) "
+                "VALUES ('cycle', 'chat', 'cycle', 3, 'user', 'sent', 'bad', "
+                "'2026-09-03T00:00:00.000Z', 'cycle', 1)"
+            )
 
     with pytest.raises(RuntimeError, match="cannot parent itself"):
         SQLiteAppStateStore.open(database)
@@ -412,8 +417,12 @@ def test_current_head_revision_shape_is_rejected_on_open(tmp_path: Path):
         database = tmp_path / f"{name}.sqlite3"
         seed_database(database)
         with sqlite3.connect(database) as connection:
-            for statement in statements:
-                connection.execute(statement)
+            with phase7_guarded_raw_mutation(
+                connection,
+                "current-head shape corruption fixture",
+            ):
+                for statement in statements:
+                    connection.execute(statement)
             connection.commit()
         with pytest.raises(RuntimeError, match=error):
             SQLiteAppStateStore.open(database)
@@ -772,7 +781,7 @@ def test_upgrade_from_existing_phase2_revision_installs_integrity_boundary(tmp_p
     store = SQLiteAppStateStore.open(database)
     try:
         with store.command_admission(), store.engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0009_phase6_context_attachments"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0010_phase7_search_navigation"
             assert connection.execute(
                 text("SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'messages_validate_insert'")
             ).scalar_one() == 1

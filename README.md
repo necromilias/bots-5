@@ -24,11 +24,18 @@ The landed Phase 6 implementation is commit
 the complete repository suite, with no failures and no provider contacted. See
 `docs/LINUX_V0_1_PHASE6_CLOSURE_REPORT.md` for the final closure and landing record.
 
-**Phase 7, search and exact navigation, is next.**
+**Phase 7, search and exact navigation, now has an uncommitted implementation
+candidate awaiting external closure.** It adds literal FTS5 search over the accepted
+chat/message/attachment domain, exact active or historical navigation, minimal
+archive/unarchive support, explicit stale/rebuild/unavailable states, and bounded
+desktop controls. It does not add semantic search, OCR, provider work, or Phase 8
+inspection/provenance UX. See `docs/LINUX_V0_1_PHASE7_IMPLEMENTATION_REPORT.md` for
+candidate identity and validation evidence.
 
 The build-facing Linux v0.1 contract remains `docs/LINUX_V0_1_DESIGN.md`. The cumulative Phase 6
 implementation history remains in `docs/LINUX_V0_1_PHASE6_IMPLEMENTATION_REPORT.md`; its earlier
 candidate-status statements are historical evidence and are superseded by the Phase 6 closure report.
+Phase 7 does not change the landed Phase 6 disposition.
 
 The provisional UI authority remains `docs/LINUX_V0_1_UI_UX_DRAFT_1.md`; it has not been promoted to
 final design authority.

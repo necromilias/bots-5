@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import ContextManager, Protocol
 
 from bots5.domain.models import Attachment, Chat, GenerationAttempt, Message, WorkspaceWindowState
+from bots5.domain.search import (
+    SearchFilters,
+    SearchNavigation,
+    SearchPage,
+    SearchResult,
+    SearchStatus,
+)
 
 
 class AppStateStore(Protocol):
@@ -35,6 +43,15 @@ class AppStateStore(Protocol):
         ...
 
     def create_chat(self, chat: Chat) -> None:
+        ...
+
+    def archive_chat(
+        self,
+        chat_id: str,
+        archived_at: datetime | None,
+        *,
+        expected_revision: int | None = None,
+    ) -> Chat:
         ...
 
     def list_chats(self) -> tuple[Chat, ...]:
@@ -109,6 +126,33 @@ class AppStateStore(Protocol):
         ...
 
     def reconcile_interrupted_generations(self, now) -> None:
+        ...
+
+    def search_status(self) -> SearchStatus:
+        ...
+
+    def search(
+        self,
+        query: str,
+        *,
+        filters: SearchFilters = SearchFilters(),
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> SearchPage:
+        ...
+
+    def rebuild_search_index(self) -> SearchStatus:
+        ...
+
+    def diagnose_search_index(self) -> SearchStatus:
+        ...
+
+    def resolve_search_result(
+        self,
+        result: SearchResult,
+        *,
+        location_index: int = 0,
+    ) -> SearchNavigation:
         ...
 
     def list_workspace_windows(self) -> tuple[WorkspaceWindowState, ...]:

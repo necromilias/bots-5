@@ -9,13 +9,20 @@ authority root and exposes the private Engine only through a proxy.
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine
 
 from bots5.infrastructure.data_root_authority import DataRootAuthority
+from bots5.infrastructure.persistence.transition_guard import (
+    arm_phase7_source_mutation,
+    clear_phase7_source_mutation,
+    install_transition_guard,
+)
 
 
 def _root_for(database: Path) -> Path:
@@ -107,3 +114,23 @@ def upgrade_to(database: Path | str, revision: str) -> None:
             command.upgrade(config, revision)
     finally:
         engine.dispose()
+
+
+@contextmanager
+def phase7_guarded_raw_mutation(connection, operation: str):
+    """Arm the real Phase 7 guard on one disposable stock-SQLite connection."""
+    record = SimpleNamespace(info={})
+    install_transition_guard(connection, record)
+    guard_connection = SimpleNamespace(info=record.info)
+    expected_revision = connection.execute(
+        "SELECT source_revision FROM search_source_state WHERE singleton_id=1"
+    ).fetchone()[0]
+    arm_phase7_source_mutation(
+        guard_connection,
+        operation,
+        expected_revision=expected_revision,
+    )
+    try:
+        yield connection
+    finally:
+        clear_phase7_source_mutation(guard_connection)

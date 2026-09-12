@@ -2,21 +2,32 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import re
 import sqlite3
 
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 from datetime import UTC, datetime
 from functools import wraps
+from threading import RLock
 
 from sqlalchemy import Engine, create_engine, delete, event, func, insert, select, text, update
 from sqlalchemy.pool import NullPool
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from uuid6 import uuid7
 
-from bots5.core.errors import AuthorityError, RevisionConflict, StateError
+from bots5.core.errors import (
+    AuthorityError,
+    RevisionConflict,
+    SearchIndexInvalid,
+    SearchRebuilding,
+    SearchResultGone,
+    SearchStaleIndex,
+    SearchUnavailable,
+    StateError,
+)
 from bots5.domain.clock import parse_utc, utc_iso
 from bots5.domain.models import (
     AttemptState,
@@ -37,6 +48,17 @@ from bots5.domain.provider import (
     CatalogueRefreshFailureClass,
     CatalogueRefreshStatus,
     validate_capability_value,
+)
+from bots5.domain.search import (
+    SearchBranchState,
+    SearchDocumentKind,
+    SearchFilters,
+    SearchIndexCondition,
+    SearchLocation,
+    SearchNavigation,
+    SearchPage,
+    SearchResult,
+    SearchStatus,
 )
 
 from .schema import (
@@ -59,6 +81,9 @@ from .schema import (
     message_attachments,
     attempt_attachments,
     context_plans,
+    search_document_keys,
+    search_index_state,
+    search_source_state,
 )
 from .phase3_validation import (
     PHASE3_BACKEND_ID,
@@ -75,6 +100,9 @@ from .transition_guard import (
     arm_phase6_blob_transition,
     clear_transition,
     clear_phase6,
+    arm_phase7_source_mutation,
+    clear_phase7_source_mutation,
+    require_phase7_consumed,
     require_phase6_consumed,
     install_transition_guard,
 )
@@ -87,6 +115,26 @@ from .phase5_store import (
     _settings,
 )
 from .phase6_schema import validate_phase6_schema
+from .phase7_schema import (
+    PHASE7_REVISION,
+    SEARCH_SCHEMA_VERSION,
+    SEARCH_TOKENIZER_VERSION,
+    validate_phase7_schema,
+)
+from .phase7_validation import validate_phase7_rebuild
+from .search import (
+    ReceiptCoordinator,
+    SearchProjection,
+    SearchReceipt,
+    bind_cursor_fingerprint,
+    build_search_statement,
+    compile_literal_query,
+    decode_cursor,
+    deterministic_rowid,
+    encode_cursor,
+    replace_projection,
+    validate_limit,
+)
 from bots5.infrastructure.attachments import (
     AttachmentCleanupUncertain,
     AttachmentIntegrityError,
@@ -97,6 +145,8 @@ from bots5.infrastructure.attachments import (
 
 
 _TEST_FAULT_HOOK = None
+_SQLITE_MAX_INTEGER = (1 << 63) - 1
+_PHASE7_PENDING_SOURCE_COMMIT = "bots5_phase7_pending_source_commit"
 
 
 def _fault(point: str) -> None:
@@ -952,26 +1002,48 @@ def _authorise_application_sql(
 
 
 def _validate_open_connection(
-    connection, *, expected_revision: str, destructive_phase6: bool = True
+    connection,
+    *,
+    expected_revision: str,
+    destructive_phase6: bool = True,
+    require_fts: bool = True,
+    allow_missing_search_index_state: bool = False,
+    allow_repairable_search_index_version: bool = False,
 ) -> None:
     """Validate the exact authoritative schema and destructive guard behavior."""
-    integrity = __import__(
-        "bots5.infrastructure.persistence.migrations.versions.0003_integrity_boundaries",
-        fromlist=["_validate_existing_state"],
-    )
-    integrity._validate_existing_state(connection)
-    revision = connection.exec_driver_sql(
-        "SELECT version_num FROM alembic_version"
-    ).scalar_one_or_none()
-    if revision != expected_revision:
-        raise RuntimeError("current database revision is not authoritative")
-    _validate_phase4_schema(connection)
-    _validate_phase5_schema(connection)
-    _validate_phase5_trigger_behavior(connection)
-    validate_phase6_schema(connection, destructive=destructive_phase6)
+    phase7 = expected_revision == PHASE7_REVISION
+    if phase7:
+        arm_phase7_source_mutation(connection, "phase7 schema validation")
+    try:
+        integrity = __import__(
+            "bots5.infrastructure.persistence.migrations.versions.0003_integrity_boundaries",
+            fromlist=["_validate_existing_state"],
+        )
+        integrity._validate_existing_state(connection)
+        revision = connection.exec_driver_sql(
+            "SELECT version_num FROM alembic_version"
+        ).scalar_one_or_none()
+        if revision != expected_revision:
+            raise RuntimeError("current database revision is not authoritative")
+        _validate_phase4_schema(connection)
+        _validate_phase5_schema(connection)
+        _validate_phase5_trigger_behavior(connection)
+        validate_phase6_schema(connection, destructive=destructive_phase6)
+    finally:
+        if phase7:
+            clear_phase7_source_mutation(connection)
+    if phase7:
+        validate_phase7_schema(
+            connection,
+            require_fts=require_fts,
+            expensive=destructive_phase6,
+            allow_missing_index_state=allow_missing_search_index_state,
+            allow_repairable_index_version=allow_repairable_search_index_version,
+        )
 
 
 def _chat(row) -> Chat:
+    archived_at = getattr(row, "archived_at", None)
     return Chat(
         id=row.id,
         title=row.title,
@@ -979,6 +1051,7 @@ def _chat(row) -> Chat:
         updated_at=parse_utc(row.updated_at),
         head_message_id=row.head_message_id,
         revision=int(row.revision),
+        archived_at=None if archived_at is None else parse_utc(archived_at),
     )
 
 
@@ -1875,6 +1948,9 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         *,
         authority: DataRootAuthority,
         _construction_key: object,
+        search_available: bool = True,
+        search_generation: int = 0,
+        search_source_revision: int = 0,
     ):
         if _construction_key is not self._CONSTRUCTION_KEY:
             raise TypeError("SQLiteAppStateStore is constructed only by DataRootAuthority")
@@ -1883,6 +1959,12 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         self._poisoned = False
         self._authority = authority
         self._attachment_manager = _open_attachment_fs(authority)
+        self._search_available = search_available
+        self._search_receipts = ReceiptCoordinator()
+        self._search_generation_high_water = search_generation
+        self._search_source_revision_lock = RLock()
+        self._search_source_revision_high_water = search_source_revision
+        self._search_cursor_epoch = str(uuid7())
         authority.register_store(self)
 
     @classmethod
@@ -1898,6 +1980,9 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         authority._claim_database()
         lease = authority
         engine = _engine(authority)
+        search_available = True
+        search_generation = 0
+        search_source_revision = 0
         try:
             lease.assert_live()
             with engine.begin() as connection:
@@ -1969,6 +2054,46 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     _validate_phase5_schema(connection)
                     _validate_phase5_trigger_behavior(connection)
                     validate_phase6_schema(connection)
+                if revision == PHASE7_REVISION:
+                    _validate_open_connection(
+                        connection,
+                        expected_revision=PHASE7_REVISION,
+                        destructive_phase6=False,
+                        require_fts=False,
+                        allow_missing_search_index_state=True,
+                        allow_repairable_search_index_version=True,
+                    )
+                    try:
+                        connection.exec_driver_sql(
+                            "SELECT rowid FROM search_fts "
+                            "WHERE search_fts MATCH ? LIMIT 0",
+                            ('"probe"',),
+                        ).fetchall()
+                    except DBAPIError as exc:
+                        if "no such module: fts5" not in str(exc).casefold():
+                            raise
+                        search_available = False
+                    stored_generation = connection.exec_driver_sql(
+                        "SELECT generation FROM search_index_state WHERE singleton_id=1"
+                    ).scalar_one_or_none()
+                    search_generation = (
+                        int(stored_generation)
+                        if type(stored_generation) is int and stored_generation >= 0
+                        else 0
+                    )
+                    stored_source_revision = connection.exec_driver_sql(
+                        "SELECT source_revision FROM search_source_state "
+                        "WHERE singleton_id=1"
+                    ).scalar_one()
+                    if (
+                        type(stored_source_revision) is not int
+                        or stored_source_revision < 0
+                        or stored_source_revision > _SQLITE_MAX_INTEGER
+                    ):
+                        raise RuntimeError(
+                            "current Phase 7 source singleton is malformed"
+                        )
+                    search_source_revision = stored_source_revision
                 if "provider_id" in columns:
                     outcomes = __import__(
                         "bots5.infrastructure.persistence.migrations.versions.0005_generation_outcomes",
@@ -1987,6 +2112,9 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                 engine,
                 authority=lease,
                 _construction_key=cls._CONSTRUCTION_KEY,
+                search_available=search_available,
+                search_generation=search_generation,
+                search_source_revision=search_source_revision,
             )
         except BaseException:
             engine.dispose()
@@ -2043,20 +2171,38 @@ class SQLiteAppStateStore(Phase5StoreMixin):
 
     def _commit_attachment_transaction(self, connection, operation: str) -> None:
         """Classify an attachment-consequential commit at its only call site."""
-        try:
-            connection.commit()
-        except BaseException as exc:
-            self._poisoned = True
-            self._authority.poison(
-                f"uncertain attachment transaction commit: {operation}"
-            )
+        connection_info = getattr(connection, "info", None)
+        pending_revision = (
+            None
+            if connection_info is None
+            else connection_info.get(_PHASE7_PENDING_SOURCE_COMMIT)
+        )
+        lock = (
+            self._search_source_revision_lock
+            if pending_revision is not None
+            else nullcontext()
+        )
+        with lock:
             try:
-                connection.rollback()
-            except BaseException:
-                pass
-            raise StateError(
-                "attachment transaction outcome is uncertain; restart recovery is required"
-            ) from exc
+                connection.commit()
+            except BaseException as exc:
+                if connection_info is not None:
+                    connection_info.pop(_PHASE7_PENDING_SOURCE_COMMIT, None)
+                self._poisoned = True
+                self._authority.poison(
+                    f"uncertain attachment transaction commit: {operation}"
+                )
+                try:
+                    connection.rollback()
+                except BaseException:
+                    pass
+                raise StateError(
+                    "attachment transaction outcome is uncertain; restart recovery is required"
+                ) from exc
+            if pending_revision is not None:
+                assert connection_info is not None
+                connection_info.pop(_PHASE7_PENDING_SOURCE_COMMIT, None)
+                self._record_committed_search_source_revision(pending_revision)
 
     def _rollback_attachment_transaction(self, connection, operation: str) -> None:
         """Establish a known abort or poison when rollback itself is uncertain."""
@@ -2070,6 +2216,10 @@ class SQLiteAppStateStore(Phase5StoreMixin):
             raise StateError(
                 "attachment transaction rollback is uncertain; restart recovery is required"
             ) from exc
+        finally:
+            connection_info = getattr(connection, "info", None)
+            if connection_info is not None:
+                connection_info.pop(_PHASE7_PENDING_SOURCE_COMMIT, None)
 
     def _poison_attachment_lifecycle(self, operation: str) -> None:
         self._poisoned = True
@@ -2107,15 +2257,43 @@ class SQLiteAppStateStore(Phase5StoreMixin):
             revision = connection.exec_driver_sql(
                 "SELECT version_num FROM alembic_version"
             ).scalar_one_or_none()
-            if revision != "0009_phase6_context_attachments":
-                raise StateError("Phase 6 persistence schema is not current")
+            if revision != PHASE7_REVISION:
+                raise StateError("Phase 7 persistence schema is not current")
             validate_phase6_schema(connection)
+            validate_phase7_schema(
+                connection,
+                require_fts=self._search_available,
+                expensive=False,
+            )
+
+    @contextmanager
+    def _search_source_transaction(
+        self,
+        operation: str,
+        document_keys: tuple[str, ...],
+    ):
+        """Commit business data and its one source revision atomically."""
+        revision: int | None = None
+        with self._authority.transition():
+            with self._search_transaction(f"{operation} source transaction") as connection:
+                self._arm_phase7_source_mutation(connection, operation)
+                try:
+                    yield connection
+                    revision = self._require_phase7_source_consumed(connection)
+                finally:
+                    clear_phase7_source_mutation(connection)
+        assert revision is not None
+        self._accept_search_receipt(
+            SearchReceipt(revision, frozenset(document_keys))
+        )
 
     def create_chat(self, chat: Chat) -> None:
         self._ensure_open()
         if chat.revision != 0 or chat.head_message_id is not None:
             raise StateError("new chats must start at revision 0 without a head")
-        with self._engine.begin() as connection:
+        with self._search_source_transaction(
+            "create chat", (f"chat:{chat.id}",)
+        ) as connection:
             connection.execute(
                 insert(chats).values(
                     id=chat.id,
@@ -2124,8 +2302,69 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     updated_at=utc_iso(chat.updated_at),
                     head_message_id=chat.head_message_id,
                     revision=chat.revision,
+                    archived_at=(
+                        None if chat.archived_at is None else utc_iso(chat.archived_at)
+                    ),
                 )
             )
+
+    def archive_chat(
+        self,
+        chat_id: str,
+        archived_at,
+        *,
+        expected_revision: int | None = None,
+    ) -> Chat:
+        self._ensure_open()
+        if not chat_id:
+            raise StateError("chat id must not be empty")
+        archived_value = None if archived_at is None else utc_iso(archived_at)
+        result_chat: Chat | None = None
+        source_revision: int | None = None
+        with self._authority.transition():
+            with self._search_transaction("archive chat source transaction") as connection:
+                row = connection.execute(select(chats).where(chats.c.id == chat_id)).first()
+                if row is None:
+                    raise StateError(f"chat not found: {chat_id}")
+                current = _chat(row)
+                if expected_revision is not None and current.revision != expected_revision:
+                    raise RevisionConflict(f"chat revision changed: {chat_id}")
+                if current.archived_at == archived_at:
+                    result_chat = current
+                else:
+                    self._arm_phase7_source_mutation(
+                        connection,
+                        "archive chat" if archived_at is not None else "unarchive chat",
+                    )
+                    try:
+                        updated_at = utc_iso(datetime.now(UTC))
+                        update_result = connection.execute(
+                            update(chats)
+                            .where(
+                                chats.c.id == chat_id,
+                                chats.c.revision == current.revision,
+                            )
+                            .values(
+                                archived_at=archived_value,
+                                updated_at=updated_at,
+                            )
+                        )
+                        if update_result.rowcount != 1:
+                            raise RevisionConflict(f"chat revision changed: {chat_id}")
+                        source_revision = self._require_phase7_source_consumed(connection)
+                    finally:
+                        clear_phase7_source_mutation(connection)
+                    result_chat = replace(
+                        current,
+                        archived_at=archived_at,
+                        updated_at=parse_utc(updated_at),
+                    )
+        if source_revision is not None:
+            self._accept_search_receipt(
+                SearchReceipt(source_revision, frozenset({f"chat:{chat_id}"}))
+            )
+        assert result_chat is not None
+        return result_chat
 
     # ------------------------------------------------------------------
     # Phase 6 attachment authority
@@ -2171,26 +2410,44 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                         self._attachment_manager.read_verified(
                             captured.digest, expected_size=captured.byte_size
                         )
-                        arm_phase6_attachment_insert(connection, attachment_id)
+                        search_revision = None
+                        self._arm_phase7_source_mutation(
+                            connection, "insert deduplicated attachment"
+                        )
                         try:
-                            result = connection.execute(
-                                insert(attachments).values(
-                                    id=attachment_id,
-                                    blob_digest=captured.digest,
-                                    filename=captured.filename,
-                                    source_kind="filesystem",
-                                    source_name=captured.filename,
-                                    text_representation_id=captured.representation_id,
-                                    text_digest=captured.representation_id,
-                                    ineligibility_reason=captured.ineligibility_reason,
-                                    created_at=created_at,
+                            arm_phase6_attachment_insert(connection, attachment_id)
+                            try:
+                                result = connection.execute(
+                                    insert(attachments).values(
+                                        id=attachment_id,
+                                        blob_digest=captured.digest,
+                                        filename=captured.filename,
+                                        source_kind="filesystem",
+                                        source_name=captured.filename,
+                                        text_representation_id=captured.representation_id,
+                                        text_digest=captured.representation_id,
+                                        ineligibility_reason=captured.ineligibility_reason,
+                                        created_at=created_at,
+                                    )
+                                )
+                                require_phase6_consumed(connection)
+                                if result.rowcount != 1:
+                                    raise StateError("attachment insertion did not affect one row")
+                            finally:
+                                clear_phase6(connection)
+                            search_revision = self._require_phase7_source_consumed(connection)
+                        finally:
+                            clear_phase7_source_mutation(connection)
+                        row = connection.execute(
+                            select(attachments, attachment_blobs.c.byte_size)
+                            .select_from(
+                                attachments.join(
+                                    attachment_blobs,
+                                    attachments.c.blob_digest == attachment_blobs.c.digest,
                                 )
                             )
-                            require_phase6_consumed(connection)
-                            if result.rowcount != 1:
-                                raise StateError("attachment insertion did not affect one row")
-                        finally:
-                            clear_phase6(connection)
+                            .where(attachments.c.id == attachment_id)
+                        ).first()
                         self._commit_attachment_transaction(
                             connection, "T1 deduplicated attachment identity"
                         )
@@ -2205,16 +2462,13 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                             raise StateError(
                                 "attachment cleanup failed; restart recovery is required"
                             ) from exc
-                        row = connection.execute(
-                            select(attachments, attachment_blobs.c.byte_size)
-                            .select_from(
-                                attachments.join(
-                                    attachment_blobs,
-                                    attachments.c.blob_digest == attachment_blobs.c.digest,
-                                )
+                        assert search_revision is not None
+                        self._accept_search_receipt(
+                            SearchReceipt(
+                                search_revision,
+                                frozenset({f"attachment:{attachment_id}"}),
                             )
-                            .where(attachments.c.id == attachment_id)
-                        ).first()
+                        )
                         return self._attachment_from_authoritative_row(row)
                     arm_phase6_blob_transition(
                         connection,
@@ -2302,26 +2556,32 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                             raise StateError("blob publication did not affect one row")
                     finally:
                         clear_phase6(connection)
-                    arm_phase6_attachment_insert(connection, attachment_id)
+                    search_revision = None
+                    self._arm_phase7_source_mutation(connection, "publish attachment")
                     try:
-                        result = connection.execute(
-                            insert(attachments).values(
-                                id=attachment_id,
-                                blob_digest=captured.digest,
-                                filename=captured.filename,
-                                source_kind="filesystem",
-                                source_name=captured.filename,
-                                text_representation_id=captured.representation_id,
-                                text_digest=captured.representation_id,
-                                ineligibility_reason=captured.ineligibility_reason,
-                                created_at=created_at,
+                        arm_phase6_attachment_insert(connection, attachment_id)
+                        try:
+                            result = connection.execute(
+                                insert(attachments).values(
+                                    id=attachment_id,
+                                    blob_digest=captured.digest,
+                                    filename=captured.filename,
+                                    source_kind="filesystem",
+                                    source_name=captured.filename,
+                                    text_representation_id=captured.representation_id,
+                                    text_digest=captured.representation_id,
+                                    ineligibility_reason=captured.ineligibility_reason,
+                                    created_at=created_at,
+                                )
                             )
-                        )
-                        require_phase6_consumed(connection)
-                        if result.rowcount != 1:
-                            raise StateError("attachment insertion did not affect one row")
+                            require_phase6_consumed(connection)
+                            if result.rowcount != 1:
+                                raise StateError("attachment insertion did not affect one row")
+                        finally:
+                            clear_phase6(connection)
+                        search_revision = self._require_phase7_source_consumed(connection)
                     finally:
-                        clear_phase6(connection)
+                        clear_phase7_source_mutation(connection)
                     row = connection.execute(
                         select(attachments, attachment_blobs.c.byte_size)
                         .select_from(
@@ -2350,6 +2610,13 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     if connection is not None:
                         connection.close()
                 _fault("after-ready-commit")
+                assert search_revision is not None
+                self._accept_search_receipt(
+                    SearchReceipt(
+                        search_revision,
+                        frozenset({f"attachment:{attachment_id}"}),
+                    )
+                )
             except BaseException as exc:
                 self._poisoned = True
                 self._authority.poison("attachment publication failed after durable staging")
@@ -2404,19 +2671,32 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                 ).first()
                 if refs is not None or attempt_ref is not None:
                     raise StateError("attachment has durable historical references")
-                arm_phase6_attachment_delete(connection, attachment_id)
+                search_revision = None
+                self._arm_phase7_source_mutation(connection, "delete attachment")
                 try:
-                    result = connection.execute(
-                        delete(attachments).where(attachments.c.id == attachment_id)
-                    )
-                    require_phase6_consumed(connection)
+                    arm_phase6_attachment_delete(connection, attachment_id)
+                    try:
+                        result = connection.execute(
+                            delete(attachments).where(attachments.c.id == attachment_id)
+                        )
+                        require_phase6_consumed(connection)
+                    finally:
+                        clear_phase6(connection)
+                    if result.rowcount != 1:
+                        raise StateError(f"attachment not found: {attachment_id}")
+                    search_revision = self._require_phase7_source_consumed(connection)
                 finally:
-                    clear_phase6(connection)
-                if result.rowcount != 1:
-                    raise StateError(f"attachment not found: {attachment_id}")
+                    clear_phase7_source_mutation(connection)
                 commit_attempted = True
                 self._commit_attachment_transaction(
                     connection, "T4 reusable attachment deletion"
+                )
+                assert search_revision is not None
+                self._accept_search_receipt(
+                    SearchReceipt(
+                        search_revision,
+                        frozenset({f"attachment:{attachment_id}"}),
+                    )
                 )
             except BaseException:
                 if not commit_attempted and not self._poisoned and connection is not None:
@@ -3415,6 +3695,7 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         # Acquire the attachment transition gate before opening the SQLite
         # write transaction.  This ordering prevents GC (gate -> BEGIN
         # IMMEDIATE) from deadlocking generation (BEGIN -> gate).
+        source_revision: int | None = None
         with self._authority.transition():
             with ExitStack() as stack:
                 if attachment_ids:
@@ -3427,7 +3708,9 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     connection.exec_driver_sql("BEGIN IMMEDIATE")
                     explicit = True
                 else:
-                    connection = stack.enter_context(self._engine.begin())
+                    connection = stack.enter_context(
+                        self._search_transaction("T5 generation start")
+                    )
                     explicit = False
                 commit_succeeded = False
                 if explicit:
@@ -3437,30 +3720,49 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                                 connection, "T5 generation start with attachments K0"
                             )
                     stack.callback(rollback_k0)
-                self._insert_messages_and_attempt(
-                    connection,
-                    (user_message, assistant_message),
-                    attempt,
-                )
-                self._persist_phase6_evidence(
-                    connection,
-                    attempt_id=attempt.id,
-                    message_id=user_message.id,
-                    context_plan=context_plan,
-                    attachment_ids=attachment_ids,
-                )
-                self._advance_chat(
-                    connection,
-                    chat,
-                    assistant_message.id,
-                    expected_chat_revision,
-                )
+                self._arm_phase7_source_mutation(connection, "generation start")
+                try:
+                    self._insert_messages_and_attempt(
+                        connection,
+                        (user_message, assistant_message),
+                        attempt,
+                    )
+                    self._persist_phase6_evidence(
+                        connection,
+                        attempt_id=attempt.id,
+                        message_id=user_message.id,
+                        context_plan=context_plan,
+                        attachment_ids=attachment_ids,
+                    )
+                    self._advance_chat(
+                        connection,
+                        chat,
+                        assistant_message.id,
+                        expected_chat_revision,
+                    )
+                    source_revision = self._require_phase7_source_consumed(connection)
+                finally:
+                    clear_phase7_source_mutation(connection)
                 if explicit:
                     commit_attempted = True
                     self._commit_attachment_transaction(
                         connection, "T5 generation start with attachments"
                     )
                     commit_succeeded = True
+            assert source_revision is not None
+            self._accept_search_receipt(
+                SearchReceipt(
+                    source_revision,
+                    frozenset(
+                        {
+                            f"chat:{chat.id}",
+                            f"message:{user_message.id}",
+                            f"message:{assistant_message.id}",
+                            *(f"attachment:{value}" for value in attachment_ids),
+                        }
+                    ),
+                )
+            )
 
     def persist_regeneration_start(
         self,
@@ -3473,6 +3775,7 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         attachment_ids: tuple[str, ...] = (),
     ) -> None:
         self._ensure_open()
+        source_revision: int | None = None
         with self._authority.transition():
             with ExitStack() as stack:
                 if attachment_ids:
@@ -3485,7 +3788,9 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     connection.exec_driver_sql("BEGIN IMMEDIATE")
                     explicit = True
                 else:
-                    connection = stack.enter_context(self._engine.begin())
+                    connection = stack.enter_context(
+                        self._search_transaction("T6 regeneration start")
+                    )
                     explicit = False
                 commit_succeeded = False
                 if explicit:
@@ -3495,27 +3800,47 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                                 connection, "T6 regeneration with attachments K0"
                             )
                     stack.callback(rollback_k0)
-                self._insert_messages_and_attempt(connection, (assistant_message,), attempt)
-                self._persist_phase6_evidence(
-                    connection,
-                    attempt_id=attempt.id,
-                    message_id=attempt.user_message_id,
-                    context_plan=context_plan,
-                    attachment_ids=attachment_ids,
-                    reuse_message_attachments=True,
-                )
-                self._advance_chat(
-                    connection,
-                    chat,
-                    assistant_message.id,
-                    expected_chat_revision,
-                )
+                self._arm_phase7_source_mutation(connection, "regeneration start")
+                try:
+                    self._insert_messages_and_attempt(
+                        connection, (assistant_message,), attempt
+                    )
+                    self._persist_phase6_evidence(
+                        connection,
+                        attempt_id=attempt.id,
+                        message_id=attempt.user_message_id,
+                        context_plan=context_plan,
+                        attachment_ids=attachment_ids,
+                        reuse_message_attachments=True,
+                    )
+                    self._advance_chat(
+                        connection,
+                        chat,
+                        assistant_message.id,
+                        expected_chat_revision,
+                    )
+                    source_revision = self._require_phase7_source_consumed(connection)
+                finally:
+                    clear_phase7_source_mutation(connection)
                 if explicit:
                     commit_attempted = True
                     self._commit_attachment_transaction(
                         connection, "T6 regeneration with attachments"
                     )
                     commit_succeeded = True
+            assert source_revision is not None
+            self._accept_search_receipt(
+                SearchReceipt(
+                    source_revision,
+                    frozenset(
+                        {
+                            f"chat:{chat.id}",
+                            f"message:{assistant_message.id}",
+                            *(f"attachment:{value}" for value in attachment_ids),
+                        }
+                    ),
+                )
+            )
 
     def update_streaming_message(self, message: Message) -> None:
         self._ensure_open()
@@ -3546,7 +3871,10 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         if message.state not in expected_message_states:
             raise StateError("message and attempt terminal states do not match")
         _validate_request_snapshot(attempt, phase3=persisted_phase3)
-        with self._engine.begin() as connection:
+        with self._search_source_transaction(
+            "finalize generation",
+            (f"chat:{message.chat_id}", f"message:{message.id}"),
+        ) as connection:
             stored_message_row = connection.execute(
                 select(messages).where(messages.c.id == message.id)
             ).first()
@@ -3751,6 +4079,1138 @@ class SQLiteAppStateStore(Phase5StoreMixin):
             if result.rowcount != 1:
                 raise StateError(f"generation attempt not found: {attempt.id}")
 
+    # ------------------------------------------------------------------
+    # Phase 7 derived search and exact navigation
+
+    @staticmethod
+    def _is_search_counter(value) -> bool:
+        return (
+            type(value) is int
+            and 0 <= value <= _SQLITE_MAX_INTEGER
+        )
+
+    def _authoritative_search_state_corrupt(self, detail: str) -> None:
+        """Use the existing Phase 6 invalidation path for known source corruption."""
+        self._authority.poison(detail)
+        raise StateError(f"{detail}; restart recovery is required")
+
+    def _require_search_source_revision(self, connection) -> int:
+        # A writer holds this lock from commit through high-water publication.
+        # A deferred read transaction therefore observes either the complete
+        # old state or the complete new state, never a mismatched pair.
+        with self._search_source_revision_lock:
+            rows = connection.exec_driver_sql(
+                "SELECT singleton_id, source_revision FROM search_source_state LIMIT 2"
+            ).fetchall()
+            if (
+                len(rows) != 1
+                or type(rows[0][0]) is not int
+                or rows[0][0] != 1
+                or not self._is_search_counter(rows[0][1])
+            ):
+                self._authoritative_search_state_corrupt(
+                    "authoritative search source state is malformed"
+                )
+            revision = rows[0][1]
+            if revision != self._search_source_revision_high_water:
+                self._authoritative_search_state_corrupt(
+                    "authoritative search source revision regressed or advanced outside its transition"
+                )
+            return revision
+
+    def _record_committed_search_source_revision(self, revision: int) -> None:
+        """Publish one known committed authoritative revision while serialized."""
+        with self._search_source_revision_lock:
+            if (
+                not self._is_search_counter(revision)
+                or revision != self._search_source_revision_high_water + 1
+            ):
+                self._authoritative_search_state_corrupt(
+                    "authoritative search source revision transition is not monotonic"
+                )
+            self._search_source_revision_high_water = revision
+
+    def _arm_phase7_source_mutation(self, connection, operation: str) -> None:
+        """Fail closed before SQLite arithmetic can launder corrupt source state."""
+        revision = self._require_search_source_revision(connection)
+        if revision >= _SQLITE_MAX_INTEGER:
+            self._authoritative_search_state_corrupt(
+                "authoritative search source revision is exhausted"
+            )
+        arm_phase7_source_mutation(
+            connection,
+            operation,
+            expected_revision=revision,
+        )
+
+    def _require_phase7_source_consumed(self, connection) -> int:
+        """Classify the authoritative post-trigger counter before commit."""
+        try:
+            revision = require_phase7_consumed(connection)
+        except (RuntimeError, TypeError, ValueError, OverflowError) as exc:
+            self._authority.poison(
+                "authoritative search source mutation result is malformed"
+            )
+            raise StateError(
+                "authoritative search source mutation result is malformed; "
+                "restart recovery is required"
+            ) from exc
+        if not self._is_search_counter(revision):
+            self._authoritative_search_state_corrupt(
+                "authoritative search source mutation result is malformed"
+            )
+        if connection.info.get(_PHASE7_PENDING_SOURCE_COMMIT) is not None:
+            self._authoritative_search_state_corrupt(
+                "authoritative search source mutation result was registered twice"
+            )
+        connection.info[_PHASE7_PENDING_SOURCE_COMMIT] = revision
+        return revision
+
+    def _search_status_from_connection(self, connection) -> SearchStatus:
+        source_revision = self._require_search_source_revision(connection)
+        rows = connection.exec_driver_sql(
+            "SELECT singleton_id, condition, checkpoint_revision, generation, "
+            "schema_version, tokenizer_version, detail "
+            "FROM search_index_state LIMIT 2"
+        ).fetchall()
+        if not rows:
+            if not self._search_available:
+                return SearchStatus(
+                    SearchIndexCondition.UNAVAILABLE,
+                    source_revision,
+                    None,
+                    None,
+                    SEARCH_SCHEMA_VERSION,
+                    SEARCH_TOKENIZER_VERSION,
+                    "SQLite FTS5 is unavailable and derived search index state is missing",
+                )
+            return SearchStatus(
+                SearchIndexCondition.INVALID,
+                source_revision,
+                None,
+                None,
+                SEARCH_SCHEMA_VERSION,
+                SEARCH_TOKENIZER_VERSION,
+                "derived search index state is missing",
+            )
+        row = rows[0]
+        singleton_valid = (
+            len(rows) == 1
+            and type(row[0]) is int
+            and row[0] == 1
+        )
+        checkpoint_valid = singleton_valid and self._is_search_counter(row[2])
+        generation_valid = singleton_valid and self._is_search_counter(row[3])
+        schema_valid = singleton_valid and type(row[4]) is int
+        tokenizer_valid = singleton_valid and type(row[5]) is str
+        condition_valid = (
+            singleton_valid
+            and type(row[1]) is str
+            and row[1] in {"VALID", "REBUILDING", "INVALID"}
+        )
+        detail_valid = singleton_valid and (row[6] is None or type(row[6]) is str)
+        checkpoint_revision = row[2] if checkpoint_valid else None
+        generation = row[3] if generation_valid else None
+        stored_schema_version = row[4] if schema_valid else None
+        stored_tokenizer_version = row[5] if tokenizer_valid else None
+        if generation_valid:
+            generation_regressed = generation < self._search_generation_high_water
+            self._search_generation_high_water = max(
+                self._search_generation_high_water, generation
+            )
+        else:
+            generation_regressed = False
+        malformed = (
+            not condition_valid
+            or not checkpoint_valid
+            or not generation_valid
+            or not schema_valid
+            or not tokenizer_valid
+            or not detail_valid
+            or checkpoint_revision > source_revision
+        )
+        if malformed:
+            return SearchStatus(
+                SearchIndexCondition.INVALID,
+                source_revision,
+                checkpoint_revision,
+                generation,
+                stored_schema_version,
+                stored_tokenizer_version,
+                "derived search index coordination state is malformed",
+            )
+        assert checkpoint_revision is not None
+        assert generation is not None
+        assert stored_schema_version is not None
+        assert stored_tokenizer_version is not None
+        version_mismatch = (
+            stored_schema_version != SEARCH_SCHEMA_VERSION
+            or stored_tokenizer_version != SEARCH_TOKENIZER_VERSION
+        )
+        detail = row[6]
+        if not self._search_available:
+            condition = SearchIndexCondition.UNAVAILABLE
+            detail = detail or "SQLite FTS5 is unavailable in this runtime"
+        elif version_mismatch:
+            condition = SearchIndexCondition.INVALID
+            detail = detail or "derived search schema or tokenizer version is invalid"
+        elif row[1] == "REBUILDING":
+            condition = SearchIndexCondition.REBUILDING
+        elif (
+            row[1] == "INVALID"
+            or checkpoint_revision > source_revision
+            or generation_regressed
+        ):
+            condition = SearchIndexCondition.INVALID
+            if generation_regressed:
+                detail = detail or "derived search generation regressed"
+        elif checkpoint_revision != source_revision:
+            condition = SearchIndexCondition.STALE
+            detail = detail or "authoritative source revision is newer than the search checkpoint"
+        else:
+            condition = SearchIndexCondition.VALID
+        return SearchStatus(
+            condition=condition,
+            source_revision=source_revision,
+            checkpoint_revision=checkpoint_revision,
+            generation=generation,
+            schema_version=stored_schema_version,
+            tokenizer_version=stored_tokenizer_version,
+            detail=None if detail is None else str(detail),
+        )
+
+    def search_status(self) -> SearchStatus:
+        self._ensure_open()
+        with self._search_transaction("search status") as connection:
+            return self._search_status_from_connection(connection)
+
+    @staticmethod
+    def _require_searchable(status: SearchStatus) -> None:
+        if status.condition is SearchIndexCondition.VALID:
+            return
+        if status.condition is SearchIndexCondition.UNAVAILABLE:
+            raise SearchUnavailable(status.detail or "search is unavailable")
+        if status.condition is SearchIndexCondition.REBUILDING:
+            raise SearchRebuilding(status.detail or "search index is rebuilding")
+        if status.condition is SearchIndexCondition.STALE:
+            raise SearchStaleIndex(status.detail or "search index is stale")
+        raise SearchIndexInvalid(status.detail or "search index is invalid")
+
+    def _attachment_projection(self, connection, attachment_id: str) -> SearchProjection | None:
+        row = connection.execute(
+            select(attachments, attachment_blobs.c.byte_size)
+            .select_from(
+                attachments.join(
+                    attachment_blobs,
+                    attachments.c.blob_digest == attachment_blobs.c.digest,
+                )
+            )
+            .where(attachments.c.id == attachment_id)
+        ).first()
+        if row is None:
+            return None
+        try:
+            raw = self._attachment_manager.read_verified(
+                row.blob_digest,
+                expected_size=int(row.byte_size),
+            )
+        except AttachmentIntegrityError as exc:
+            self._poison_attachment_lifecycle(
+                "search attachment payload integrity mismatch"
+            )
+            raise StateError("attachment payload integrity failed") from exc
+        body = self._validated_authoritative_attachment_representation(
+            row,
+            attachment_id,
+            raw=raw,
+        )
+        names = str(row.filename)
+        if row.source_name != row.filename:
+            names += "\n" + str(row.source_name)
+        return SearchProjection(
+            "attachment",
+            attachment_id,
+            str(row.filename),
+            body or "",
+            names,
+        )
+
+    def _projection_for_key(self, connection, document_key: str) -> SearchProjection | None:
+        try:
+            kind, document_id = document_key.split(":", 1)
+        except ValueError:
+            raise SearchIndexInvalid("derived receipt contains a malformed document key") from None
+        if not document_id:
+            raise SearchIndexInvalid("derived receipt contains an empty document identity")
+        if kind == "chat":
+            row = connection.execute(
+                select(chats.c.id, chats.c.title).where(chats.c.id == document_id)
+            ).first()
+            return (
+                None
+                if row is None
+                else SearchProjection("chat", document_id, str(row.title), "", "")
+            )
+        if kind == "message":
+            row = connection.execute(
+                select(
+                    messages.c.id,
+                    messages.c.role,
+                    messages.c.state,
+                    messages.c.content,
+                ).where(messages.c.id == document_id)
+            ).first()
+            if row is None or not (
+                row.role == MessageRole.USER.value
+                or (
+                    row.role == MessageRole.ASSISTANT.value
+                    and row.state
+                    in {state.value for state in _MESSAGE_TERMINAL_STATES}
+                )
+            ):
+                return None
+            return SearchProjection("message", document_id, "", str(row.content), "")
+        if kind == "attachment":
+            return self._attachment_projection(connection, document_id)
+        raise SearchIndexInvalid("derived receipt contains an unknown document kind")
+
+    def _all_search_projections(self, connection) -> tuple[SearchProjection, ...]:
+        result: list[SearchProjection] = []
+        for row in connection.execute(
+            select(chats.c.id, chats.c.title).order_by(chats.c.id)
+        ).fetchall():
+            result.append(SearchProjection("chat", str(row.id), str(row.title), "", ""))
+        for row in connection.execute(
+            select(messages.c.id, messages.c.content)
+            .where(
+                (messages.c.role == MessageRole.USER.value)
+                | (
+                    (messages.c.role == MessageRole.ASSISTANT.value)
+                    & (
+                        messages.c.state.in_(
+                            tuple(state.value for state in _MESSAGE_TERMINAL_STATES)
+                        )
+                    )
+                )
+            )
+            .order_by(messages.c.id)
+        ).fetchall():
+            result.append(
+                SearchProjection("message", str(row.id), "", str(row.content), "")
+            )
+        attachment_ids = connection.execute(
+            select(attachments.c.id).order_by(attachments.c.id)
+        ).scalars().all()
+        for attachment_id in attachment_ids:
+            projection = self._attachment_projection(connection, str(attachment_id))
+            if projection is None:
+                raise SearchIndexInvalid("attachment disappeared during serialized rebuild")
+            result.append(projection)
+        return tuple(result)
+
+    @staticmethod
+    def _validate_search_projection_contents(
+        connection,
+        projections: tuple[SearchProjection, ...],
+    ) -> None:
+        """Compare every derived field at explicit expensive boundaries only."""
+        expected = {
+            projection.document_key: (
+                projection.document_kind,
+                projection.document_id,
+                projection.title,
+                projection.body,
+                projection.filename,
+            )
+            for projection in projections
+        }
+        rows = connection.exec_driver_sql(
+            "SELECT f.document_key, k.document_kind, k.document_id, "
+            "f.title, f.body, f.filename FROM search_document_keys k "
+            "JOIN search_fts f ON f.rowid=k.fts_rowid"
+        ).fetchall()
+        actual: dict[str, tuple[str, ...]] = {}
+        for row in rows:
+            values = tuple(row)
+            if len(values) != 6 or any(not isinstance(value, str) for value in values):
+                raise SearchIndexInvalid("derived search document content is malformed")
+            key = values[0]
+            if key in actual:
+                raise SearchIndexInvalid("derived search document key is duplicated")
+            actual[key] = values[1:]
+        if actual != expected:
+            raise SearchIndexInvalid(
+                "derived search document content does not match authoritative truth"
+            )
+
+    def _rollback_search_transaction(self, connection, operation: str) -> None:
+        try:
+            connection.rollback()
+        except BaseException as exc:
+            self._poisoned = True
+            self._authority.poison(f"search transaction rollback failed: {operation}")
+            raise StateError(
+                "search transaction rollback is uncertain; restart recovery is required"
+            ) from exc
+        finally:
+            connection_info = getattr(connection, "info", None)
+            if connection_info is not None:
+                connection_info.pop(_PHASE7_PENDING_SOURCE_COMMIT, None)
+
+    def _commit_search_transaction(self, connection, operation: str) -> None:
+        connection_info = getattr(connection, "info", None)
+        pending_revision = (
+            None
+            if connection_info is None
+            else connection_info.get(_PHASE7_PENDING_SOURCE_COMMIT)
+        )
+        lock = (
+            self._search_source_revision_lock
+            if pending_revision is not None
+            else nullcontext()
+        )
+        with lock:
+            try:
+                connection.commit()
+            except BaseException as exc:
+                if connection_info is not None:
+                    connection_info.pop(_PHASE7_PENDING_SOURCE_COMMIT, None)
+                self._poisoned = True
+                self._authority.poison(f"uncertain search transaction commit: {operation}")
+                try:
+                    connection.rollback()
+                except BaseException:
+                    pass
+                raise StateError(
+                    "search transaction outcome is uncertain; restart recovery is required"
+                ) from exc
+            if pending_revision is not None:
+                assert connection_info is not None
+                connection_info.pop(_PHASE7_PENDING_SOURCE_COMMIT, None)
+                self._record_committed_search_source_revision(pending_revision)
+
+    def _close_search_connection(self, connection, operation: str) -> None:
+        try:
+            connection.close()
+        except BaseException as exc:
+            self._poisoned = True
+            self._authority.poison(f"search connection close failed: {operation}")
+            raise StateError(
+                "search connection close is uncertain; restart recovery is required"
+            ) from exc
+
+    @contextmanager
+    def _search_transaction(self, operation: str):
+        """Classify settlement and lifetime outcomes for one Phase 7 transaction."""
+        connection = None
+        try:
+            connection = self._engine.connect()
+            connection.exec_driver_sql("BEGIN")
+            try:
+                yield connection
+            except BaseException:
+                self._rollback_search_transaction(connection, operation)
+                raise
+            else:
+                self._commit_search_transaction(connection, operation)
+        finally:
+            if connection is not None:
+                self._close_search_connection(connection, operation)
+
+    def _accept_search_receipt(self, receipt: SearchReceipt) -> None:
+        try:
+            self._search_receipts.accept(receipt)
+            if not self._search_available:
+                return
+            self._drain_search_receipts()
+        except Exception:
+            # The authoritative transaction is already known committed.  A
+            # derived rollback or uncertain derived settlement leaves source >
+            # checkpoint visible. Unknown outcomes have already poisoned the
+            # authority, but must not falsely report business mutation failure.
+            return
+
+    def _write_search_invalid_state(
+        self,
+        detail: str,
+        *,
+        expected_generation: int,
+        expected_checkpoint: int,
+    ) -> bool:
+        """Persist INVALID for the exact derived snapshot already observed bad.
+
+        The caller owns writer serialization. A concurrent completed rebuild is
+        not overwritten because generation and checkpoint are part of the CAS.
+        """
+        connection = None
+        commit_attempted = False
+        try:
+            connection = self._engine.connect()
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+            updated = connection.exec_driver_sql(
+                "UPDATE search_index_state SET condition='INVALID', detail=?, "
+                "updated_at=? WHERE singleton_id=1 AND generation=? "
+                "AND checkpoint_revision=?",
+                (
+                    detail[:1024],
+                    utc_iso(datetime.now(UTC)),
+                    expected_generation,
+                    expected_checkpoint,
+                ),
+            )
+            if updated.rowcount not in {0, 1}:
+                raise SearchIndexInvalid("search index singleton is not unique")
+            commit_attempted = True
+            self._commit_search_transaction(connection, "mark invalid")
+            return updated.rowcount == 1
+        except SearchIndexInvalid:
+            if connection is not None and not commit_attempted:
+                self._rollback_search_transaction(connection, "mark invalid")
+            raise
+        except (DBAPIError, sqlite3.DatabaseError, IntegrityError) as exc:
+            if connection is not None and not commit_attempted:
+                self._rollback_search_transaction(connection, "mark invalid")
+            raise SearchIndexInvalid("failed to persist invalid search state") from exc
+        finally:
+            if connection is not None:
+                self._close_search_connection(connection, "mark invalid")
+
+    def _mark_search_invalid(
+        self,
+        detail: str,
+        *,
+        expected_generation: int,
+        expected_checkpoint: int,
+    ) -> bool:
+        with self._authority.transition():
+            return self._write_search_invalid_state(
+                detail,
+                expected_generation=expected_generation,
+                expected_checkpoint=expected_checkpoint,
+            )
+
+    def _drain_search_receipts(self) -> None:
+        with self._authority.transition():
+            connection = None
+            commit_attempted = False
+            try:
+                connection = self._engine.connect()
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+                status = self._search_status_from_connection(connection)
+                if status.condition in {
+                    SearchIndexCondition.REBUILDING,
+                    SearchIndexCondition.INVALID,
+                    SearchIndexCondition.UNAVAILABLE,
+                }:
+                    self._rollback_search_transaction(connection, "receipt status gate")
+                    return
+                assert status.checkpoint_revision is not None
+                contiguous = self._search_receipts.contiguous(status.checkpoint_revision)
+                if contiguous is None:
+                    self._rollback_search_transaction(connection, "receipt gap")
+                    return
+                target_revision, document_keys = contiguous
+                assert status.source_revision is not None
+                if target_revision > status.source_revision:
+                    self._rollback_search_transaction(connection, "future receipt")
+                    raise SearchIndexInvalid("derived receipt is newer than authoritative state")
+                for document_key in sorted(document_keys):
+                    replace_projection(
+                        connection,
+                        self._projection_for_key(connection, document_key),
+                        document_key,
+                    )
+                updated = connection.exec_driver_sql(
+                    "UPDATE search_index_state SET checkpoint_revision=?, condition='VALID', "
+                    "detail=NULL, updated_at=? WHERE singleton_id=1 AND checkpoint_revision=?",
+                    (
+                        target_revision,
+                        utc_iso(datetime.now(UTC)),
+                        status.checkpoint_revision,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise SearchIndexInvalid("derived checkpoint changed during receipt drain")
+                commit_attempted = True
+                self._commit_search_transaction(connection, "receipt drain")
+                self._search_receipts.acknowledge(target_revision)
+            except SearchIndexInvalid:
+                if connection is not None and not commit_attempted:
+                    self._rollback_search_transaction(connection, "receipt logical failure")
+                raise
+            except (DBAPIError, sqlite3.DatabaseError, IntegrityError) as exc:
+                if connection is not None and not commit_attempted:
+                    self._rollback_search_transaction(connection, "receipt derived failure")
+                raise SearchIndexInvalid("incremental derived search update failed") from exc
+            finally:
+                if connection is not None:
+                    self._close_search_connection(connection, "receipt drain")
+
+    def search(
+        self,
+        query: str,
+        *,
+        filters: SearchFilters = SearchFilters(),
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> SearchPage:
+        self._ensure_open()
+        limit = validate_limit(limit)
+        expression, fingerprint = compile_literal_query(query, filters)
+        fingerprint = bind_cursor_fingerprint(
+            fingerprint, self._search_cursor_epoch
+        )
+        status: SearchStatus | None = None
+        try:
+            with self._search_transaction("search query snapshot") as connection:
+                status = self._search_status_from_connection(connection)
+                self._require_searchable(status)
+                assert status.checkpoint_revision is not None
+                assert status.generation is not None
+                offset = decode_cursor(
+                    cursor,
+                    fingerprint=fingerprint,
+                    checkpoint_revision=status.checkpoint_revision,
+                    generation=status.generation,
+                )
+                statement, parameters = build_search_statement(
+                    expression,
+                    filters,
+                    limit=limit,
+                    offset=offset,
+                )
+                rows = connection.exec_driver_sql(statement, parameters).fetchall()
+                for row in rows:
+                    self._validate_returned_search_projection(connection, row)
+                page_rows = rows[:limit]
+                results = tuple(
+                    self._search_result_from_row(
+                        connection,
+                        row,
+                        status=status,
+                        filters=filters,
+                    )
+                    for row in page_rows
+                )
+                next_cursor = (
+                    encode_cursor(
+                        fingerprint,
+                        status.checkpoint_revision,
+                        status.generation,
+                        offset + limit,
+                    )
+                    if len(rows) > limit
+                    else None
+                )
+                return SearchPage(results, next_cursor, status)
+        except SearchIndexInvalid as exc:
+            if (
+                status is not None
+                and status.condition is SearchIndexCondition.VALID
+                and status.generation is not None
+                and status.checkpoint_revision is not None
+            ):
+                self._mark_search_invalid(
+                    str(exc),
+                    expected_generation=status.generation,
+                    expected_checkpoint=status.checkpoint_revision,
+                )
+            raise
+        except (DBAPIError, sqlite3.DatabaseError) as exc:
+            if (
+                status is not None
+                and status.generation is not None
+                and status.checkpoint_revision is not None
+            ):
+                try:
+                    self._mark_search_invalid(
+                        str(exc),
+                        expected_generation=status.generation,
+                        expected_checkpoint=status.checkpoint_revision,
+                    )
+                except SearchIndexInvalid:
+                    # The original structural failure remains the typed cause;
+                    # an exact newer snapshot may also have won the CAS.
+                    pass
+            raise SearchIndexInvalid("search index query failed") from exc
+
+    def _message_is_active(self, connection, chat_id: str, message_id: str) -> bool:
+        return bool(
+            connection.exec_driver_sql(
+                "WITH RECURSIVE active(id) AS ("
+                " SELECT head_message_id FROM chats WHERE id=? AND head_message_id IS NOT NULL"
+                " UNION SELECT m.parent_id FROM messages m JOIN active a ON m.id=a.id"
+                " WHERE m.parent_id IS NOT NULL) SELECT 1 FROM active WHERE id=? LIMIT 1",
+                (chat_id, message_id),
+            ).first()
+        )
+
+    def _attachment_locations(
+        self,
+        connection,
+        attachment_id: str,
+        *,
+        filters: SearchFilters,
+    ) -> tuple[SearchLocation, ...]:
+        predicates = ["ma.attachment_id=?"]
+        parameters: list[object] = [attachment_id]
+        if filters.chat_id is not None:
+            predicates.append("m.chat_id=?")
+            parameters.append(filters.chat_id)
+        if not filters.include_archived:
+            predicates.append("c.archived_at IS NULL")
+        sql = (
+            "SELECT m.chat_id, m.id, c.archived_at FROM message_attachments ma "
+            "JOIN messages m ON m.id=ma.message_id JOIN chats c ON c.id=m.chat_id "
+            "WHERE "
+            + " AND ".join(predicates)
+            + " "
+            + "ORDER BY m.chat_id, m.sequence, m.id"
+        )
+        locations = []
+        for chat_id, message_id, archived_at in connection.exec_driver_sql(
+            sql, tuple(parameters)
+        ).fetchall():
+            active = self._message_is_active(connection, str(chat_id), str(message_id))
+            if filters.active_branch_only and not active:
+                continue
+            locations.append(
+                SearchLocation(
+                    str(chat_id),
+                    str(message_id),
+                    SearchBranchState.ACTIVE if active else SearchBranchState.HISTORICAL,
+                    None if archived_at is None else parse_utc(str(archived_at)),
+                )
+            )
+        return tuple(locations)
+
+    def _search_result_from_row(
+        self,
+        connection,
+        row,
+        *,
+        status: SearchStatus,
+        filters: SearchFilters,
+    ) -> SearchResult:
+        try:
+            kind = SearchDocumentKind(str(row[0]))
+            document_id = str(row[1])
+            document_key = str(row[2])
+            rank = float(row[3])
+        except (TypeError, ValueError) as exc:
+            raise SearchIndexInvalid("derived search result identity is malformed") from exc
+        if document_key != f"{kind.value}:{document_id}":
+            raise SearchIndexInvalid("derived search result key is inconsistent")
+        if not math.isfinite(rank):
+            raise SearchIndexInvalid("derived search result rank is malformed")
+        if row[5] is None:
+            raise SearchIndexInvalid(
+                "derived search result has no authoritative timestamp"
+            )
+        snippet = "" if row[4] is None else str(row[4])
+        authoritative_at = parse_utc(str(row[5]))
+        assert status.checkpoint_revision is not None and status.generation is not None
+        if kind is SearchDocumentKind.CHAT:
+            chat_row = connection.execute(
+                select(chats).where(chats.c.id == document_id)
+            ).first()
+            if chat_row is None:
+                raise SearchIndexInvalid("indexed chat document has no authoritative row")
+            archived = None if chat_row.archived_at is None else parse_utc(chat_row.archived_at)
+            return SearchResult(
+                document_key,
+                kind,
+                document_id,
+                str(chat_row.title),
+                snippet,
+                rank,
+                authoritative_at,
+                chat_id=document_id,
+                locations=(
+                    SearchLocation(document_id, None, SearchBranchState.ACTIVE, archived),
+                ),
+                checkpoint_revision=status.checkpoint_revision,
+                generation=status.generation,
+                include_archived=filters.include_archived,
+                active_branch_only=filters.active_branch_only,
+            )
+        if kind is SearchDocumentKind.MESSAGE:
+            message_row = connection.execute(
+                select(messages, chats.c.title, chats.c.archived_at)
+                .select_from(messages.join(chats, messages.c.chat_id == chats.c.id))
+                .where(messages.c.id == document_id)
+            ).first()
+            if message_row is None:
+                raise SearchIndexInvalid("indexed message document has no authoritative row")
+            active = self._message_is_active(
+                connection, str(message_row.chat_id), document_id
+            )
+            branch = SearchBranchState.ACTIVE if active else SearchBranchState.HISTORICAL
+            archived = (
+                None
+                if message_row.archived_at is None
+                else parse_utc(str(message_row.archived_at))
+            )
+            return SearchResult(
+                document_key,
+                kind,
+                document_id,
+                str(message_row.title),
+                snippet,
+                rank,
+                authoritative_at,
+                chat_id=str(message_row.chat_id),
+                message_id=document_id,
+                lineage_id=str(message_row.lineage_id),
+                revision=int(message_row.revision),
+                supersedes_message_id=(
+                    None if message_row.supersedes_id is None else str(message_row.supersedes_id)
+                ),
+                role=MessageRole(str(message_row.role)),
+                state=MessageState(str(message_row.state)),
+                locations=(
+                    SearchLocation(str(message_row.chat_id), document_id, branch, archived),
+                ),
+                checkpoint_revision=status.checkpoint_revision,
+                generation=status.generation,
+                include_archived=filters.include_archived,
+                active_branch_only=filters.active_branch_only,
+            )
+        attachment_row = connection.execute(
+            select(attachments.c.filename).where(attachments.c.id == document_id)
+        ).first()
+        if attachment_row is None:
+            raise SearchIndexInvalid("indexed attachment document has no authoritative row")
+        locations = self._attachment_locations(
+            connection,
+            document_id,
+            filters=filters,
+        )
+        if not locations:
+            raise SearchIndexInvalid("visible attachment result has no authoritative location")
+        return SearchResult(
+            document_key,
+            kind,
+            document_id,
+            str(attachment_row.filename),
+            snippet,
+            rank,
+            authoritative_at,
+            locations=locations,
+            checkpoint_revision=status.checkpoint_revision,
+            generation=status.generation,
+            include_archived=filters.include_archived,
+            active_branch_only=filters.active_branch_only,
+        )
+
+    def _validate_returned_search_projection(self, connection, row) -> None:
+        """Validate only bounded FTS rows returned by the current query snapshot."""
+        try:
+            values = tuple(row)
+            if len(values) != 9 or any(
+                type(values[index]) is not str for index in (0, 1, 2, 6, 7, 8)
+            ):
+                raise TypeError
+            document_key = f"{values[0]}:{values[1]}"
+            if values[2] != document_key:
+                raise SearchIndexInvalid("derived search result key is inconsistent")
+            derived = SearchProjection(
+                values[0], values[1], values[6], values[7], values[8]
+            )
+        except (IndexError, TypeError, ValueError) as exc:
+            raise SearchIndexInvalid(
+                "returned search document projection is malformed"
+            ) from exc
+        authoritative = self._projection_for_key(connection, document_key)
+        if authoritative is None or derived != authoritative:
+            raise SearchIndexInvalid(
+                "returned search document does not match authoritative truth"
+            )
+
+    def _write_rebuild_state(self) -> int:
+        connection = None
+        commit_attempted = False
+        try:
+            connection = self._engine.connect()
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+            rows = connection.exec_driver_sql(
+                "SELECT singleton_id, generation FROM search_index_state LIMIT 2"
+            ).fetchall()
+            row_is_canonical = (
+                len(rows) == 1
+                and type(rows[0][0]) is int
+                and rows[0][0] == 1
+            )
+            stored_generation = (
+                rows[0][1]
+                if row_is_canonical and self._is_search_counter(rows[0][1])
+                else None
+            )
+            generation_base = max(
+                self._search_generation_high_water,
+                -1 if stored_generation is None else stored_generation,
+            )
+            if generation_base >= _SQLITE_MAX_INTEGER:
+                self._search_cursor_epoch = str(uuid7())
+                self._search_generation_high_water = 0
+                generation = 1
+            else:
+                generation = generation_base + 1
+            if not row_is_canonical:
+                connection.exec_driver_sql("DELETE FROM search_index_state")
+                connection.exec_driver_sql(
+                    "INSERT INTO search_index_state"
+                    "(singleton_id, condition, checkpoint_revision, generation, "
+                    "schema_version, tokenizer_version, detail, updated_at) "
+                    "VALUES (1, 'REBUILDING', 0, ?, ?, ?, NULL, ?)",
+                    (
+                        generation,
+                        SEARCH_SCHEMA_VERSION,
+                        SEARCH_TOKENIZER_VERSION,
+                        utc_iso(datetime.now(UTC)),
+                    ),
+                )
+            else:
+                updated = connection.exec_driver_sql(
+                    "UPDATE search_index_state SET condition='REBUILDING', "
+                    "checkpoint_revision=0, generation=?, "
+                    "schema_version=?, tokenizer_version=?, detail=NULL, updated_at=? "
+                    "WHERE singleton_id=1",
+                    (
+                        generation,
+                        SEARCH_SCHEMA_VERSION,
+                        SEARCH_TOKENIZER_VERSION,
+                        utc_iso(datetime.now(UTC)),
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise SearchIndexInvalid("search index singleton is unavailable")
+            commit_attempted = True
+            self._commit_search_transaction(connection, "mark rebuilding")
+            self._search_generation_high_water = generation
+            return generation
+        except SearchIndexInvalid:
+            if connection is not None and not commit_attempted:
+                self._rollback_search_transaction(connection, "mark rebuilding")
+            raise
+        except (DBAPIError, sqlite3.DatabaseError, IntegrityError, RuntimeError) as exc:
+            if connection is not None and not commit_attempted:
+                self._rollback_search_transaction(connection, "mark rebuilding")
+            raise SearchIndexInvalid("failed to mark search index rebuilding") from exc
+        finally:
+            if connection is not None:
+                self._close_search_connection(connection, "mark rebuilding")
+
+    def rebuild_search_index(self) -> SearchStatus:
+        self._ensure_open()
+        if not self._search_available:
+            raise SearchUnavailable("SQLite FTS5 is unavailable in this runtime")
+        with self._authority.transition():
+            generation = self._write_rebuild_state()
+            connection = None
+            commit_attempted = False
+            try:
+                connection = self._engine.connect()
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+                source_revision = self._require_search_source_revision(connection)
+                projections = self._all_search_projections(connection)
+                connection.exec_driver_sql("DELETE FROM search_fts")
+                connection.exec_driver_sql("DELETE FROM search_document_keys")
+                occupied: set[int] = set()
+                for projection in projections:
+                    rowid = deterministic_rowid(projection.document_key, occupied)
+                    occupied.add(rowid)
+                    connection.exec_driver_sql(
+                        "INSERT INTO search_document_keys"
+                        "(fts_rowid, document_kind, document_id) VALUES (?, ?, ?)",
+                        (rowid, projection.document_kind, projection.document_id),
+                    )
+                    connection.exec_driver_sql(
+                        "INSERT INTO search_fts"
+                        "(rowid, document_key, title, body, filename) VALUES (?, ?, ?, ?, ?)",
+                        (
+                            rowid,
+                            projection.document_key,
+                            projection.title,
+                            projection.body,
+                            projection.filename,
+                        ),
+                    )
+                validate_phase7_rebuild(connection)
+                self._validate_search_projection_contents(connection, projections)
+                updated = connection.exec_driver_sql(
+                    "UPDATE search_index_state SET condition='VALID', checkpoint_revision=?, "
+                    "generation=?, detail=NULL, updated_at=? WHERE singleton_id=1 "
+                    "AND condition='REBUILDING' AND generation=?",
+                    (
+                        source_revision,
+                        generation,
+                        utc_iso(datetime.now(UTC)),
+                        generation,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise SearchIndexInvalid("search rebuild generation changed")
+                commit_attempted = True
+                self._commit_search_transaction(connection, "search rebuild")
+                self._search_receipts.acknowledge(source_revision)
+            except SearchIndexInvalid:
+                if connection is not None and not commit_attempted:
+                    self._rollback_search_transaction(connection, "search rebuild")
+                raise
+            except (DBAPIError, sqlite3.DatabaseError, IntegrityError) as exc:
+                if connection is not None and not commit_attempted:
+                    self._rollback_search_transaction(connection, "search rebuild")
+                raise SearchIndexInvalid("search rebuild failed") from exc
+            finally:
+                if connection is not None:
+                    self._close_search_connection(connection, "search rebuild")
+        return self.search_status()
+
+    def diagnose_search_index(self) -> SearchStatus:
+        self._ensure_open()
+        if not self._search_available:
+            return self.search_status()
+        with self._authority.transition():
+            status: SearchStatus | None = None
+            try:
+                with self._search_transaction("search diagnostics") as connection:
+                    status = self._search_status_from_connection(connection)
+                    if status.generation is None or status.checkpoint_revision is None:
+                        return status
+                    validate_phase7_rebuild(connection)
+                    projections = self._all_search_projections(connection)
+                    self._validate_search_projection_contents(connection, projections)
+            except (SearchIndexInvalid, DBAPIError, sqlite3.DatabaseError, RuntimeError) as exc:
+                if status is None:
+                    status = self.search_status()
+                assert status.generation is not None
+                assert status.checkpoint_revision is not None
+                try:
+                    self._write_search_invalid_state(
+                        str(exc),
+                        expected_generation=status.generation,
+                        expected_checkpoint=status.checkpoint_revision,
+                    )
+                except SearchIndexInvalid:
+                    return SearchStatus(
+                        SearchIndexCondition.INVALID,
+                        status.source_revision,
+                        status.checkpoint_revision,
+                        status.generation,
+                        SEARCH_SCHEMA_VERSION,
+                        SEARCH_TOKENIZER_VERSION,
+                        str(exc),
+                    )
+            return self.search_status()
+
+    def _branch_messages_in_snapshot(
+        self, connection, chat: Chat, leaf_message_id: str | None
+    ) -> tuple[Message, ...]:
+        if leaf_message_id is None:
+            return ()
+        rows = connection.execute(
+            select(messages)
+            .where(messages.c.chat_id == chat.id)
+            .order_by(messages.c.sequence)
+        ).fetchall()
+        by_id = {str(row.id): _message(row) for row in rows}
+        branch: list[Message] = []
+        seen: set[str] = set()
+        current: str | None = leaf_message_id
+        while current is not None:
+            if current in seen:
+                raise SearchResultGone("message lineage contains a cycle")
+            seen.add(current)
+            message = by_id.get(current)
+            if message is None:
+                raise SearchResultGone("search result message is gone")
+            branch.append(message)
+            current = message.parent_id
+        branch.reverse()
+        return tuple(branch)
+
+    def resolve_search_result(
+        self,
+        result: SearchResult,
+        *,
+        location_index: int = 0,
+    ) -> SearchNavigation:
+        self._ensure_open()
+        if not isinstance(result, SearchResult):
+            raise SearchResultGone("search result identity is invalid")
+        if type(location_index) is not int or location_index < 0:
+            raise SearchResultGone("search result location is invalid")
+        with self._search_transaction("search result navigation") as connection:
+            try:
+                focus_message_id: str | None = None
+                if result.document_kind is SearchDocumentKind.CHAT:
+                    chat_id = result.document_id
+                    leaf_message_id = None
+                    branch_state = SearchBranchState.ACTIVE
+                elif result.document_kind is SearchDocumentKind.MESSAGE:
+                    message_row = connection.execute(
+                        select(messages).where(messages.c.id == result.document_id)
+                    ).first()
+                    if message_row is None or str(message_row.chat_id) != result.chat_id:
+                        raise SearchResultGone("search result message is gone")
+                    chat_id = str(message_row.chat_id)
+                    focus_message_id = str(message_row.id)
+                    active = self._message_is_active(connection, chat_id, focus_message_id)
+                    branch_state = (
+                        SearchBranchState.ACTIVE if active else SearchBranchState.HISTORICAL
+                    )
+                    leaf_message_id = None if active else focus_message_id
+                else:
+                    if location_index >= len(result.locations):
+                        raise SearchResultGone("search result location is gone")
+                    chosen = result.locations[location_index]
+                    if chosen.message_id is None:
+                        raise SearchResultGone("attachment search location is malformed")
+                    exists = connection.exec_driver_sql(
+                        "SELECT 1 FROM attachments a JOIN message_attachments ma "
+                        "ON ma.attachment_id=a.id JOIN messages m ON m.id=ma.message_id "
+                        "WHERE a.id=? AND ma.message_id=? AND m.chat_id=?",
+                        (result.document_id, chosen.message_id, chosen.chat_id),
+                    ).first()
+                    if exists is None:
+                        raise SearchResultGone("attachment search location is gone")
+                    chat_id = chosen.chat_id
+                    focus_message_id = chosen.message_id
+                    active = self._message_is_active(connection, chat_id, focus_message_id)
+                    branch_state = (
+                        SearchBranchState.ACTIVE if active else SearchBranchState.HISTORICAL
+                    )
+                    leaf_message_id = None if active else focus_message_id
+                chat_row = connection.execute(
+                    select(chats).where(chats.c.id == chat_id)
+                ).first()
+                if chat_row is None:
+                    raise SearchResultGone("search result chat is gone")
+                chat = _chat(chat_row)
+                if not result.include_archived and chat.archived_at is not None:
+                    raise SearchResultGone("search result is no longer visible")
+                if (
+                    result.active_branch_only
+                    and branch_state is SearchBranchState.HISTORICAL
+                ):
+                    raise SearchResultGone("search result is no longer visible")
+                presentation_leaf = leaf_message_id or chat.head_message_id
+                branch = self._branch_messages_in_snapshot(
+                    connection, chat, presentation_leaf
+                )
+                navigation = SearchNavigation(
+                    chat,
+                    branch,
+                    focus_message_id,
+                    leaf_message_id,
+                    branch_state,
+                    chat.archived_at,
+                )
+                return navigation
+            except BaseException:
+                raise
+
     def list_workspace_windows(self) -> tuple[WorkspaceWindowState, ...]:
         self._ensure_open()
         with self._engine.connect() as connection:
@@ -3853,6 +5313,7 @@ def _authority_store_operation(method):
 
 _SQLITE_OPERATION_METHODS = (
     "create_chat",
+    "archive_chat",
     "ingest_attachment",
     "get_attachment",
     "list_attachments",
@@ -3877,6 +5338,11 @@ _SQLITE_OPERATION_METHODS = (
     "finalize_generation",
     "reconcile_interrupted_generations",
     "update_attempt",
+    "search_status",
+    "search",
+    "rebuild_search_index",
+    "diagnose_search_index",
+    "resolve_search_result",
     "list_workspace_windows",
     "save_workspace_window",
     "delete_workspace_window",

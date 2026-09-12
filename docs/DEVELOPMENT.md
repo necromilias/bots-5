@@ -5,7 +5,8 @@
 This repository now contains two related but distinct surfaces:
 
 1. the closed manifest-driven campaign harness (V0/V0.2); and
-2. the native Linux desktop product, implemented and landed through Linux v0.1 Phase 6.
+2. the native Linux desktop product, implemented and landed through Linux v0.1
+   Phase 6 with an uncommitted Phase 7 implementation candidate.
 
 Do not apply old V0 non-goals to the desktop product without checking `LINUX_V0_1_DESIGN.md` and the
 current roadmap.
@@ -74,6 +75,26 @@ cleanup may settle already-owned resources but must not mint fresh forward autho
 
 Schema changes require explicit migrations, matching validation/recovery tests, and preservation of the
 single-authority data-root contract.
+
+Phase 7 owns additive migration `0010_phase7_search_navigation`; migrations
+0001–0009 remain immutable. Its routine query validity checks must stay bounded:
+source revision, index state/version, checkpoint/generation/cursor identity, and
+bounded authoritative joins. Whole-index integrity and cardinality work belongs at
+migration, rebuild, explicit diagnostic, or corruption-recovery boundaries.
+
+Use the rooted Python 3.14/native-VFS test environment for Phase 7 persistence
+tests. The bounded subsystem gate is:
+
+```bash
+QT_QPA_PLATFORM=offscreen PYTHONPATH=src .venv314/bin/python -m pytest -q \
+  tests/test_phase7_core_contracts.py tests/test_phase7_desktop.py \
+  tests/test_phase7_migration_authority_faults.py \
+  tests/test_phase7_search_navigation.py
+```
+
+This deterministic gate has no provider, credential, network, semantic-search, or
+Phase 8 dependency. The complete repository suite remains a separate pre-commit
+closure gate.
 
 ## Campaign manifest schema
 

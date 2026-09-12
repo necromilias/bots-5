@@ -39,6 +39,7 @@ from bots5.infrastructure.generation.openai_compatible import OpenAICompatibleSt
 from bots5.infrastructure.generation.fake import FakeStreamingBackend
 from tests._authority_test_support import (
     SQLiteAppStateStore,
+    phase7_guarded_raw_mutation,
     upgrade_database,
     upgrade_to as authority_upgrade_to,
 )
@@ -107,7 +108,7 @@ def test_phase3_outcome_columns_are_additive_and_nullable(tmp_path: Path):
         with store.command_admission():
             with store.engine.connect() as connection:
                 assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-                    "0009_phase6_context_attachments"
+                    "0010_phase7_search_navigation"
                 )
     finally:
         store.close()
@@ -785,9 +786,10 @@ def test_authoritative_store_rejects_finish_reason_on_running_phase3(tmp_path: P
 
 def _tamper_current_schema(database: Path, statement: str, parameters: dict[str, object]) -> None:
     with sqlite3.connect(database) as connection:
-        connection.execute("DROP TRIGGER generation_attempt_validate_update")
-        connection.execute("DROP TRIGGER generation_attempt_snapshot_immutable")
-        connection.execute(statement, parameters)
+        with phase7_guarded_raw_mutation(connection, "Phase 3 corruption fixture"):
+            connection.execute("DROP TRIGGER generation_attempt_validate_update")
+            connection.execute("DROP TRIGGER generation_attempt_snapshot_immutable")
+            connection.execute(statement, parameters)
 
 
 def test_live_attempt_read_rejects_snapshot_prompt_contradiction(tmp_path: Path):

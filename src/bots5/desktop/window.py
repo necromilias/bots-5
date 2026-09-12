@@ -20,11 +20,30 @@ from PySide6.QtWidgets import (
 )
 
 from bots5.core.application import BotsApplication
-from bots5.core.errors import RevisionConflict
+from bots5.core.errors import (
+    RevisionConflict,
+    SearchCursorStale,
+    SearchError,
+    SearchIndexInvalid,
+    SearchInvalidQuery,
+    SearchRebuilding,
+    SearchResultGone,
+    SearchStaleIndex,
+    SearchUnavailable,
+)
 from bots5.core.events import CoreEvent
 from bots5.core.secrets import sanitize_secret_error
-from bots5.domain.models import AttemptState, Chat, ChatActivity, Message, MessageRole, WorkspaceWindowState
+from bots5.domain.models import (
+    AttemptState,
+    Chat,
+    ChatActivity,
+    Message,
+    MessageRole,
+    MessageState,
+    WorkspaceWindowState,
+)
 from bots5.domain.provider import BackendType, CapabilityOverride, CapabilityState, CredentialSource, GenerationSettings, ProviderProfile
+from bots5.domain.search import SearchDocumentKind, SearchFilters, SearchResult
 from bots5.providers.discovery import discoverer_for_connection
 
 from .profile import DesktopSessionInfo
@@ -36,6 +55,7 @@ from .widgets import (
     InspectorPanel,
     LeftRail,
     MessageRow,
+    SearchPanel,
     SettingsDialog,
     TopBar,
     TranscriptView,
@@ -49,6 +69,23 @@ _TERMINAL_EVENT_KINDS = frozenset(
         "generation_incomplete",
         "generation_failed",
         "generation_aborted",
+    }
+)
+
+_SEARCH_SOURCE_EVENT_KINDS = frozenset(
+    {
+        "chat_created",
+        "chat_archived",
+        "chat_unarchived",
+        "attachment_created",
+        "attachment_removed",
+        "message_sent",
+        "message_revision_created",
+        "generation_completed",
+        "generation_incomplete",
+        "generation_failed",
+        "generation_aborted",
+        "search_index_rebuilt",
     }
 )
 
@@ -78,6 +115,7 @@ class MainWindow(QMainWindow):
         self._current_chat_id: str | None = None
         self._current_chat: Chat | None = None
         self._current_messages: tuple[Message, ...] = ()
+        self._historical_leaf_message_id: str | None = None
         self._selected_message: Message | None = None
         self._refresh_tasks: set[asyncio.Task[None]] = set()
         self._refresh_generation = 0
@@ -94,6 +132,10 @@ class MainWindow(QMainWindow):
         self._add_connection_dialog: AddConnectionDialog | None = None
         self._phase5_refresh_lock = asyncio.Lock()
         self._last_phase5_event_sequence = 0
+        self._last_search_query: str | None = None
+        self._last_search_filters: SearchFilters | None = None
+        self._next_search_cursor: str | None = None
+        self._search_busy = False
 
         self.setWindowTitle("B.O.T.S. 5")
         self.resize(1180, 760)
@@ -119,6 +161,16 @@ class MainWindow(QMainWindow):
         )
         self.menuBar().addAction(self.new_window_action)
 
+        self.global_search_action = QAction("Search", self)
+        self.global_search_action.setShortcut("Ctrl+K")
+        self.global_search_action.triggered.connect(self._open_global_search)
+        self.menuBar().addAction(self.global_search_action)
+
+        self.in_chat_search_action = QAction("Search Current Chat", self)
+        self.in_chat_search_action.setShortcut("Ctrl+F")
+        self.in_chat_search_action.triggered.connect(self._open_in_chat_search)
+        self.menuBar().addAction(self.in_chat_search_action)
+
         root = QWidget(self)
         root.setObjectName("draft1Root")
         root_layout = QVBoxLayout(root)
@@ -127,6 +179,7 @@ class MainWindow(QMainWindow):
 
         self.top_bar = TopBar(self._session, root, phase5=self._phase5)
         self.top_bar.rail_toggle_requested.connect(self._toggle_rail)
+        self.top_bar.search_toggled.connect(self._toggle_search)
         self.top_bar.details_toggled.connect(self._toggle_inspector)
         self.top_bar.model_selected.connect(self._on_model_selected)
         self.top_bar.tune_requested.connect(self._on_tune_requested)
@@ -152,9 +205,40 @@ class MainWindow(QMainWindow):
         workspace_layout.setContentsMargins(18, 10, 18, 12)
         workspace_layout.setSpacing(8)
 
+        chat_header = QHBoxLayout()
         self.chat_title = QLabel("New chat", workspace)
         self.chat_title.setObjectName("chatTitle")
-        workspace_layout.addWidget(self.chat_title)
+        chat_header.addWidget(self.chat_title)
+        self.archived_badge = QLabel("Archived", workspace)
+        self.archived_badge.setObjectName("archivedBadge")
+        self.archived_badge.setVisible(False)
+        chat_header.addWidget(self.archived_badge)
+        chat_header.addStretch(1)
+        self.archive_button = QToolButton(workspace)
+        self.archive_button.setObjectName("archiveChatButton")
+        self.archive_button.setText("Archive")
+        self.archive_button.setToolTip("Archive this chat")
+        self.archive_button.clicked.connect(self._on_archive_chat)
+        chat_header.addWidget(self.archive_button)
+        workspace_layout.addLayout(chat_header)
+
+        self.historical_banner = QFrame(workspace)
+        self.historical_banner.setObjectName("historicalBanner")
+        historical_layout = QHBoxLayout(self.historical_banner)
+        historical_layout.setContentsMargins(9, 6, 9, 6)
+        self.historical_label = QLabel(
+            "Historical branch — the authoritative active head is unchanged.",
+            self.historical_banner,
+        )
+        self.historical_label.setObjectName("historicalViewLabel")
+        self.historical_label.setWordWrap(True)
+        historical_layout.addWidget(self.historical_label, 1)
+        self.return_active_button = QPushButton("Return to active branch", self.historical_banner)
+        self.return_active_button.setObjectName("returnActiveBranchButton")
+        self.return_active_button.clicked.connect(self._on_return_active_branch)
+        historical_layout.addWidget(self.return_active_button)
+        self.historical_banner.setVisible(False)
+        workspace_layout.addWidget(self.historical_banner)
 
         self.transcript = TranscriptView(workspace)
         workspace_layout.addWidget(self.transcript, 1)
@@ -236,6 +320,23 @@ class MainWindow(QMainWindow):
         self.inspector_dock.visibilityChanged.connect(self._sync_inspector_button)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.inspector_dock)
         self.inspector_dock.hide()
+
+        self.search_panel = SearchPanel(self)
+        self.search_panel.search_requested.connect(self._on_search_requested)
+        self.search_panel.load_more_requested.connect(self._on_load_more_search)
+        self.search_panel.result_requested.connect(self._on_search_result_requested)
+        self.search_panel.rebuild_requested.connect(self._on_rebuild_search)
+        self.search_dock = QDockWidget("Search", self)
+        self.search_dock.setObjectName("searchDock")
+        self.search_dock.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
+        )
+        self.search_dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetClosable)
+        self.search_dock.setMinimumWidth(350)
+        self.search_dock.setWidget(self.search_panel)
+        self.search_dock.visibilityChanged.connect(self._sync_search_button)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.search_dock)
+        self.search_dock.hide()
         self._update_controls()
 
     @staticmethod
@@ -303,6 +404,7 @@ class MainWindow(QMainWindow):
             chat_id = self._chat_ids[row]
             if chat_id != self._current_chat_id:
                 self._clear_editing()
+                self._set_historical_leaf(None)
             self._current_chat_id = chat_id
             self._selected_message = None
             if self._window_id is not None:
@@ -321,9 +423,302 @@ class MainWindow(QMainWindow):
         self.rail.set_collapsed(not self.rail.collapsed)
         self._schedule(self._save_workspace())
 
+    def _open_global_search(self, _checked: bool = False) -> None:
+        self.search_panel.scope_combo.setCurrentIndex(
+            self.search_panel.scope_combo.findData("global")
+        )
+        self.search_dock.show()
+        self.search_dock.raise_()
+        self.search_panel.focus_query()
+
+    def _open_in_chat_search(self, _checked: bool = False) -> None:
+        if self._current_chat_id is None:
+            self.statusBar().showMessage("Select a chat before searching within it")
+            return
+        self.search_panel.set_in_chat_scope()
+        self.search_dock.show()
+        self.search_dock.raise_()
+        self.search_panel.focus_query()
+
+    def _toggle_search(self, visible: bool) -> None:
+        self.search_dock.setVisible(visible)
+        if visible:
+            self.search_panel.set_current_chat_available(self._current_chat_id is not None)
+            self.search_panel.focus_query()
+            self._schedule(self._refresh_search_status())
+
+    def _sync_search_button(self, visible: bool) -> None:
+        if self.top_bar.search_button.isChecked() != visible:
+            self.top_bar.search_button.blockSignals(True)
+            self.top_bar.search_button.setChecked(visible)
+            self.top_bar.search_button.blockSignals(False)
+        if visible:
+            self.search_panel.set_current_chat_available(self._current_chat_id is not None)
+
+    async def _refresh_search_status(self) -> None:
+        try:
+            status = await self._application.search_status()
+        except SearchError as exc:
+            self._show_search_error(exc)
+            return
+        except Exception as exc:
+            self.search_panel.show_error("ERROR", str(exc))
+            return
+        self.search_panel.show_status(status)
+
+    def _on_search_requested(self, payload: object) -> None:
+        if isinstance(payload, dict):
+            self._schedule(self._run_search(payload, append=False))
+
+    def _on_load_more_search(self) -> None:
+        if (
+            not self._search_busy
+            and self._last_search_query is not None
+            and self._last_search_filters is not None
+            and self._next_search_cursor is not None
+        ):
+            self._schedule(self._load_more_search())
+
+    async def _run_search(self, payload: dict[str, object], *, append: bool) -> None:
+        if self._search_busy:
+            return
+        query = str(payload.get("query", ""))
+        chat_id = self._current_chat_id if payload.get("scope") == "chat" else None
+        if payload.get("scope") == "chat" and chat_id is None:
+            self.search_panel.show_error("INVALID QUERY", "Select a chat for in-chat search")
+            return
+        try:
+            filters = SearchFilters(
+                chat_id=chat_id,
+                document_kinds=tuple(
+                    SearchDocumentKind(str(value))
+                    for value in payload.get("document_kinds", ())
+                ),
+                roles=(MessageRole(str(payload["role"])),) if payload.get("role") else (),
+                message_states=(
+                    MessageState(str(payload["message_state"])),
+                )
+                if payload.get("message_state")
+                else (),
+                backend_ids=(),
+                provider_ids=(),
+                models=(),
+                connection_ids=(),
+                model_entry_ids=(),
+                active_branch_only=bool(payload.get("active_branch_only", False)),
+                include_archived=bool(payload.get("include_archived", False)),
+                after=None,
+                before=None,
+            )
+        except (TypeError, ValueError) as exc:
+            self.search_panel.show_error("INVALID QUERY", str(exc))
+            return
+        self._search_busy = True
+        self.search_panel.set_busy(True)
+        try:
+            page = await self._application.search(
+                query,
+                filters=filters,
+                limit=50,
+                cursor=self._next_search_cursor if append else None,
+            )
+        except SearchError as exc:
+            self._show_search_error(exc)
+            return
+        except Exception as exc:
+            self.search_panel.show_error("ERROR", str(exc))
+            return
+        finally:
+            self._search_busy = False
+            self.search_panel.set_busy(False)
+        self._last_search_query = query
+        self._last_search_filters = filters
+        self._next_search_cursor = page.next_cursor
+        self.search_panel.show_page(page, append=append)
+
+    async def _load_more_search(self) -> None:
+        query = self._last_search_query
+        filters = self._last_search_filters
+        cursor = self._next_search_cursor
+        if query is None or filters is None or cursor is None or self._search_busy:
+            return
+        self._search_busy = True
+        self.search_panel.set_busy(True)
+        try:
+            page = await self._application.search(
+                query,
+                filters=filters,
+                limit=50,
+                cursor=cursor,
+            )
+        except SearchError as exc:
+            self._show_search_error(exc)
+            return
+        except Exception as exc:
+            self.search_panel.show_error("ERROR", str(exc))
+            return
+        finally:
+            self._search_busy = False
+            self.search_panel.set_busy(False)
+        self._next_search_cursor = page.next_cursor
+        self.search_panel.show_page(page, append=True)
+
+    def _on_search_result_requested(self, result: object, location_index: int) -> None:
+        if isinstance(result, SearchResult):
+            self._schedule(self._navigate_search_result(result, location_index))
+
+    async def _navigate_search_result(
+        self,
+        result: SearchResult,
+        location_index: int,
+    ) -> None:
+        try:
+            navigation = await self._application.resolve_search_result(
+                result,
+                location_index=location_index,
+            )
+        except SearchError as exc:
+            self._show_search_error(exc, clear_results=False)
+            return
+        except Exception as exc:
+            self.search_panel.show_error("ERROR", str(exc), clear_results=False)
+            return
+
+        chat_id = navigation.chat.id
+        if chat_id not in self._chat_ids:
+            chats = await self._application.list_chats()
+            self._replace_chat_list(chats)
+        if chat_id not in self._chat_ids:
+            self.search_panel.show_error(
+                "GONE",
+                "The result chat no longer exists",
+                clear_results=False,
+            )
+            return
+        self._clear_editing()
+        self._current_chat_id = chat_id
+        self.rail.chat_list.blockSignals(True)
+        try:
+            self._select_chat_row(chat_id)
+        finally:
+            self.rail.chat_list.blockSignals(False)
+        if self._window_id is not None:
+            self._workspace.set_selected_chat(self._window_id, chat_id)
+        self.rail.set_activity(self._activity, chat_id)
+        self._set_historical_leaf(navigation.historical_leaf_message_id)
+        self._render_transcript_projection(
+            navigation.chat,
+            navigation.messages,
+            focus_message_id=navigation.focus_message_id,
+        )
+        if navigation.focus_message_id is not None and not self.transcript.focus_message(
+            navigation.focus_message_id
+        ):
+            self.search_panel.show_error(
+                "GONE",
+                "The exact message is no longer present",
+                clear_results=False,
+            )
+            return
+        await self._save_workspace()
+
+    def _show_search_error(self, error: SearchError, *, clear_results: bool = True) -> None:
+        if isinstance(error, SearchCursorStale):
+            self._next_search_cursor = None
+            self.search_panel.show_pagination_error(str(error))
+            self.statusBar().showMessage(f"Search pagination expired: {error}")
+            return
+        if isinstance(error, SearchResultGone):
+            condition = "GONE"
+        elif isinstance(error, SearchUnavailable):
+            condition = "UNAVAILABLE"
+        elif isinstance(error, SearchRebuilding):
+            condition = "REBUILDING"
+        elif isinstance(error, SearchStaleIndex):
+            condition = "STALE"
+        elif isinstance(error, SearchIndexInvalid):
+            condition = "INVALID"
+        elif isinstance(error, SearchInvalidQuery):
+            condition = "INVALID QUERY"
+        else:
+            condition = "SEARCH ERROR"
+        self.search_panel.show_error(condition, str(error), clear_results=clear_results)
+        self.statusBar().showMessage(f"Search {condition.lower()}: {error}")
+
+    def _on_rebuild_search(self) -> None:
+        if not self._search_busy:
+            self._schedule(self._rebuild_search())
+
+    async def _rebuild_search(self) -> None:
+        self._search_busy = True
+        self.search_panel.set_busy(True)
+        self.search_panel.show_error("REBUILDING", "Rebuilding the derived search index")
+        await asyncio.sleep(0)
+        try:
+            status = await self._application.rebuild_search_index()
+        except SearchError as exc:
+            self._show_search_error(exc)
+            return
+        except Exception as exc:
+            self.search_panel.show_error("ERROR", str(exc))
+            return
+        finally:
+            self._search_busy = False
+            self.search_panel.set_busy(False)
+        self._last_search_query = None
+        self._last_search_filters = None
+        self._next_search_cursor = None
+        self.search_panel.results.clear()
+        self.search_panel.load_more_button.setVisible(False)
+        self.search_panel.show_status(status)
+
     def _on_new_chat(self) -> None:
         self._clear_editing()
+        self._set_historical_leaf(None)
         self._schedule(self._create_chat())
+
+    def _on_archive_chat(self) -> None:
+        if self._current_chat_id is not None:
+            self._schedule(self._toggle_current_chat_archive())
+
+    async def _toggle_current_chat_archive(self) -> None:
+        chat = self._current_chat
+        if chat is None or chat.id != self._current_chat_id:
+            return
+        try:
+            if chat.archived_at is None:
+                updated = await self._application.archive_chat(chat.id)
+                message = "Chat archived"
+            else:
+                updated = await self._application.unarchive_chat(chat.id)
+                message = "Chat unarchived"
+        except Exception as exc:
+            self.statusBar().showMessage(str(exc))
+            return
+        self._current_chat = updated
+        self._sync_chat_header(updated)
+        chats = await self._application.list_chats()
+        self._replace_chat_list(chats)
+        self.statusBar().showMessage(message, 2500)
+
+    def _on_return_active_branch(self) -> None:
+        if self._current_chat_id is None:
+            return
+        self._set_historical_leaf(None)
+        self._schedule(self._refresh_transcript(self._current_chat_id))
+
+    def _set_historical_leaf(self, message_id: str | None) -> None:
+        self._historical_leaf_message_id = message_id
+        historical = message_id is not None
+        self.historical_banner.setVisible(historical)
+        if historical:
+            self._clear_editing()
+        for row in self.transcript.message_rows.values():
+            row.set_historical_view(
+                historical,
+                exact_result=row.message.id == message_id,
+            )
+        self._update_controls()
 
     async def _create_chat(self) -> None:
         chat = await self._application.create_chat()
@@ -799,7 +1194,11 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(str(exc))
 
     def _on_attach_file(self) -> None:
-        if self._generation_busy or self._current_chat_id is None:
+        if (
+            self._generation_busy
+            or self._historical_leaf_message_id is not None
+            or self._current_chat_id is None
+        ):
             return
         path, _filter = QFileDialog.getOpenFileName(
             self,
@@ -812,7 +1211,7 @@ class MainWindow(QMainWindow):
 
     async def _attach_file(self, path: str) -> None:
         chat_id = self._current_chat_id
-        if chat_id is None:
+        if chat_id is None or self._historical_leaf_message_id is not None:
             return
         try:
             attachment = await self._application.attach_file(path)
@@ -843,7 +1242,11 @@ class MainWindow(QMainWindow):
         self._schedule(self._send_message())
 
     async def _send_message(self) -> None:
-        if self._generation_busy or self._current_chat_id is None:
+        if (
+            self._generation_busy
+            or self._historical_leaf_message_id is not None
+            or self._current_chat_id is None
+        ):
             return
         text = self.composer.toPlainText()
         if not text.strip():
@@ -905,6 +1308,7 @@ class MainWindow(QMainWindow):
     def _on_edit_message(self, message: Message) -> None:
         if (
             self._generation_busy
+            or self._historical_leaf_message_id is not None
             or self._current_chat_id != message.chat_id
             or message.role is not MessageRole.USER
             or message.state.value != "sent"
@@ -927,6 +1331,9 @@ class MainWindow(QMainWindow):
         self._update_controls()
 
     def _valid_edit_target(self, chat_id: str) -> str | None:
+        if self._historical_leaf_message_id is not None:
+            self._clear_editing()
+            return None
         message_id = self._editing_message_id
         if message_id is None:
             return None
@@ -948,11 +1355,14 @@ class MainWindow(QMainWindow):
         return message_id
 
     def _on_regenerate_message(self, message: Message) -> None:
-        if self._current_chat_id is not None:
+        if (
+            self._current_chat_id is not None
+            and self._historical_leaf_message_id is None
+        ):
             self._schedule(self._regenerate_message(message))
 
     async def _regenerate_message(self, message: Message) -> None:
-        if self._current_chat_id is None:
+        if self._current_chat_id is None or self._historical_leaf_message_id is not None:
             return
         chat_id = self._current_chat_id
         self._set_generation_busy(True)
@@ -980,23 +1390,38 @@ class MainWindow(QMainWindow):
 
     def _set_generation_busy(self, busy: bool) -> None:
         self._generation_busy = busy
+        historical = self._historical_leaf_message_id is not None
         self.generation_indicator.setVisible(busy)
-        self.composer.setReadOnly(busy)
+        self.composer.setReadOnly(busy or historical)
         self.chat_list.setEnabled(True)
         self.new_chat_button.setEnabled(True)
-        self.send_button.setEnabled(not busy and bool(self.composer.toPlainText().strip()))
-        self.attachment_button.setEnabled(not busy and self._current_chat_id is not None)
+        self.send_button.setEnabled(
+            not busy and not historical and bool(self.composer.toPlainText().strip())
+        )
+        self.attachment_button.setEnabled(
+            not busy and not historical and self._current_chat_id is not None
+        )
         self.cancel_button.setEnabled(busy and self._active_attempt_id is not None)
         self.rail.chat_button.setEnabled(True)
         for row in self.transcript.message_rows.values():
             row.set_generation_busy(busy)
 
     def _update_controls(self) -> None:
+        historical = self._historical_leaf_message_id is not None
+        self.composer.setReadOnly(self._generation_busy or historical)
         self.send_button.setEnabled(
-            not self._generation_busy and bool(self.composer.toPlainText().strip())
+            not self._generation_busy
+            and not historical
+            and bool(self.composer.toPlainText().strip())
         )
-        self.attachment_button.setEnabled(not self._generation_busy and self._current_chat_id is not None)
+        self.attachment_button.setEnabled(
+            not self._generation_busy
+            and not historical
+            and self._current_chat_id is not None
+        )
         self.cancel_button.setEnabled(self._generation_busy and self._active_attempt_id is not None)
+        self.archive_button.setEnabled(self._current_chat_id is not None)
+        self.search_panel.set_current_chat_available(self._current_chat_id is not None)
 
     def _on_event(self, event: CoreEvent) -> None:
         if not self._workspace_attached:
@@ -1047,9 +1472,15 @@ class MainWindow(QMainWindow):
 
     async def _handle_event(self, event: CoreEvent) -> None:
         chat_id = event.payload.get("chat_id")
-        if event.kind == "chat_created":
+        if event.kind in {"chat_created", "chat_archived", "chat_unarchived"}:
             chats = await self._application.list_chats()
             self._replace_chat_list(chats)
+            if chat_id == self._current_chat_id:
+                self._current_chat = next(
+                    (chat for chat in chats if chat.id == self._current_chat_id),
+                    self._current_chat,
+                )
+                self._sync_chat_header(self._current_chat)
         if event.kind == "pending_attachments_changed" and chat_id == self._current_chat_id:
             await self._refresh_pending_attachment_button(self._current_chat_id)
         if event.kind in {
@@ -1069,34 +1500,71 @@ class MainWindow(QMainWindow):
             await self._refresh_phase5_state()
         if chat_id == self._current_chat_id:
             await self._refresh_transcript(self._current_chat_id)
+        if event.kind in _SEARCH_SOURCE_EVENT_KINDS and self.search_dock.isVisible():
+            await self._refresh_search_status()
 
     async def _refresh_transcript(self, chat_id: str) -> None:
         self._refresh_generation += 1
         generation = self._refresh_generation
         try:
-            chat, messages = await self._application.open_chat(chat_id)
+            if self._historical_leaf_message_id is None:
+                chat, messages = await self._application.open_chat(chat_id)
+            else:
+                chat, messages = await self._application.open_chat(
+                    chat_id,
+                    head_message_id=self._historical_leaf_message_id,
+                )
         except Exception:
             return
         if generation != self._refresh_generation or chat_id != self._current_chat_id:
             return
+        self._render_transcript_projection(chat, messages)
+        if self.inspector_dock.isVisible():
+            await self._refresh_inspector()
+
+    def _render_transcript_projection(
+        self,
+        chat: Chat,
+        messages: tuple[Message, ...] | list[Message],
+        *,
+        focus_message_id: str | None = None,
+    ) -> None:
         self._current_chat = chat
         self._current_messages = tuple(messages)
-        if chat is not None:
-            self.chat_title.setText(chat.title)
-        self.transcript.render(messages, self._generation_busy)
+        self._sync_chat_header(chat)
+        self.transcript.render(
+            messages,
+            self._generation_busy,
+            historical_leaf_message_id=self._historical_leaf_message_id,
+        )
         for row in self.transcript.message_rows.values():
             row.copy_requested.connect(self._on_copy_message)
             row.edit_requested.connect(self._on_edit_message)
             row.inspect_requested.connect(self._on_inspect_message)
             row.regenerate_requested.connect(self._on_regenerate_message)
+        if focus_message_id is not None:
+            self.transcript.focus_message(focus_message_id)
         if self._selected_message is not None:
             self._selected_message = next(
                 (message for message in self._current_messages if message.id == self._selected_message.id),
                 None,
             )
         self._update_controls()
-        if self.inspector_dock.isVisible():
-            await self._refresh_inspector()
+
+    def _sync_chat_header(self, chat: Chat | None) -> None:
+        if chat is None:
+            self.chat_title.setText("New chat")
+            self.archived_badge.setVisible(False)
+            self.archive_button.setText("Archive")
+            self.archive_button.setToolTip("Archive this chat")
+            return
+        self.chat_title.setText(chat.title)
+        archived = chat.archived_at is not None
+        self.archived_badge.setVisible(archived)
+        self.archive_button.setText("Unarchive" if archived else "Archive")
+        self.archive_button.setToolTip(
+            "Return this chat to active status" if archived else "Archive this chat"
+        )
 
     async def _save_workspace(self) -> None:
         if self._window_id is None:

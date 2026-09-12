@@ -28,6 +28,58 @@ chats = Table(
     Column("updated_at", String(40), nullable=False),
     Column("head_message_id", String(64), ForeignKey("messages.id", ondelete="SET NULL")),
     Column("revision", Integer, nullable=False, default=0),
+    Column("archived_at", Text),
+)
+
+# Phase 7 authoritative coordination metadata.  Search rows below are derived;
+# this singleton is not.
+search_source_state = Table(
+    "search_source_state",
+    metadata,
+    Column("singleton_id", Integer, primary_key=True),
+    Column("source_revision", Integer, nullable=False),
+    CheckConstraint("singleton_id = 1", name="ck_search_source_singleton"),
+    CheckConstraint("source_revision >= 0", name="ck_search_source_revision"),
+)
+
+search_index_state = Table(
+    "search_index_state",
+    metadata,
+    Column("singleton_id", Integer, primary_key=True),
+    Column("condition", String(16), nullable=False),
+    Column("checkpoint_revision", Integer, nullable=False),
+    Column("generation", Integer, nullable=False),
+    Column("schema_version", Integer, nullable=False),
+    Column("tokenizer_version", String(64), nullable=False),
+    Column("detail", Text),
+    Column("updated_at", String(40), nullable=False),
+    CheckConstraint("singleton_id = 1", name="ck_search_index_singleton"),
+    CheckConstraint(
+        "condition IN ('VALID', 'REBUILDING', 'INVALID')",
+        name="ck_search_index_condition",
+    ),
+    CheckConstraint("checkpoint_revision >= 0", name="ck_search_checkpoint_revision"),
+    CheckConstraint("generation >= 0", name="ck_search_generation"),
+    CheckConstraint("schema_version = 1", name="ck_search_schema_version"),
+    CheckConstraint(
+        "tokenizer_version = 'unicode61-v1'",
+        name="ck_search_tokenizer_version",
+    ),
+)
+
+search_document_keys = Table(
+    "search_document_keys",
+    metadata,
+    Column("fts_rowid", Integer, primary_key=True),
+    Column("document_kind", String(16), nullable=False),
+    Column("document_id", String(64), nullable=False),
+    CheckConstraint(
+        "document_kind IN ('chat', 'message', 'attachment')",
+        name="ck_search_document_kind",
+    ),
+    UniqueConstraint(
+        "document_kind", "document_id", name="ux_search_document_identity"
+    ),
 )
 
 messages = Table(

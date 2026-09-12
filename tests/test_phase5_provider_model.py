@@ -51,6 +51,7 @@ from bots5.infrastructure.generation.fake import FakeStreamingBackend
 from bots5.infrastructure.persistence import migration_runner
 from tests._authority_test_support import (
     SQLiteAppStateStore,
+    phase7_guarded_raw_mutation,
     upgrade_database,
     upgrade_to as authority_upgrade_to,
 )
@@ -126,7 +127,7 @@ def test_fresh_phase5_seed_and_pre_phase5_chat_selection_required(tmp_path: Path
         assert models[0].provider_model_id == "fake-v0.1"
         assert store.get_chat_model_selection("old") is None
         with _engine_connection(store) as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0009_phase6_context_attachments"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0010_phase7_search_navigation"
     finally:
         store.close()
 
@@ -2631,15 +2632,19 @@ def test_phase5_attribution_cannot_be_added_to_legacy_attempt(tmp_path: Path):
     upgrade_database(database)
     with sqlite3.connect(database) as connection:
         with pytest.raises(sqlite3.IntegrityError, match="Phase 5 attempt attribution"):
-            connection.execute(
-                "UPDATE generation_attempts SET connection_id = ?, model_entry_id = ? "
-                "WHERE id = ?",
-                (
-                    "01900000-0000-7000-8000-000000000005",
-                    "01900000-0000-7000-8000-000000000006",
-                    "legacy-attempt",
-                ),
-            )
+            with phase7_guarded_raw_mutation(
+                connection,
+                "legacy-attribution rejection fixture",
+            ):
+                connection.execute(
+                    "UPDATE generation_attempts SET connection_id = ?, model_entry_id = ? "
+                    "WHERE id = ?",
+                    (
+                        "01900000-0000-7000-8000-000000000005",
+                        "01900000-0000-7000-8000-000000000006",
+                        "legacy-attempt",
+                    ),
+                )
         assert connection.execute(
             "SELECT connection_id, model_entry_id FROM generation_attempts WHERE id = ?",
             ("legacy-attempt",),

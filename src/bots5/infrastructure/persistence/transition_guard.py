@@ -28,6 +28,10 @@ def install_transition_guard(dbapi_connection: Any, connection_record: Any | Non
         "phase5_catalogue_refresh": None,
         "phase6": None,
         "phase6_consumed": False,
+        "phase7_source": None,
+        "phase7_expected_source_revision": None,
+        "phase7_consumed": False,
+        "phase7_source_updated": False,
     }
 
     def consume_phase6(expected: tuple[object, ...]) -> int:
@@ -240,6 +244,60 @@ def install_transition_guard(dbapi_connection: Any, connection_record: Any | Non
         1,
         lambda attachment_id: consume_phase6(("attachment-delete", attachment_id)),
     )
+    dbapi_connection.create_function(
+        "bots5_phase7_source_mutation_allowed",
+        0,
+        lambda: int(state["phase7_source"] is not None),
+    )
+
+    def phase7_source_revision_update_allowed(
+        old_singleton_id: object,
+        new_singleton_id: object,
+        old_revision: object,
+        new_revision: object,
+    ) -> int:
+        expected = state["phase7_expected_source_revision"]
+        if (
+            state["phase7_source"] is None
+            or type(expected) is not int
+            or type(old_singleton_id) is not int
+            or type(new_singleton_id) is not int
+            or old_singleton_id != 1
+            or new_singleton_id != 1
+            or type(old_revision) is not int
+            or type(new_revision) is not int
+            or not state["phase7_consumed"]
+        ):
+            return 0
+        if not state["phase7_source_updated"]:
+            if old_revision != expected or new_revision != expected + 1:
+                return 0
+            state["phase7_source_updated"] = True
+            return 1
+        # One authoritative transaction may touch several search-visible rows.
+        # Later business triggers execute a guarded no-op after the first one
+        # has consumed the transaction's single revision increment.
+        return int(old_revision == new_revision == expected + 1)
+
+    dbapi_connection.create_function(
+        "bots5_phase7_source_revision_update_allowed",
+        4,
+        phase7_source_revision_update_allowed,
+    )
+
+    def consume_phase7_source_revision() -> int:
+        if state["phase7_source"] is None:
+            return 0
+        if state["phase7_consumed"]:
+            return 0
+        state["phase7_consumed"] = True
+        return 1
+
+    dbapi_connection.create_function(
+        "bots5_phase7_consume_source_revision",
+        0,
+        consume_phase7_source_revision,
+    )
     if connection_record is not None:
         connection_record.info[_STATE_KEY] = state
 
@@ -334,6 +392,64 @@ def clear_phase6(connection: Any) -> None:
     if state is not None:
         state["phase6"] = None
         state["phase6_consumed"] = False
+
+
+def arm_phase7_source_mutation(
+    connection: Any,
+    operation: str,
+    *,
+    expected_revision: int | None = None,
+) -> None:
+    """Authorize one search-visible authoritative transaction.
+
+    Phase 7 triggers consume the arm at most once no matter how many relevant
+    rows the transaction changes.  Callers must clear the arm on both commit
+    and rollback paths so pooled connections cannot inherit authority.
+    """
+    state = connection.info.get(_STATE_KEY)
+    if state is None:
+        raise RuntimeError("SQLite transition guard is not installed")
+    if state["phase7_source"] is not None:
+        raise RuntimeError("SQLite Phase 7 source mutation is already armed")
+    if expected_revision is None:
+        expected_revision = connection.exec_driver_sql(
+            "SELECT source_revision FROM search_source_state WHERE singleton_id=1"
+        ).scalar_one()
+    if type(expected_revision) is not int or expected_revision < 0:
+        raise RuntimeError("SQLite Phase 7 source revision is malformed")
+    state["phase7_source"] = operation
+    state["phase7_expected_source_revision"] = expected_revision
+    state["phase7_consumed"] = False
+    state["phase7_source_updated"] = False
+
+
+def require_phase7_consumed(connection: Any) -> int:
+    state = connection.info.get(_STATE_KEY)
+    if (
+        state is None
+        or not state["phase7_consumed"]
+        or not state["phase7_source_updated"]
+        or type(state["phase7_expected_source_revision"]) is not int
+    ):
+        raise RuntimeError("SQLite Phase 7 source arm was not consumed")
+    revision = connection.exec_driver_sql(
+        "SELECT source_revision FROM search_source_state WHERE singleton_id=1"
+    ).scalar_one()
+    if (
+        type(revision) is not int
+        or revision != state["phase7_expected_source_revision"] + 1
+    ):
+        raise RuntimeError("SQLite Phase 7 source revision is malformed")
+    return revision
+
+
+def clear_phase7_source_mutation(connection: Any) -> None:
+    state = connection.info.get(_STATE_KEY)
+    if state is not None:
+        state["phase7_source"] = None
+        state["phase7_expected_source_revision"] = None
+        state["phase7_consumed"] = False
+        state["phase7_source_updated"] = False
 
 
 def arm_phase5_connection_identity_update(

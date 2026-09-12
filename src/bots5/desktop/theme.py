@@ -35,6 +35,25 @@ QLabel#chatTitle {
     font-weight: 600;
     padding: 3px 4px;
 }
+QLabel#archivedBadge, QLabel#historicalBadge {
+    background: #4a3520;
+    border: 1px solid #9a6b32;
+    border-radius: 8px;
+    color: #ffd79a;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 7px;
+}
+QFrame#historicalBanner {
+    background: #2a263c;
+    border: 1px solid #6d5fa0;
+    border-radius: 7px;
+}
+QLabel#historicalViewLabel {
+    color: #d7cdfd;
+    font-size: 11px;
+    font-weight: 600;
+}
 QToolButton, QPushButton {
     background: transparent;
     border: 1px solid transparent;
@@ -122,6 +141,10 @@ QFrame#messageBubble[generationActive="true"] {
     background: #1c3b52;
     border-color: #3b9ddd;
 }
+QFrame#messageBubble[searchFocus="true"] {
+    border: 2px solid #70c7ff;
+    background: #213c4e;
+}
 QLabel#assistantAvatar, QLabel#userAvatar {
     border-radius: 8px;
     font-size: 12px;
@@ -185,6 +208,44 @@ QLabel#inspectorValue {
 QLabel#emptyTranscript {
     color: #6f7e8a;
     padding: 36px;
+}
+QWidget#searchPanel {
+    background: #171d24;
+}
+QLabel#searchTitle {
+    color: #f2f7fb;
+    font-size: 15px;
+    font-weight: 700;
+}
+QLineEdit#searchQuery, QComboBox#searchScope, QComboBox#searchRole,
+QComboBox#searchState, QListWidget#searchResults {
+    background: #11161b;
+    border: 1px solid #33424e;
+    border-radius: 6px;
+    color: #dce6ed;
+    padding: 5px;
+}
+QListWidget#searchResults::item {
+    border-bottom: 1px solid #29343f;
+    padding: 8px 5px;
+}
+QListWidget#searchResults::item:selected {
+    background: #1a3b52;
+}
+QLabel#searchStatus {
+    color: #aab8c4;
+    font-size: 11px;
+    padding: 4px;
+}
+QLabel#searchStatus[condition="STALE"],
+QLabel#searchStatus[condition="REBUILDING"],
+QLabel#searchStatus[condition="GONE"] {
+    color: #ffd79a;
+}
+QLabel#searchStatus[condition="UNAVAILABLE"],
+QLabel#searchStatus[condition="INVALID"],
+QLabel#searchStatus[condition="ERROR"] {
+    color: #f2aeb9;
 }
 """
 

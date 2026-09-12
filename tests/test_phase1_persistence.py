@@ -38,11 +38,20 @@ def test_real_migration_creates_state_schema_and_enables_sqlite_safety(tmp_path:
                 "attempt_attachments",
                 "context_plans",
                 "workspace_windows",
+                "search_source_state",
+                "search_index_state",
+                "search_document_keys",
+                "search_fts",
+                "search_fts_config",
+                "search_fts_content",
+                "search_fts_data",
+                "search_fts_docsize",
+                "search_fts_idx",
             }
             with store.engine.connect() as connection:
                 assert connection.execute(text("PRAGMA foreign_keys")).scalar_one() == 1
                 assert connection.execute(text("PRAGMA journal_mode")).scalar_one().lower() == "delete"
-                assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0009_phase6_context_attachments"
+                assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0010_phase7_search_navigation"
 
         now = datetime.now(timezone.utc)
         chat = Chat(str(uuid4()), "Test", now, now)

@@ -38,6 +38,7 @@ class Chat:
     updated_at: datetime
     head_message_id: str | None = None
     revision: int = 0
+    archived_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.revision < 0:

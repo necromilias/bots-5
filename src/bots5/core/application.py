@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import asynccontextmanager, contextmanager, nullcontext
+from contextvars import Context
 from dataclasses import dataclass, replace
 from enum import Enum
 from functools import wraps
@@ -26,6 +27,13 @@ from bots5.domain.provider import (
     CapabilitySource,
     CapabilityState,
     CatalogueRefreshFailureClass,
+)
+from bots5.domain.search import (
+    SearchFilters,
+    SearchNavigation,
+    SearchPage,
+    SearchResult,
+    SearchStatus,
 )
 from bots5.errors import ProviderError
 
@@ -434,6 +442,30 @@ class BotsApplication:
         return chat
 
     @_tracked_command
+    async def archive_chat(self, chat_id: str) -> Chat:
+        self._ensure_open()
+        chat = self._store.archive_chat(chat_id, self._clock.now())
+        await self._events.publish(
+            "chat_archived",
+            chat_id=chat.id,
+            archived_at=chat.archived_at,
+        )
+        self._ensure_open()
+        return chat
+
+    @_tracked_command
+    async def unarchive_chat(self, chat_id: str) -> Chat:
+        self._ensure_open()
+        chat = self._store.archive_chat(chat_id, None)
+        await self._events.publish(
+            "chat_unarchived",
+            chat_id=chat.id,
+            archived_at=None,
+        )
+        self._ensure_open()
+        return chat
+
+    @_tracked_command
     async def list_chats(self) -> tuple[Chat, ...]:
         self._ensure_open()
         return self._store.list_chats()
@@ -464,6 +496,96 @@ class BotsApplication:
         if self._store.get_chat(chat_id) is None:
             raise StateError(f"chat not found: {chat_id}")
         return self._store.list_revisions(chat_id, lineage_id)
+
+    @_tracked_command
+    async def search_status(self) -> SearchStatus:
+        self._ensure_open()
+        return self._store.search_status()
+
+    @_tracked_command
+    async def search(
+        self,
+        query: str,
+        *,
+        filters: SearchFilters = SearchFilters(),
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> SearchPage:
+        self._ensure_open()
+        return self._store.search(
+            query,
+            filters=filters,
+            limit=limit,
+            cursor=cursor,
+        )
+
+    @_tracked_command
+    async def rebuild_search_index(self) -> SearchStatus:
+        self._ensure_open()
+        loop = asyncio.get_running_loop()
+        # ``run_in_executor`` does not copy the caller's contextvars. The
+        # synchronous store operation therefore acquires its own callee-owned
+        # DataRootAuthority grant. Cancellation is deferred until both that
+        # forward effect and its completion event have settled, so the worker
+        # can never outlive its owning application command.
+        worker = loop.run_in_executor(None, self._store.rebuild_search_index)
+        cancellation: asyncio.CancelledError | None = None
+        owner = asyncio.current_task()
+
+        async def settle_without_detaching(future) -> None:
+            nonlocal cancellation
+            completed = asyncio.Event()
+            future.add_done_callback(lambda _future: completed.set())
+            while not future.done():
+                try:
+                    await completed.wait()
+                except asyncio.CancelledError as exc:
+                    cancellation = exc
+                    if owner is not None:
+                        owner.uncancel()
+
+        await settle_without_detaching(worker)
+        status = worker.result()
+        # A child task inherits context variables unless given an explicit
+        # context.  Inheriting this command's executor-owned authority grant
+        # would correctly be rejected when EventBus opens its child-task
+        # admission scope.  Start publication with no inherited grants; the
+        # bus acquires its own grant while this command continues to own and
+        # await the forward effect.
+        publication = asyncio.create_task(
+            self._events.publish(
+                "search_index_rebuilt",
+                condition=status.condition.value,
+                source_revision=status.source_revision,
+                checkpoint_revision=status.checkpoint_revision,
+                generation=status.generation,
+            ),
+            context=Context(),
+        )
+        await settle_without_detaching(publication)
+        publication.result()
+        self._ensure_open()
+        if cancellation is not None:
+            raise cancellation
+        return status
+
+    @_tracked_command
+    async def diagnose_search_index(self) -> SearchStatus:
+        self._ensure_open()
+        return self._store.diagnose_search_index()
+
+    @_tracked_command
+    async def resolve_search_result(
+        self,
+        result: SearchResult,
+        *,
+        location_index: int = 0,
+    ) -> SearchNavigation:
+        self._ensure_open()
+        return self._store.resolve_search_result(
+            result,
+            location_index=location_index,
+        )
 
     @_tracked_command
     async def list_generation_attempts(self, chat_id: str) -> tuple[GenerationAttempt, ...]:

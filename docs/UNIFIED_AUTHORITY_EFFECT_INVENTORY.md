@@ -126,6 +126,31 @@ never rewrites the candidate. Required result:
 | B1 parent release before child drain | Killed; the connection-first oracle observes the retained cursor still live when the mutated parent releases. |
 | B1 child-cursor tracking removed | Killed; the direct ownership-ledger assertion observes that the parent does not retain its live child. |
 
+## Uncommitted Phase 7 participation delta
+
+This section describes the uncommitted Phase 7 implementation candidate; it does
+not rewrite the landed Phase 6 inventory or closure disposition.
+
+- Public application search status/query/rebuild/diagnostic/navigation and
+  archive/unarchive surfaces enter the existing tracked command admission.
+- The corresponding public SQLite store methods are members of
+  `_SQLITE_OPERATION_METHODS` and therefore acquire or join the existing callee-owned
+  logical grant. No second authority system exists.
+- Authoritative search-visible writes execute under the existing transition gate.
+  Their business mutation and one `search_source_state.source_revision` increment
+  commit in the same SQLite transaction.
+- Receipt draining and rebuild are forward derived effects under the existing
+  transition gate. Rebuild is awaited, writer-serialized, and has no detached task,
+  destructor, or garbage-collection correctness dependency.
+- Clean derived logical failure leaves authoritative business success intact.
+  Unknown commit, rollback, physical close, native, or verified-attachment outcomes
+  continue through the Phase 6 fail-closed paths.
+- Revoked grants cannot start or continue forward indexing. Invalidated teardown
+  remains release-only and cannot open a fresh database session.
+- Search-result navigation is a bounded read projection. Historical navigation uses
+  the selected message as a temporary presentation leaf and never mutates
+  `chats.head_message_id`.
+
 ## Explicit sibling-path search result
 
 The audit searched direct terminal assignments, raw engine/DBAPI creation, caller-only wrappers,
