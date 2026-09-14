@@ -6,7 +6,7 @@ This repository now contains two related but distinct surfaces:
 
 1. the closed manifest-driven campaign harness (V0/V0.2); and
 2. the native Linux desktop product, implemented and landed through Linux v0.1
-   Phase 6 with an uncommitted Phase 7 implementation candidate.
+   Phase 7; Phase 8 inspection/provenance UX is current.
 
 Do not apply old V0 non-goals to the desktop product without checking `LINUX_V0_1_DESIGN.md` and the
 current roadmap.
@@ -93,7 +93,10 @@ QT_QPA_PLATFORM=offscreen PYTHONPATH=src .venv314/bin/python -m pytest -q \
 ```
 
 This deterministic gate has no provider, credential, network, semantic-search, or
-Phase 8 dependency. The complete repository suite remains a separate pre-commit
+Phase 8 is the current implementation phase. Phase 7 was accepted, committed, and
+pushed at `6ccdaf01ce880cf5f00fca55209c2a99dd06c1cd`; its supplied closure was
+**1,065 passed, 1 expected provider skip, 0 failed**, with no provider/network
+activity. The complete repository suite remains a separate pre-commit
 closure gate.
 
 ## Campaign manifest schema

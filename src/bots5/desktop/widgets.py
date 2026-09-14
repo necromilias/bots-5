@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from bots5.core.inspection import InspectionProjection
 from bots5.domain.models import (
     Chat,
     ChatActivity,
@@ -1825,7 +1826,7 @@ class InspectorPanel(QWidget):
         self._layout.setLabelAlignment(Qt.AlignmentFlag.AlignTop)
         self._layout.setVerticalSpacing(8)
         self._layout.setHorizontalSpacing(10)
-        self._show_chat_context(None, None, ())
+        self._field("Selection", "No chat selected")
 
     def _clear(self) -> None:
         while self._layout.rowCount():
@@ -1841,128 +1842,9 @@ class InspectorPanel(QWidget):
         )
         self._layout.addRow(QLabel(name, self), label)
 
-    def _show_chat_context(
-        self,
-        chat: Chat | None,
-        message: Message | None,
-        attempts: Iterable[GenerationAttempt],
-        revision_count: int = 0,
-    ) -> None:
+    def show_projection(self, projection: InspectionProjection) -> None:
+        """Present a core-owned projection; no persisted-schema interpretation here."""
         self._clear()
-        if chat is None:
-            self._field("Selection", "No chat selected")
-            return
-        self._field("Chat", chat.title)
-        self._field("Chat ID", chat.id)
-        self._field("Chat revision", chat.revision)
-        self._field("Active head", chat.head_message_id or "none")
-        if message is None:
-            self._field("Message", "Select a message for details")
-            return
-        self._field("Role", message.role.value)
-        self._field("State", message.state.value)
-        self._field("Message ID", message.id)
-        self._field("Sequence", message.sequence)
-        self._field("Created", message.created_at.isoformat())
-        self._field("Parent", message.parent_id or "none")
-        self._field("Lineage", message.lineage_id or message.id)
-        self._field("Revision", f"{message.revision} of {revision_count}")
-        self._field("Supersedes", message.supersedes_id or "none")
-
-        associated = tuple(
-            attempt
-            for attempt in attempts
-            if attempt.assistant_message_id == message.id
-            or attempt.user_message_id == message.id
-        )
-        if not associated:
-            self._field("Generation", "No associated generation attempt")
-            return
-        for index, attempt in enumerate(associated, start=1):
-            prefix = f"Generation {index}"
-            self._field(f"{prefix} ID", attempt.id)
-            self._field(f"{prefix} state", attempt.state.value)
-            self._field(f"{prefix} backend", attempt.backend_id)
-            self._field(f"{prefix} provider", attempt.provider_id or "none")
-            self._field(f"{prefix} model", attempt.model)
-            phase5 = self._phase5_snapshot(attempt.request_snapshot)
-            if phase5 is not None:
-                self._field(f"{prefix} connection", f"{phase5.get('connection_name', 'unknown')} ({phase5.get('connection_id', 'unknown')})")
-                self._field(f"{prefix} model entry", phase5.get("model_entry_id", "unknown"))
-                self._field(f"{prefix} effective settings", json.dumps(phase5.get("effective_settings", {}), sort_keys=True))
-                self._field(f"{prefix} capability provenance", json.dumps(phase5.get("capability_provenance", {}), sort_keys=True))
-            self._field(f"{prefix} returned model", attempt.returned_model or "unknown")
-            self._field(f"{prefix} request ID", attempt.request_id or "unknown")
-            self._field(f"{prefix} finish", attempt.finish_reason or "unknown")
-            self._field(
-                f"{prefix} uncertainty",
-                (
-                    "not recorded"
-                    if attempt.remote_outcome_unknown is None
-                    else "unknown"
-                    if attempt.remote_outcome_unknown
-                    else "known/not marked unknown"
-                ),
-            )
-            self._field(f"{prefix} started", attempt.started_at.isoformat())
-            self._field(
-                f"{prefix} ended",
-                attempt.ended_at.isoformat() if attempt.ended_at else "running",
-            )
-            self._field(f"{prefix} error", attempt.error_message or "none")
-            self._field(
-                f"{prefix} tokens",
-                ", ".join(
-                    f"{name}={value}"
-                    for name, value in (
-                        ("prompt", attempt.prompt_tokens),
-                        ("completion", attempt.completion_tokens),
-                        ("reasoning", attempt.reasoning_tokens),
-                        ("total", attempt.total_tokens),
-                    )
-                    if value is not None
-                )
-                or "unknown",
-            )
-            self._field(
-                f"{prefix} known cost",
-                attempt.known_cost_usd if attempt.known_cost_usd is not None else "unknown",
-            )
-            self._field(f"{prefix} snapshot", self._snapshot_summary(attempt.request_snapshot))
-
-    @staticmethod
-    def _snapshot_summary(snapshot: str) -> str:
-        try:
-            parsed = json.loads(snapshot)
-        except (TypeError, ValueError):
-            return "present but not displayable"
-        if not isinstance(parsed, dict):
-            return "present but not an object"
-        fields = [
-            key
-            for key in ("backend_id", "provider_id", "connection_id", "model", "endpoint", "base_url", "prompt")
-            if key in parsed
-        ]
-        return "present; fields=" + ", ".join(fields)
-
-    @staticmethod
-    def _phase5_snapshot(snapshot: str) -> dict[str, object] | None:
-        try:
-            parsed = json.loads(snapshot)
-        except (TypeError, ValueError):
-            return None
-        if not isinstance(parsed, dict) or parsed.get("snapshot_version") != 2:
-            return None
-        return parsed
-
-    def show_chat(self, chat: Chat | None) -> None:
-        self._show_chat_context(chat, None, ())
-
-    def show_message(
-        self,
-        chat: Chat,
-        message: Message,
-        attempts: Iterable[GenerationAttempt],
-        revision_count: int,
-    ) -> None:
-        self._show_chat_context(chat, message, attempts, revision_count)
+        self._field("Inspection", projection.status)
+        for field in projection.fields:
+            self._field(field.name, field.value)

@@ -38,7 +38,8 @@ from bots5.infrastructure.rooted_sqlite_vfs import (
 
 
 _LEGACY_HEAD = "0009_phase6_context_attachments"
-_HEAD = "0010_phase7_search_navigation"
+_PHASE7_HEAD = "0010_phase7_search_navigation"
+_HEAD = "0011_phase8_inspector_state"
 _PRIOR_REVISIONS = (
     "0001_desktop_state",
     "0002_conversation_lineage",
@@ -49,8 +50,10 @@ _PRIOR_REVISIONS = (
     "0007_phase5_provider_model_configuration",
     "0008_catalogue_refresh_outcomes",
     _LEGACY_HEAD,
+    _PHASE7_HEAD,
 )
 _SUPPORTED_REVISIONS = frozenset((*_PRIOR_REVISIONS, _HEAD))
+_MIGRATION_CHAIN = (*_PRIOR_REVISIONS, _HEAD)
 _JOURNAL = "phase6-journal-v3.json"
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
 _TEMP_RE = re.compile(rf"\.phase6-journal-v3-({_UUID})-([1-9][0-9]*)\.tmp")
@@ -396,7 +399,7 @@ def _validate_record(
     target_revision = record.get("target_revision")
     if (
         record.get("journal_version") != 3
-        or target_revision not in {_LEGACY_HEAD, _HEAD}
+        or target_revision not in {_LEGACY_HEAD, _PHASE7_HEAD, _HEAD}
     ):
         raise RuntimeError("migration journal version or target is unsupported")
     source_kind = record.get("source_kind")
@@ -427,11 +430,10 @@ def _validate_record(
     if raw != _canonical_bytes(record):
         raise RuntimeError("migration journal is not canonical JSON")
     if source_kind == "EXISTING":
-        supported_sources = (
-            tuple(item for item in _PRIOR_REVISIONS if item != _LEGACY_HEAD)
-            if target_revision == _LEGACY_HEAD
-            else _PRIOR_REVISIONS
-        )
+        # A recovery journal cannot claim a source beyond its own migration
+        # target.  The canonical chain also keeps genuine historical journal
+        # recovery possible without granting newer revisions retroactively.
+        supported_sources = _MIGRATION_CHAIN[:_MIGRATION_CHAIN.index(target_revision)]
         if record.get("expected_start_revision") not in supported_sources:
             raise RuntimeError("migration journal source revision is unsupported")
         if record.get("backup_leaf") != f"migrate-{transaction_id}.backup.sqlite3":
@@ -1700,7 +1702,7 @@ def _preflight_fts5() -> None:
 
 
 def upgrade_database(*, authority: DataRootAuthority) -> None:
-    """Upgrade the authority's canonical database to the Phase 7 head."""
+    """Upgrade the authority's canonical database to the current Phase 8 head."""
     if not isinstance(authority, DataRootAuthority):
         raise TypeError("upgrade_database requires DataRootAuthority")
     authority.assert_live()
@@ -1742,8 +1744,8 @@ def upgrade_database(*, authority: DataRootAuthority) -> None:
             if target_revision == _HEAD:
                 success = True
                 return
-            # A legitimate interrupted 0009 journal has now completed and was
-            # removed.  Start a distinct 0010 transaction/journal rather than
-            # changing the target identity of the recovered record.
+            # A legitimate interrupted historical journal has now completed
+            # and was removed.  Start a distinct successor transaction rather
+            # than changing the target identity of the recovered record.
     finally:
         authority._finish_migration(success=success)

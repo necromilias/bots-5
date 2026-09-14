@@ -24,7 +24,7 @@ accepted. The build-facing contract is `docs/LINUX_V0_1_DESIGN.md`.
 
 ### Landed status
 
-Phases **1 through 6 are implemented, validated, committed, and landed on `main`**.
+Phases **1 through 7 are implemented, validated, committed, and landed on `main`**.
 
 - Phase 1: native walking skeleton, core, persistence, events, fake streaming backend.
 - Phase 2: conversation truth, immutable lineage/revisions, and deterministic fake generation.
@@ -52,13 +52,12 @@ The cumulative implementation archaeology remains in the phase implementation re
 candidate-status statements such as “unstaged”, “uncommitted”, or “not yet accepted” describe those
 historical checkpoints and do not override the current closure record.
 
-### Active closure candidate
+### Current implementation phase
 
-**Phase 7 — search and exact navigation** has an uncommitted implementation
-candidate awaiting independent external closure, the reserved complete-suite gate,
-and separate commit/push authority. The candidate remains additive to the landed
-Phase 6 authority model and is recorded in
-`LINUX_V0_1_PHASE7_IMPLEMENTATION_REPORT.md`.
+**Phase 7 — search and exact navigation** was accepted, committed, and pushed at
+`6ccdaf01ce880cf5f00fca55209c2a99dd06c1cd`. Supplied final closure evidence is
+**1,065 passed, 1 expected provider skip, 0 failed**, with no provider/network
+activity. **Phase 8 — inspection/provenance UX** is current.
 
 The accepted desktop sequence remains:
 
@@ -69,8 +68,8 @@ The accepted desktop sequence remains:
 5. Phase 4: concurrency/workspace;
 6. Phase 5: provider/model usability;
 7. Phase 6: context and attachments — **closed**;
-8. Phase 7: search and exact navigation — **implementation candidate awaiting external closure**;
-9. Phase 8: inspection/provenance UX;
+8. Phase 7: search and exact navigation — **closed and landed**;
+9. Phase 8: inspection/provenance UX — **current implementation phase**;
 10. Phase 9: import/export, backup, verification, and restore;
 11. Phase 10: campaign desktop integration;
 12. Phase 11: product finishing and standalone packaging;

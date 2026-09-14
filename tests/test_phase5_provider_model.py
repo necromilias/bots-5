@@ -127,7 +127,7 @@ def test_fresh_phase5_seed_and_pre_phase5_chat_selection_required(tmp_path: Path
         assert models[0].provider_model_id == "fake-v0.1"
         assert store.get_chat_model_selection("old") is None
         with _engine_connection(store) as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0010_phase7_search_navigation"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0011_phase8_inspector_state"
     finally:
         store.close()
 

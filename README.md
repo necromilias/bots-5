@@ -8,7 +8,7 @@ inspectable state, durable evidence, and human-controlled consequential actions.
 The original campaign harness baseline is closed and preserved. V0.2 adds the built-in
 `local_openai` provider while preserving the bounded manifest-driven execution model.
 
-Linux v0.1 is now implemented and landed through **Phase 6**:
+Linux v0.1 is implemented and landed through **Phase 7**:
 
 1. native walking skeleton;
 2. conversation truth, immutable lineage/revisions, and deterministic fake generation;
@@ -24,13 +24,10 @@ The landed Phase 6 implementation is commit
 the complete repository suite, with no failures and no provider contacted. See
 `docs/LINUX_V0_1_PHASE6_CLOSURE_REPORT.md` for the final closure and landing record.
 
-**Phase 7, search and exact navigation, now has an uncommitted implementation
-candidate awaiting external closure.** It adds literal FTS5 search over the accepted
-chat/message/attachment domain, exact active or historical navigation, minimal
-archive/unarchive support, explicit stale/rebuild/unavailable states, and bounded
-desktop controls. It does not add semantic search, OCR, provider work, or Phase 8
-inspection/provenance UX. See `docs/LINUX_V0_1_PHASE7_IMPLEMENTATION_REPORT.md` for
-candidate identity and validation evidence.
+Phase 7 was accepted, committed, and pushed at
+`6ccdaf01ce880cf5f00fca55209c2a99dd06c1cd`. Its supplied final closure evidence is
+**1,065 passed, 1 expected provider skip, 0 failed**, with no provider or network
+activity. Phase 8 inspection and provenance UX is the current implementation phase.
 
 The build-facing Linux v0.1 contract remains `docs/LINUX_V0_1_DESIGN.md`. The cumulative Phase 6
 implementation history remains in `docs/LINUX_V0_1_PHASE6_IMPLEMENTATION_REPORT.md`; its earlier

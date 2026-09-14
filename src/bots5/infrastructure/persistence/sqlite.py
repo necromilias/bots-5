@@ -203,6 +203,12 @@ _PHASE4_WORKSPACE_NOT_NULL = {
     "restore_open",
     "updated_at",
 }
+_PHASE8_REVISION = "0011_phase8_inspector_state"
+_PHASE8_WORKSPACE_COLUMN_TYPES = {
+    "inspector_open": "BOOLEAN",
+    "inspector_message_id": "VARCHAR(64)",
+    "inspector_leaf_message_id": "VARCHAR(64)",
+}
 _PHASE4_ACTIVE_INDEX_PREDICATE = re.compile(
     r"\(?\s*(?i:state|\"state\"|`state`|\[state\])\s*=\s*'running'\s*\)?",
 )
@@ -1011,7 +1017,7 @@ def _validate_open_connection(
     allow_repairable_search_index_version: bool = False,
 ) -> None:
     """Validate the exact authoritative schema and destructive guard behavior."""
-    phase7 = expected_revision == PHASE7_REVISION
+    phase7 = expected_revision in {PHASE7_REVISION, _PHASE8_REVISION}
     if phase7:
         arm_phase7_source_mutation(connection, "phase7 schema validation")
     try:
@@ -1026,6 +1032,8 @@ def _validate_open_connection(
         if revision != expected_revision:
             raise RuntimeError("current database revision is not authoritative")
         _validate_phase4_schema(connection)
+        if expected_revision == _PHASE8_REVISION:
+            _validate_phase8_schema(connection)
         _validate_phase5_schema(connection)
         _validate_phase5_trigger_behavior(connection)
         validate_phase6_schema(connection, destructive=destructive_phase6)
@@ -1168,6 +1176,9 @@ def _workspace_window(row) -> WorkspaceWindowState:
             rail_collapsed=bool(mapping["rail_collapsed"]),
             restore_open=bool(mapping["restore_open"]),
             updated_at=parse_utc(mapping["updated_at"]),
+            inspector_open=bool(mapping.get("inspector_open", False)),
+            inspector_message_id=mapping.get("inspector_message_id"),
+            inspector_leaf_message_id=mapping.get("inspector_leaf_message_id"),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise StateError("workspace window state is malformed") from exc
@@ -1290,6 +1301,37 @@ def _validate_phase4_schema(connection) -> None:
     if not _PHASE4_ACTIVE_INDEX_PREDICATE.fullmatch(predicate):
         raise RuntimeError(
             "current Phase 4 active-chat index must be filtered to running attempts"
+        )
+
+
+def _validate_phase8_schema(connection) -> None:
+    workspace_columns = {
+        row[1]: row
+        for row in connection.exec_driver_sql(
+            "PRAGMA table_info(workspace_windows)"
+        ).fetchall()
+    }
+    missing = sorted(set(_PHASE8_WORKSPACE_COLUMN_TYPES) - set(workspace_columns))
+    if missing:
+        raise RuntimeError(
+            "current Phase 8 workspace_windows schema is missing columns: "
+            + ", ".join(missing)
+        )
+    wrong_types = sorted(
+        name
+        for name, expected_type in _PHASE8_WORKSPACE_COLUMN_TYPES.items()
+        if str(workspace_columns[name][2]).upper().replace(" ", "") != expected_type
+    )
+    if wrong_types:
+        raise RuntimeError(
+            "current Phase 8 workspace_windows columns have invalid declared types: "
+            + ", ".join(
+                f"{name}={workspace_columns[name][2]}" for name in wrong_types
+            )
+        )
+    if workspace_columns["inspector_open"][3] != 1:
+        raise RuntimeError(
+            "current Phase 8 workspace_windows inspector_open must be non-null"
         )
 
 
@@ -2054,10 +2096,10 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     _validate_phase5_schema(connection)
                     _validate_phase5_trigger_behavior(connection)
                     validate_phase6_schema(connection)
-                if revision == PHASE7_REVISION:
+                if revision == _PHASE8_REVISION:
                     _validate_open_connection(
                         connection,
-                        expected_revision=PHASE7_REVISION,
+                        expected_revision=_PHASE8_REVISION,
                         destructive_phase6=False,
                         require_fts=False,
                         allow_missing_search_index_state=True,
@@ -2257,8 +2299,8 @@ class SQLiteAppStateStore(Phase5StoreMixin):
             revision = connection.exec_driver_sql(
                 "SELECT version_num FROM alembic_version"
             ).scalar_one_or_none()
-            if revision != PHASE7_REVISION:
-                raise StateError("Phase 7 persistence schema is not current")
+            if revision != _PHASE8_REVISION:
+                raise StateError("Phase 8 persistence schema is not current")
             validate_phase6_schema(connection)
             validate_phase7_schema(
                 connection,
@@ -2783,6 +2825,45 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                 .order_by(attempt_attachments.c.ordinal)
             ).fetchall()
         return tuple(self._attachment_from_authoritative_row(row) for row in rows)
+
+    def list_message_attachment_metadata(self, message_id: str) -> tuple[Attachment, ...]:
+        """Read only persisted attachment metadata for the Inspector.
+
+        Payload verification remains mandatory for attachment-consuming paths.
+        Inspection deliberately reports only metadata that the durable schema
+        already binds to a message and must not open object bytes.
+        """
+        self._ensure_open()
+        with self._authority.operation(), self._engine.connect() as connection:
+            rows = connection.execute(
+                select(attachments)
+                .select_from(
+                    message_attachments.join(
+                        attachments,
+                        message_attachments.c.attachment_id == attachments.c.id,
+                    )
+                )
+                .where(message_attachments.c.message_id == message_id)
+                .order_by(message_attachments.c.ordinal)
+            ).fetchall()
+        return tuple(_attachment(row) for row in rows)
+
+    def list_attempt_attachment_metadata(self, attempt_id: str) -> tuple[Attachment, ...]:
+        """Read only persisted attempt-attachment metadata for the Inspector."""
+        self._ensure_open()
+        with self._authority.operation(), self._engine.connect() as connection:
+            rows = connection.execute(
+                select(attachments)
+                .select_from(
+                    attempt_attachments.join(
+                        attachments,
+                        attempt_attachments.c.attachment_id == attachments.c.id,
+                    )
+                )
+                .where(attempt_attachments.c.attempt_id == attempt_id)
+                .order_by(attempt_attachments.c.ordinal)
+            ).fetchall()
+        return tuple(_attachment(row) for row in rows)
 
     def gc_attachments(self) -> tuple[str, ...]:
         """Linearize deletion, durably mark deleting, then remove bytes."""
@@ -5247,6 +5328,9 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     selected_chat_id=state.selected_chat_id,
                     rail_collapsed=state.rail_collapsed,
                     restore_open=state.restore_open,
+                    inspector_open=state.inspector_open,
+                    inspector_message_id=state.inspector_message_id,
+                    inspector_leaf_message_id=state.inspector_leaf_message_id,
                     updated_at=utc_iso(state.updated_at),
                 )
             )
@@ -5321,6 +5405,8 @@ _SQLITE_OPERATION_METHODS = (
     "read_attachment_bytes",
     "list_message_attachments",
     "list_attempt_attachments",
+    "list_message_attachment_metadata",
+    "list_attempt_attachment_metadata",
     "gc_attachments",
     "list_chats",
     "get_chat",

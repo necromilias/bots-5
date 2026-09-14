@@ -366,10 +366,9 @@ def validate_phase6_schema(connection, *, destructive: bool = True) -> None:
         "SELECT version_num FROM alembic_version"
     ).scalar_one_or_none()
     phase7_additions: set[str] = set()
-    if revision == "0010_phase7_search_navigation":
-        # Phase 6 remains exact at revision 0009.  Revision 0010 may add only
-        # the closed trigger set whose names are owned and validated by the
-        # Phase 7 schema contract.
+    if revision in {"0010_phase7_search_navigation", "0011_phase8_inspector_state"}:
+        # Phase 6 remains exact at revision 0009.  Later Phase 7/8 revisions
+        # may add only the closed Phase 7 trigger set to Phase 6-owned tables.
         from .phase7_schema import PHASE7_TRIGGER_NAMES
 
         phase7_additions = set(PHASE7_TRIGGER_NAMES)

@@ -75,7 +75,7 @@ from tests._authority_test_support import upgrade_to
 
 REPO = Path(__file__).resolve().parents[1]
 HEAD = "0009_phase6_context_attachments"
-CURRENT_HEAD = "0010_phase7_search_navigation"
+CURRENT_HEAD = "0011_phase8_inspector_state"
 PRIOR_REVISIONS = (
     "0001_desktop_state",
     "0002_conversation_lineage",

@@ -50,6 +50,7 @@ from .generation import (
     GenerationRequest,
 )
 from .context import ContextBuilder, ContextPlan, ContextSource
+from .inspection import InspectionProjection, build_inspection_projection
 from .ports import AppStateStore
 from .provider_configuration import ProviderConfiguration
 from .secrets import SecretStoreError, reject_secret_material, sanitize_secret_error
@@ -408,6 +409,9 @@ class BotsApplication:
         selected_chat_id: str | None,
         rail_collapsed: bool,
         restore_open: bool = True,
+        inspector_open: bool = False,
+        inspector_message_id: str | None = None,
+        inspector_leaf_message_id: str | None = None,
     ) -> WorkspaceWindowState:
         self._ensure_open()
         state = WorkspaceWindowState(
@@ -418,6 +422,9 @@ class BotsApplication:
             rail_collapsed=rail_collapsed,
             restore_open=restore_open,
             updated_at=self._clock.now(),
+            inspector_open=inspector_open,
+            inspector_message_id=inspector_message_id,
+            inspector_leaf_message_id=inspector_leaf_message_id,
         )
         self._store.save_workspace_window(state)
         return state
@@ -496,6 +503,93 @@ class BotsApplication:
         if self._store.get_chat(chat_id) is None:
             raise StateError(f"chat not found: {chat_id}")
         return self._store.list_revisions(chat_id, lineage_id)
+
+    @_tracked_command
+    async def inspect_chat(
+        self,
+        chat_id: str,
+        *,
+        message_id: str | None = None,
+        historical_leaf_message_id: str | None = None,
+    ) -> InspectionProjection:
+        """Return the core-owned, safe display projection for Details."""
+        self._ensure_open()
+        chat = self._store.get_chat(chat_id)
+        if chat is None:
+            raise StateError(f"chat not found: {chat_id}")
+        message = None if message_id is None else self._store.get_message(message_id)
+        if message is not None and message.chat_id != chat_id:
+            raise StateError("inspection message is not in the selected chat")
+        branch: tuple[Message, ...] = ()
+        if historical_leaf_message_id is not None:
+            leaf = self._store.get_message(historical_leaf_message_id)
+            if leaf is None or leaf.chat_id != chat_id:
+                historical_leaf_message_id = None
+            else:
+                branch = self._store.list_branch_messages(
+                    chat_id, historical_leaf_message_id
+                )
+                if not branch or branch[-1].id != historical_leaf_message_id:
+                    historical_leaf_message_id = None
+        if historical_leaf_message_id is None:
+            # A missing or stale historical leaf falls back to the
+            # authoritative active path.  The selected identity must be
+            # coherent with that path as well; it cannot retain a different
+            # historical branch under an active-path label.
+            branch = self._store.list_branch_messages(chat_id)
+        branch_ids = frozenset(item.id for item in branch)
+        if message is not None and message.id not in branch_ids:
+            if historical_leaf_message_id is not None:
+                # Saved UI identities are advisory.  An incoherent historical
+                # leaf cannot label another branch's message or attempt.  Fall
+                # back to the authoritative active path, then accept the
+                # selected message only if it belongs to that path.
+                historical_leaf_message_id = None
+                branch = self._store.list_branch_messages(chat_id)
+                branch_ids = frozenset(item.id for item in branch)
+            if message.id not in branch_ids:
+                message = None
+        attempts = self._store.list_generation_attempts(chat_id)
+        if message is not None:
+            # A selected user can be shared by regenerated assistant siblings.
+            # Its attempts are historical facts only when their resulting
+            # assistant belongs to the branch that resolved this inspection.
+            # Keep the unfiltered chat-level history when no message is
+            # selected.
+            attempts = tuple(
+                attempt
+                for attempt in attempts
+                if (
+                    attempt.assistant_message_id in branch_ids
+                    and (
+                        attempt.user_message_id == message.id
+                        or attempt.assistant_message_id == message.id
+                    )
+                )
+            )
+        user_content = {
+            attempt.id: (
+                self._store.get_message(attempt.user_message_id).content
+                if self._store.get_message(attempt.user_message_id) is not None
+                else None
+            )
+            for attempt in attempts
+        }
+        revisions = () if message is None else self._store.list_revisions(
+            chat_id, message.lineage_id or message.id
+        )
+        return build_inspection_projection(
+            chat=chat, message=message,
+            historical_leaf_message_id=historical_leaf_message_id,
+            revision_count=len(revisions), attempts=attempts,
+            user_content_by_attempt=user_content,
+            message_attachments=()
+            if message is None else self._store.list_message_attachment_metadata(message.id),
+            attempt_attachments={
+                attempt.id: self._store.list_attempt_attachment_metadata(attempt.id)
+                for attempt in attempts
+            },
+        )
 
     @_tracked_command
     async def search_status(self) -> SearchStatus:

@@ -42,7 +42,7 @@ from tests._authority_test_support import upgrade_to
 
 
 REPO = Path(__file__).resolve().parents[1]
-HEAD = "0010_phase7_search_navigation"
+HEAD = "0011_phase8_inspector_state"
 PRIOR_REVISIONS = (
     "0001_desktop_state",
     "0002_conversation_lineage",
@@ -53,6 +53,7 @@ PRIOR_REVISIONS = (
     "0007_phase5_provider_model_configuration",
     "0008_catalogue_refresh_outcomes",
     "0009_phase6_context_attachments",
+    "0010_phase7_search_navigation",
 )
 PRIOR_MIGRATION_SHA256 = {
     "0001_desktop_state.py": "15b7a409d35e3313db288f201e67d2e23c0a89e6f90058ad367dc879034e2da1",
@@ -296,6 +297,37 @@ os._exit(92)
     assert _revision(root) == HEAD
     assert not journal_path.exists()
     assert list((root / "database" / "migration").iterdir()) == []
+
+
+def test_legacy_0009_journal_rejects_a_newer_0010_source_revision(
+    tmp_path: Path,
+):
+    root = tmp_path / "root"
+    _historical_root(root, "0010_phase7_search_navigation")
+    source = r'''
+import os, sys
+from bots5.infrastructure.data_root_authority import DataRootAuthority
+from bots5.infrastructure.persistence import migration_runner
+original = migration_runner._journal_base
+def legacy(authority, transaction_id, source_kind):
+    record = original(authority, transaction_id, source_kind)
+    record["target_revision"] = migration_runner._LEGACY_HEAD
+    return record
+migration_runner._journal_base = legacy
+try:
+    DataRootAuthority(sys.argv[1]).acquire().open_store()
+except RuntimeError as exc:
+    assert "source revision is unsupported" in str(exc)
+    os._exit(93)
+os._exit(94)
+'''
+
+    completed = _run_migration_child(root, source)
+
+    assert completed.returncode == 93, (completed.stdout, completed.stderr)
+    assert _revision(root) == "0010_phase7_search_navigation"
+    assert list((root / "database" / "migration").iterdir()) == []
+    assert list((root / "recovery").iterdir()) == []
 
 
 def test_phase7_source_guard_rejects_unarmed_dml_and_consumes_once_per_transaction(

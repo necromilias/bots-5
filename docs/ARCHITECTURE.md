@@ -5,8 +5,8 @@
 B.O.T.S. now contains two related execution surfaces:
 
 1. the closed V0/V0.2 manifest-driven campaign harness; and
-2. the native Linux v0.1 desktop product, landed through Phase 6 with an
-   uncommitted Phase 7 implementation candidate awaiting external closure.
+2. the native Linux v0.1 desktop product, landed through Phase 7; Phase 8
+   inspection/provenance UX is the current implementation phase.
 
 The campaign harness remains a bounded deterministic worker orchestrator. The desktop adds durable
 conversation state, native UI, streaming generation, SQLite-backed application persistence,
@@ -41,8 +41,8 @@ non-secret endpoint/configuration material; resolved credentials are not persist
 ## Linux v0.1 landed architecture
 
 The accepted desktop contract is `LINUX_V0_1_DESIGN.md`. Phases 1 through 6 are
-landed. Phase 7 (search and exact navigation) has an uncommitted implementation
-candidate awaiting external closure.
+landed. Phase 7 (search and exact navigation) was accepted, committed, and pushed
+at `6ccdaf01ce880cf5f00fca55209c2a99dd06c1cd`; Phase 8 is current.
 
 Linux v0.1 runs as one native Qt/PySide6 desktop process containing one authoritative, separable,
 headless-testable B.O.T.S. core. Multiple windows are clients/views over the same authority.

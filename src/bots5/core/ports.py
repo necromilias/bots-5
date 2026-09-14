@@ -88,6 +88,20 @@ class AppStateStore(Protocol):
     def get_message(self, message_id: str) -> Message | None:
         ...
 
+    def list_message_attachments(self, message_id: str) -> tuple[Attachment, ...]:
+        ...
+
+    def list_attempt_attachments(self, attempt_id: str) -> tuple[Attachment, ...]:
+        ...
+
+    def list_message_attachment_metadata(self, message_id: str) -> tuple[Attachment, ...]:
+        """Return durable attachment metadata without opening payload bytes."""
+        ...
+
+    def list_attempt_attachment_metadata(self, attempt_id: str) -> tuple[Attachment, ...]:
+        """Return durable attempt-attachment metadata without opening payload bytes."""
+        ...
+
     def next_message_sequence(self, chat_id: str) -> int:
         ...
 

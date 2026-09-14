@@ -363,6 +363,7 @@ class MainWindow(QMainWindow):
             geometry = self._window_state.geometry
             if geometry is not None:
                 self.setGeometry(*geometry)
+            self._historical_leaf_message_id = self._window_state.inspector_leaf_message_id
         chats = await self._application.list_chats()
         if not chats:
             await self._application.create_chat()
@@ -380,6 +381,25 @@ class MainWindow(QMainWindow):
             self._select_chat_row(selected)
             self._workspace.set_selected_chat(self._window_id, selected)
             await self._refresh_transcript(selected)
+            if (
+                self._historical_leaf_message_id is not None
+                and (
+                    not self._current_messages
+                    or self._current_messages[-1].id
+                    != self._historical_leaf_message_id
+                )
+            ):
+                # Restored presentation identity is advisory.  It must never
+                # keep a stale/deleted historical leaf selected.
+                self._set_historical_leaf(None)
+            if self._window_state is not None and self._window_state.inspector_open:
+                self.inspector_dock.show()
+                if self._window_state.inspector_message_id is not None:
+                    self._selected_message = next(
+                        (item for item in self._current_messages if item.id == self._window_state.inspector_message_id),
+                        None,
+                    )
+                await self._refresh_inspector()
             await self._sync_current_activity()
         await self._refresh_phase5_state()
         await self._save_workspace()
@@ -1515,7 +1535,17 @@ class MainWindow(QMainWindow):
                     head_message_id=self._historical_leaf_message_id,
                 )
         except Exception:
-            return
+            if self._historical_leaf_message_id is None:
+                return
+            # Persisted historical selection is advisory.  If its exact leaf
+            # no longer exists, reopen the authoritative active head now;
+            # leaving the previous transcript empty would make a valid chat
+            # unusable until a later unrelated refresh.
+            self._set_historical_leaf(None)
+            try:
+                chat, messages = await self._application.open_chat(chat_id)
+            except Exception:
+                return
         if generation != self._refresh_generation or chat_id != self._current_chat_id:
             return
         self._render_transcript_projection(chat, messages)
@@ -1576,28 +1606,24 @@ class MainWindow(QMainWindow):
             selected_chat_id=self._current_chat_id,
             rail_collapsed=self.rail.collapsed,
             restore_open=True,
+            inspector_open=self.inspector_dock.isVisible(),
+            inspector_message_id=(None if self._selected_message is None else self._selected_message.id),
+            inspector_leaf_message_id=self._historical_leaf_message_id,
         )
 
     async def _refresh_inspector(self) -> None:
         if self._current_chat is None:
             return
-        if self._selected_message is None:
-            self.inspector.show_chat(self._current_chat)
-            return
-        attempts = await self._application.list_generation_attempts(self._current_chat.id)
-        revisions = await self._application.list_revisions(
+        projection = await self._application.inspect_chat(
             self._current_chat.id,
-            self._selected_message.lineage_id or self._selected_message.id,
+            message_id=(None if self._selected_message is None else self._selected_message.id),
+            historical_leaf_message_id=self._historical_leaf_message_id,
         )
-        self.inspector.show_message(
-            self._current_chat,
-            self._selected_message,
-            attempts,
-            len(revisions),
-        )
+        self.inspector.show_projection(projection)
 
     def _toggle_inspector(self, visible: bool) -> None:
         self.inspector_dock.setVisible(visible)
+        self._schedule(self._save_workspace())
         if visible:
             self._schedule(self._refresh_inspector())
 
@@ -1656,6 +1682,9 @@ class MainWindow(QMainWindow):
                     ),
                     selected_chat_id=self._current_chat_id,
                     rail_collapsed=self.rail.collapsed,
+                    inspector_open=self.inspector_dock.isVisible(),
+                    inspector_message_id=(None if self._selected_message is None else self._selected_message.id),
+                    inspector_leaf_message_id=self._historical_leaf_message_id,
                 )
                 self._window_id = None
             await self._workspace.close()
@@ -1670,6 +1699,9 @@ class MainWindow(QMainWindow):
                 ),
                 selected_chat_id=self._current_chat_id,
                 rail_collapsed=self.rail.collapsed,
+                inspector_open=self.inspector_dock.isVisible(),
+                inspector_message_id=(None if self._selected_message is None else self._selected_message.id),
+                inspector_leaf_message_id=self._historical_leaf_message_id,
             )
             self._window_id = None
 
@@ -1714,6 +1746,9 @@ class MainWindow(QMainWindow):
                 selected_chat_id=self._current_chat_id,
                 rail_collapsed=self.rail.collapsed,
                 restore_open=final_window,
+                inspector_open=self.inspector_dock.isVisible(),
+                inspector_message_id=(None if self._selected_message is None else self._selected_message.id),
+                inspector_leaf_message_id=self._historical_leaf_message_id,
             )
             self._window_id = None
         elif self._window_id is not None:
@@ -1729,6 +1764,9 @@ class MainWindow(QMainWindow):
                 selected_chat_id=self._current_chat_id,
                 rail_collapsed=self.rail.collapsed,
                 restore_open=final_window,
+                inspector_open=self.inspector_dock.isVisible(),
+                inspector_message_id=(None if self._selected_message is None else self._selected_message.id),
+                inspector_leaf_message_id=self._historical_leaf_message_id,
             )
             self._window_id = None
             await self._workspace.close()

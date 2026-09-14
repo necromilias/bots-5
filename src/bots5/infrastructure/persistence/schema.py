@@ -400,5 +400,8 @@ workspace_windows = Table(
     Column("selected_chat_id", String(64), ForeignKey("chats.id", ondelete="SET NULL")),
     Column("rail_collapsed", Boolean, nullable=False, default=False),
     Column("restore_open", Boolean, nullable=False, default=True),
+    Column("inspector_open", Boolean, nullable=False, default=False),
+    Column("inspector_message_id", String(64), nullable=True),
+    Column("inspector_leaf_message_id", String(64), nullable=True),
     Column("updated_at", String(40), nullable=False),
 )

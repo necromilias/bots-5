@@ -9,9 +9,10 @@ from datetime import datetime, timezone
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QLabel
 from qasync import QEventLoop
 
+from bots5.core.inspection import InspectionField, InspectionProjection
 from bots5.core.errors import (
     SearchCursorStale,
     SearchResultGone,
@@ -142,6 +143,8 @@ class FakeSearchApplication:
         self.resolve_error: Exception | None = None
         self.rebuild_status = _status()
         self.page = SearchPage(results=(), next_cursor=None, status=_status())
+        self.inspection_calls: list[tuple[str, str | None, str | None]] = []
+        self.invalid_historical_leaf: str | None = None
         self.navigation = SearchNavigation(
             chat=self.chat,
             messages=self.messages,
@@ -174,7 +177,26 @@ class FakeSearchApplication:
 
     async def open_chat(self, chat_id, *, head_message_id=_ACTIVE_HEAD_OMITTED):
         self.open_calls.append((chat_id, head_message_id))
+        if head_message_id == self.invalid_historical_leaf:
+            raise ValueError("historical leaf no longer exists")
         return self.chat, self.messages
+
+    async def inspect_chat(
+        self, chat_id, *, message_id=None, historical_leaf_message_id=None
+    ) -> InspectionProjection:
+        self.inspection_calls.append(
+            (chat_id, message_id, historical_leaf_message_id)
+        )
+        return InspectionProjection(
+            chat_id=chat_id,
+            selected_message_id=message_id,
+            historical_leaf_message_id=historical_leaf_message_id,
+            status="available",
+            fields=(
+                InspectionField("Historical leaf", historical_leaf_message_id or "active head"),
+                InspectionField("Attempt 1 provider/model", "fake / fake-v0.1"),
+            ),
+        )
 
     async def archive_chat(self, chat_id: str) -> Chat:
         self.archive_calls.append(chat_id)
@@ -384,6 +406,63 @@ def test_exact_focus_historical_projection_guards_and_return_to_active():
             assert not window.composer.isReadOnly()
             assert window.transcript.message_rows[user.id].edit_button.isEnabled()
             assert window.transcript.message_rows[assistant.id].regenerate_action.isEnabled()
+        finally:
+            await _dispose(window)
+
+    _run_qasync(qt_application, scenario())
+
+
+def test_details_consumes_core_projection_for_exact_historical_selection():
+    qt_application = QApplication.instance() or QApplication([])
+
+    async def scenario() -> None:
+        application = FakeSearchApplication()
+        window = MainWindow(application)
+        try:
+            _user, assistant = application.messages
+            window._current_chat = application.chat
+            window._current_chat_id = application.chat.id
+            window._current_messages = application.messages
+            window._selected_message = assistant
+            window._set_historical_leaf(assistant.id)
+            window.inspector_dock.show()
+            await window._refresh_inspector()
+
+            assert application.inspection_calls == [
+                (application.chat.id, assistant.id, assistant.id)
+            ]
+            values = [label.text() for label in window.inspector.findChildren(QLabel)]
+            assert "fake / fake-v0.1" in values
+            assert assistant.id in values
+        finally:
+            await _dispose(window)
+
+    _run_qasync(qt_application, scenario())
+
+
+def test_stale_restored_inspector_leaf_reopens_active_transcript_in_same_refresh():
+    qt_application = QApplication.instance() or QApplication([])
+
+    async def scenario() -> None:
+        application = FakeSearchApplication()
+        application.invalid_historical_leaf = "deleted-historical-leaf"
+        window = MainWindow(application)
+        try:
+            window._current_chat_id = application.chat.id
+            window._set_historical_leaf(application.invalid_historical_leaf)
+
+            await window._refresh_transcript(application.chat.id)
+
+            assert window._historical_leaf_message_id is None
+            assert window._current_chat == application.chat
+            assert window._current_messages == application.messages
+            assert set(window.transcript.message_rows) == {
+                message.id for message in application.messages
+            }
+            assert application.open_calls == [
+                (application.chat.id, "deleted-historical-leaf"),
+                (application.chat.id, _ACTIVE_HEAD_OMITTED),
+            ]
         finally:
             await _dispose(window)
 

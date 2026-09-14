@@ -146,6 +146,9 @@ class WorkspaceWindowState:
     rail_collapsed: bool
     restore_open: bool
     updated_at: datetime
+    inspector_open: bool = False
+    inspector_message_id: str | None = None
+    inspector_leaf_message_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.window_id:

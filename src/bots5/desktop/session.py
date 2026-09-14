@@ -149,6 +149,9 @@ class DesktopSessionController(QObject):
         selected_chat_id: str | None,
         rail_collapsed: bool,
         restore_open: bool = True,
+        inspector_open: bool = False,
+        inspector_message_id: str | None = None,
+        inspector_leaf_message_id: str | None = None,
     ) -> WorkspaceWindowState:
         return await self.application.save_workspace_window(
             window_id=window_id,
@@ -157,6 +160,9 @@ class DesktopSessionController(QObject):
             selected_chat_id=selected_chat_id,
             rail_collapsed=rail_collapsed,
             restore_open=restore_open,
+            inspector_open=inspector_open,
+            inspector_message_id=inspector_message_id,
+            inspector_leaf_message_id=inspector_leaf_message_id,
         )
 
     async def unregister_window(
@@ -167,6 +173,9 @@ class DesktopSessionController(QObject):
         selected_chat_id: str | None = None,
         rail_collapsed: bool = False,
         restore_open: bool = False,
+        inspector_open: bool = False,
+        inspector_message_id: str | None = None,
+        inspector_leaf_message_id: str | None = None,
     ) -> None:
         if window_id not in self._windows:
             return
@@ -177,6 +186,9 @@ class DesktopSessionController(QObject):
                 selected_chat_id=selected_chat_id,
                 rail_collapsed=rail_collapsed,
                 restore_open=True,
+                inspector_open=inspector_open,
+                inspector_message_id=inspector_message_id,
+                inspector_leaf_message_id=inspector_leaf_message_id,
             )
         else:
             await self.application.delete_workspace_window(window_id)
