@@ -6,7 +6,7 @@ This repository now contains two related but distinct surfaces:
 
 1. the closed manifest-driven campaign harness (V0/V0.2); and
 2. the native Linux desktop product, implemented and landed through Linux v0.1
-   Phase 7; Phase 8 inspection/provenance UX is current.
+   Phase 8; Phase 9 import/export, backup, verification, and restore is current.
 
 Do not apply old V0 non-goals to the desktop product without checking `LINUX_V0_1_DESIGN.md` and the
 current roadmap.
@@ -92,12 +92,20 @@ QT_QPA_PLATFORM=offscreen PYTHONPATH=src .venv314/bin/python -m pytest -q \
   tests/test_phase7_search_navigation.py
 ```
 
-This deterministic gate has no provider, credential, network, semantic-search, or
-Phase 8 is the current implementation phase. Phase 7 was accepted, committed, and
-pushed at `6ccdaf01ce880cf5f00fca55209c2a99dd06c1cd`; its supplied closure was
-**1,065 passed, 1 expected provider skip, 0 failed**, with no provider/network
-activity. The complete repository suite remains a separate pre-commit
-closure gate.
+This deterministic gate has no provider, credential, network, semantic-search, or Phase 8 path.
+Phase 7 was accepted, committed, and pushed at `6ccdaf01ce880cf5f00fca55209c2a99dd06c1cd`; its
+supplied closure was **1,065 passed, 1 expected provider skip, 0 failed**, with no provider/network
+activity. Phase 8 is now landed at `f72e0ea6e10694972f3b3455d973651629de448a`; its separate final
+T4 gate recorded **1082 passed, 1 skipped, 3124 warnings in 3946.05s (1:05:46)**, exit `0`.
+Phase 9 is the current implementation phase. The complete repository suite remains a separate
+pre-commit closure gate.
+
+Phase 8 inspection semantics belong to the core: use `BotsApplication.inspect_chat()` and the typed
+`InspectionProjection`; Qt is presentation only. The additive migration is
+`0011_phase8_inspector_state` after `0010_phase7_search_navigation`. Preserve request-time provenance,
+metadata-only attachment inspection, exact active/historical branch identity, and honest unavailable
+or unsupported states. Phase 9 import/export, backup, verification, and restore is not implemented by
+Phase 8.
 
 ## Campaign manifest schema
 

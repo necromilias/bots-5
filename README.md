@@ -8,7 +8,7 @@ inspectable state, durable evidence, and human-controlled consequential actions.
 The original campaign harness baseline is closed and preserved. V0.2 adds the built-in
 `local_openai` provider while preserving the bounded manifest-driven execution model.
 
-Linux v0.1 is implemented and landed through **Phase 7**:
+Linux v0.1 is implemented and landed through **Phase 8**:
 
 1. native walking skeleton;
 2. conversation truth, immutable lineage/revisions, and deterministic fake generation;
@@ -17,6 +17,8 @@ Linux v0.1 is implemented and landed through **Phase 7**:
 5. provider/model usability, secrets, catalogue/capability discovery, and settings;
 6. deterministic context construction, content-addressed attachments, unified data-root authority,
    rooted SQLite/native durability handling, and fail-closed effect ownership.
+7. search and exact navigation through authoritative branch/message identities;
+8. core-owned inspection and provenance UX over durable request-time facts.
 
 The landed Phase 6 implementation is commit
 `20847c7a49e26679d0d3dfe99798a2c211bec436`. Its final reserved acceptance gates were
@@ -27,12 +29,17 @@ the complete repository suite, with no failures and no provider contacted. See
 Phase 7 was accepted, committed, and pushed at
 `6ccdaf01ce880cf5f00fca55209c2a99dd06c1cd`. Its supplied final closure evidence is
 **1,065 passed, 1 expected provider skip, 0 failed**, with no provider or network
-activity. Phase 8 inspection and provenance UX is the current implementation phase.
+activity. Phase 8 inspection and provenance UX was accepted and landed at
+`f72e0ea6e10694972f3b3455d973651629de448a`. Its final pre-commit T4 gate recorded
+**1082 passed, 1 skipped, 3124 warnings in 3946.05s (1:05:46)**, exit `0`, with
+no provider/network activity. Phase 9 — import/export, backup, verification, and
+restore — is the current implementation phase.
 
 The build-facing Linux v0.1 contract remains `docs/LINUX_V0_1_DESIGN.md`. The cumulative Phase 6
-implementation history remains in `docs/LINUX_V0_1_PHASE6_IMPLEMENTATION_REPORT.md`; its earlier
-candidate-status statements are historical evidence and are superseded by the Phase 6 closure report.
-Phase 7 does not change the landed Phase 6 disposition.
+implementation history remains in `docs/LINUX_V0_1_PHASE6_IMPLEMENTATION_REPORT.md` and the later
+phase implementation reports. Their earlier candidate-status statements are historical evidence;
+the applicable phase closure reports record current landing authority. Phase 7 and Phase 8 do not
+change the landed Phase 6 disposition.
 
 The provisional UI authority remains `docs/LINUX_V0_1_UI_UX_DRAFT_1.md`; it has not been promoted to
 final design authority.
@@ -173,5 +180,8 @@ Key records include:
 - `docs/LINUX_V0_1_PHASE1_PHASE2_CLOSURE_REPORT.md` — early desktop closure;
 - `docs/LINUX_V0_1_PHASE3_IMPLEMENTATION_REPORT.md` through
   `docs/LINUX_V0_1_PHASE6_IMPLEMENTATION_REPORT.md` — cumulative phase implementation evidence;
-- `docs/LINUX_V0_1_PHASE6_CLOSURE_REPORT.md` — current Phase 6 closure and landing authority;
+- `docs/LINUX_V0_1_PHASE6_CLOSURE_REPORT.md` — Phase 6 closure and landing record;
+- `docs/LINUX_V0_1_PHASE7_IMPLEMENTATION_REPORT.md` — cumulative Phase 7 implementation evidence;
+- `docs/LINUX_V0_1_PHASE8_IMPLEMENTATION_REPORT.md` — cumulative Phase 8 implementation archaeology;
+- `docs/LINUX_V0_1_PHASE8_CLOSURE_REPORT.md` — authoritative Phase 8 closure and landing record;
 - `docs/LINUX_V0_1_DESIGN.md` — accepted Linux v0.1 build-facing contract.

@@ -24,7 +24,7 @@ accepted. The build-facing contract is `docs/LINUX_V0_1_DESIGN.md`.
 
 ### Landed status
 
-Phases **1 through 7 are implemented, validated, committed, and landed on `main`**.
+Phases **1 through 8 are implemented, validated, committed, and landed on `main`**.
 
 - Phase 1: native walking skeleton, core, persistence, events, fake streaming backend.
 - Phase 2: conversation truth, immutable lineage/revisions, and deterministic fake generation.
@@ -52,12 +52,22 @@ The cumulative implementation archaeology remains in the phase implementation re
 candidate-status statements such as “unstaged”, “uncommitted”, or “not yet accepted” describe those
 historical checkpoints and do not override the current closure record.
 
+- Phase 7: search and exact navigation, closed and landed at
+  `6ccdaf01ce880cf5f00fca55209c2a99dd06c1cd`.
+- Phase 8: inspection and provenance UX, closed and landed at
+  `f72e0ea6e10694972f3b3455d973651629de448a`.
+- Phase 8 final T4 closure evidence: **1082 passed, 1 skipped, 3124 warnings in
+  3946.05s (1:05:46)**, exit `0`, with Candidate E byte-identical and no
+  provider/network/credential contact.
+
 ### Current implementation phase
 
 **Phase 7 — search and exact navigation** was accepted, committed, and pushed at
 `6ccdaf01ce880cf5f00fca55209c2a99dd06c1cd`. Supplied final closure evidence is
 **1,065 passed, 1 expected provider skip, 0 failed**, with no provider/network
-activity. **Phase 8 — inspection/provenance UX** is current.
+activity. **Phase 8 — inspection/provenance UX** is closed and landed at
+`f72e0ea6e10694972f3b3455d973651629de448a`. **Phase 9 — import/export, backup,
+verification, and restore** is current.
 
 The accepted desktop sequence remains:
 
@@ -69,8 +79,8 @@ The accepted desktop sequence remains:
 6. Phase 5: provider/model usability;
 7. Phase 6: context and attachments — **closed**;
 8. Phase 7: search and exact navigation — **closed and landed**;
-9. Phase 8: inspection/provenance UX — **current implementation phase**;
-10. Phase 9: import/export, backup, verification, and restore;
+9. Phase 8: inspection/provenance UX — **closed and landed**;
+10. Phase 9: import/export, backup, verification, and restore — **current implementation phase**;
 11. Phase 10: campaign desktop integration;
 12. Phase 11: product finishing and standalone packaging;
 13. Phase 12: Linux v0.1 torture run and separate closure adjudication.

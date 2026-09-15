@@ -5,8 +5,8 @@
 B.O.T.S. now contains two related execution surfaces:
 
 1. the closed V0/V0.2 manifest-driven campaign harness; and
-2. the native Linux v0.1 desktop product, landed through Phase 7; Phase 8
-   inspection/provenance UX is the current implementation phase.
+2. the native Linux v0.1 desktop product, landed through Phase 8; Phase 9
+   import/export, backup, verification, and restore is the current implementation phase.
 
 The campaign harness remains a bounded deterministic worker orchestrator. The desktop adds durable
 conversation state, native UI, streaming generation, SQLite-backed application persistence,
@@ -40,9 +40,11 @@ non-secret endpoint/configuration material; resolved credentials are not persist
 
 ## Linux v0.1 landed architecture
 
-The accepted desktop contract is `LINUX_V0_1_DESIGN.md`. Phases 1 through 6 are
+The accepted desktop contract is `LINUX_V0_1_DESIGN.md`. Phases 1 through 8 are
 landed. Phase 7 (search and exact navigation) was accepted, committed, and pushed
-at `6ccdaf01ce880cf5f00fca55209c2a99dd06c1cd`; Phase 8 is current.
+at `6ccdaf01ce880cf5f00fca55209c2a99dd06c1cd`. Phase 8 (inspection and provenance
+UX) was accepted, committed, and pushed at
+`f72e0ea6e10694972f3b3455d973651629de448a`; Phase 9 is current.
 
 Linux v0.1 runs as one native Qt/PySide6 desktop process containing one authoritative, separable,
 headless-testable B.O.T.S. core. Multiple windows are clients/views over the same authority.
@@ -113,6 +115,19 @@ open as a temporary historical leaf without changing the chat head, and disappea
 identities return typed GONE behaviour. Archived chats are excluded by default;
 inclusion is explicit. Unreferenced attachments remain absent from user-visible
 results. Search has no provider, network, semantic, OCR, or detached-worker path.
+
+### Inspection and provenance
+
+Phase 8 adds a core-owned typed inspection projection over durable request-time facts. The core
+interprets legacy, supported, future, and corrupt request snapshots and supplies safe status/field
+values; Qt presents that projection without interpreting versioned persistence. Per-message and
+chat-level views preserve historical provider/model/settings and Phase 6 context/attachment
+provenance, while attachment inspection reads metadata only and never payload bytes. Selected-message
+attempts are bound to the resolved active or historical branch, including regenerated shared ancestors;
+chat-level history remains unfiltered when no message is selected. Inspector visibility, selected
+message, and historical leaf are restored through additive migration `0011_phase8_inspector_state`,
+with stale identities falling back safely. Import/export provenance remains unavailable/not applicable
+until Phase 9.
 
 ### Concurrency and events
 

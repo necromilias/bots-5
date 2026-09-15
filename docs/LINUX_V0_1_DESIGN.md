@@ -1,10 +1,12 @@
 # Linux v0.1 accepted design
 
-Status: accepted build-facing design. **Phases 1 through 7 are implemented, independently validated,
-committed, and landed on `main`; Phase 7 is
-`6ccdaf01ce880cf5f00fca55209c2a99dd06c1cd`.** Its supplied closure was **1,065
-passed, 1 expected provider skip, 0 failed**, with no provider/network activity.
-Phase 8 inspection/provenance UX is current.
+Status: accepted build-facing design. **Phases 1 through 8 are implemented, independently validated,
+committed, and landed on `main`; Phase 8 is
+`f72e0ea6e10694972f3b3455d973651629de448a`.** Phase 7's supplied closure was **1,065
+passed, 1 expected provider skip, 0 failed**, with no provider/network activity. Phase 8's final T4
+gate recorded **1082 passed, 1 skipped, 3124 warnings in 3946.05s (1:05:46)**, exit `0`.
+Phase 9 import/export, backup, verification, and restore is current. See
+`LINUX_V0_1_PHASE8_CLOSURE_REPORT.md` for the administrative landing record.
 
 This document remains the build-facing technical contract for the first native Linux B.O.T.S. desktop
 application. Organisational Memory owns the broader decision rationale and supersession history; this
@@ -331,8 +333,8 @@ Build through validated vertical slices:
 6. Phase 5: provider/model usability, secrets, catalogue, capability discovery, settings;
 7. Phase 6: deterministic context and content-addressed attachments — **closed and landed**;
 8. Phase 7: search and exact navigation — **closed and landed**;
-9. Phase 8: inspection/provenance UX — **current implementation phase**;
-10. Phase 9: import/export, backup, verification, and restore;
+9. Phase 8: inspection/provenance UX — **closed and landed**;
+10. Phase 9: import/export, backup, verification, and restore — **current implementation phase**;
 11. Phase 10: campaign desktop integration;
 12. Phase 11: product finishing and standalone packaging;
 13. Phase 12: Linux v0.1 torture run and separate closure adjudication.
