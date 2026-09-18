@@ -3241,6 +3241,218 @@ class SQLiteAppStateStore(Phase5StoreMixin):
             ).fetchall()
         return tuple(_chat(row) for row in rows)
 
+    def read_chat_export_source(self, chat_id: str, *, attachment_policy):
+        """Read one complete export source projection from a single SQLite cut."""
+        from bots5.core.export import ChatExportSource, ExportAttachment
+
+        self._ensure_open()
+        with self._authority.transition():
+            with self._engine.connect() as connection:
+                connection.exec_driver_sql("BEGIN")
+                try:
+                    chat_row = connection.execute(
+                        select(chats).where(chats.c.id == chat_id)
+                    ).first()
+                    if chat_row is None:
+                        connection.rollback()
+                        return ChatExportSource(
+                            chat=None, messages=(), attempts=(),
+                            message_attachments={}, attempt_attachments={},
+                            context_plans={}, chat_configuration={},
+                            captured_at=datetime.now(UTC),
+                        )
+                    chat = _chat(chat_row)
+                    message_rows = connection.execute(
+                        select(messages).where(messages.c.chat_id == chat_id)
+                        .order_by(messages.c.sequence.asc(), messages.c.id.asc())
+                    ).fetchall()
+                    source_messages = tuple(_message(row) for row in message_rows)
+                    attempt_rows = connection.execute(
+                        select(
+                            generation_attempts,
+                            messages.c.id.label("_attempt_user_message_id"),
+                            messages.c.content.label("_attempt_user_message_content"),
+                        ).select_from(
+                            generation_attempts.outerjoin(
+                                messages, messages.c.id == generation_attempts.c.user_message_id
+                            )
+                        ).where(generation_attempts.c.chat_id == chat_id)
+                        .order_by(generation_attempts.c.started_at.asc(), generation_attempts.c.id.asc())
+                    ).fetchall()
+                    source_attempts = []
+                    for row in attempt_rows:
+                        mapping = row._mapping
+                        if mapping["_attempt_user_message_id"] is None:
+                            raise StateError(
+                                "generation attempt user message not found: " + str(mapping["id"])
+                            )
+                        source_attempts.append(
+                            _attempt(row, mapping["_attempt_user_message_content"])
+                        )
+                    source_attempts = tuple(source_attempts)
+                    message_ids = tuple(item.id for item in source_messages)
+                    attempt_ids = tuple(item.id for item in source_attempts)
+
+                    def attachment_rows(relation, owner_column, owner_ids):
+                        if not owner_ids:
+                            return ()
+                        return connection.execute(
+                            select(
+                                owner_column.label("_export_owner_id"),
+                                attachments, attachment_blobs.c.byte_size,
+                                attachment_blobs.c.state.label("_export_blob_state"),
+                            ).select_from(
+                                relation.join(attachments, relation.c.attachment_id == attachments.c.id)
+                                .join(attachment_blobs, attachments.c.blob_digest == attachment_blobs.c.digest)
+                            ).where(owner_column.in_(owner_ids))
+                            .order_by(owner_column.asc(), relation.c.ordinal.asc(), attachments.c.id.asc())
+                        ).fetchall()
+
+                    message_attachment_rows = attachment_rows(
+                        message_attachments, message_attachments.c.message_id, message_ids
+                    )
+                    attempt_attachment_rows = attachment_rows(
+                        attempt_attachments, attempt_attachments.c.attempt_id, attempt_ids
+                    )
+                    attachments_by_id = {}
+                    for row in (*message_attachment_rows, *attempt_attachment_rows):
+                        attachment_id = str(row._mapping["id"])
+                        if attachment_id in attachments_by_id:
+                            continue
+                        attachment = _attachment(row)
+                        size = int(row._mapping["byte_size"])
+                        raw = None
+                        status = "missing" if row._mapping["_export_blob_state"] != "ready" else "verified"
+                        if status == "verified":
+                            try:
+                                raw = self._attachment_manager.read_verified(
+                                    row.blob_digest, expected_size=size
+                                )
+                                self._validated_authoritative_attachment_representation(
+                                    row, attachment_id, raw=raw
+                                )
+                            except AttachmentIntegrityError:
+                                status = "integrity-failed"
+                                raw = None
+                        if attachment_policy.value == "embedded" and status != "verified":
+                            raise StateError("authoritative attachment payload is unavailable")
+                        attachments_by_id[attachment_id] = ExportAttachment(
+                            attachment=attachment, byte_size=size, integrity_status=status,
+                            payload=raw if attachment_policy.value == "embedded" else None,
+                        )
+
+                    def grouped(rows):
+                        result = {}
+                        for row in rows:
+                            owner = str(row._mapping["_export_owner_id"])
+                            item = attachments_by_id[str(row._mapping["id"])]
+                            result.setdefault(owner, []).append(item)
+                        return {key: tuple(value) for key, value in result.items()}
+
+                    context_rows = connection.execute(
+                        select(context_plans).where(context_plans.c.attempt_id.in_(attempt_ids))
+                        if attempt_ids else select(context_plans).where(text("1 = 0"))
+                    ).fetchall()
+                    context_source = {
+                        str(row._mapping["attempt_id"]): {
+                            key: row._mapping[key] for key in (
+                                "attempt_id", "plan_version", "canonical_representation",
+                                "canonical_digest", "wire_representation_digest", "budget_limit",
+                                "budget_provenance", "budget_semantics", "adapter_id",
+                                "adapter_version", "input_counts", "envelope_overhead",
+                                "output_reserve", "input_units", "total_units", "headroom",
+                                "created_at",
+                            )
+                        }
+                        for row in context_rows
+                    }
+                    selection_row = connection.execute(
+                        select(chat_model_selection).where(chat_model_selection.c.chat_id == chat_id)
+                    ).first()
+                    override_rows = connection.execute(
+                        select(chat_model_generation_config).where(
+                            chat_model_generation_config.c.chat_id == chat_id
+                        ).order_by(chat_model_generation_config.c.model_entry_id.asc())
+                    ).fetchall()
+                    model_ids = {str(row._mapping["model_entry_id"]) for row in override_rows}
+                    if selection_row is not None and selection_row._mapping["model_entry_id"] is not None:
+                        model_ids.add(str(selection_row._mapping["model_entry_id"]))
+                    model_rows = connection.execute(
+                        select(
+                            model_catalogue_entries.c.id.label("model_entry_id"),
+                            model_catalogue_entries.c.connection_id,
+                            model_catalogue_entries.c.provider_model_id,
+                            model_catalogue_entries.c.display_name,
+                            model_catalogue_entries.c.origin,
+                            model_catalogue_entries.c.availability,
+                            model_catalogue_entries.c.revision.label("model_revision"),
+                            provider_connections.c.backend_type,
+                            provider_connections.c.profile,
+                            provider_connections.c.revision.label("connection_revision"),
+                            provider_connections.c.catalogue_revision,
+                        ).select_from(
+                            model_catalogue_entries.join(
+                                provider_connections,
+                                model_catalogue_entries.c.connection_id == provider_connections.c.id,
+                            )
+                        ).where(model_catalogue_entries.c.id.in_(model_ids))
+                    ).fetchall() if model_ids else ()
+                    descriptors = {
+                        str(row._mapping["model_entry_id"]): {
+                            "source_model_entry_id": str(row._mapping["model_entry_id"]),
+                            "source_connection_id": str(row._mapping["connection_id"]),
+                            "backend_type": str(row._mapping["backend_type"]),
+                            "provider_profile": str(row._mapping["profile"]),
+                            "provider_model_id": str(row._mapping["provider_model_id"]),
+                            "display_name": str(row._mapping["display_name"]),
+                            "origin": str(row._mapping["origin"]),
+                            "availability": str(row._mapping["availability"]),
+                            "model_revision": int(row._mapping["model_revision"]),
+                            "connection_revision": int(row._mapping["connection_revision"]),
+                            "catalogue_revision": int(row._mapping["catalogue_revision"]),
+                        } for row in model_rows
+                    }
+                    if set(model_ids) != set(descriptors):
+                        raise StateError("chat continuation model metadata is unavailable")
+                    overrides = []
+                    for row in override_rows:
+                        mapping = row._mapping
+                        settings = _settings(mapping)
+                        model_id = str(mapping["model_entry_id"])
+                        overrides.append({
+                            "model": descriptors[model_id],
+                            "revision": int(mapping["revision"]),
+                            "temperature": settings.temperature,
+                            "max_output_tokens": settings.max_output_tokens,
+                            "reasoning_effort": settings.reasoning_effort,
+                            "timeout_seconds": settings.timeout_seconds,
+                        })
+                    selection = None
+                    if selection_row is not None:
+                        mapping = selection_row._mapping
+                        selected_id = mapping["model_entry_id"]
+                        selection = {
+                            "model": None if selected_id is None else descriptors[str(selected_id)],
+                            "selection_required": bool(mapping["selection_required"]),
+                            "revision": int(mapping["revision"]),
+                        }
+                    result = ChatExportSource(
+                        chat=chat, messages=source_messages, attempts=source_attempts,
+                        message_attachments=grouped(message_attachment_rows),
+                        attempt_attachments=grouped(attempt_attachment_rows),
+                        context_plans=context_source,
+                        chat_configuration={
+                            "semantic": "inert-continuation-hints",
+                            "selection": selection, "overrides": overrides,
+                        },
+                        captured_at=datetime.now(UTC),
+                    )
+                    connection.rollback()
+                    return result
+                except BaseException:
+                    connection.rollback()
+                    raise
+
     def get_chat(self, chat_id: str) -> Chat | None:
         self._ensure_open()
         with self._engine.connect() as connection:
@@ -5403,6 +5615,7 @@ _SQLITE_OPERATION_METHODS = (
     "list_attachments",
     "delete_attachment",
     "read_attachment_bytes",
+    "read_chat_export_source",
     "list_message_attachments",
     "list_attempt_attachments",
     "list_message_attachment_metadata",

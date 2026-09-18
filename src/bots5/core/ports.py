@@ -11,6 +11,7 @@ from bots5.domain.search import (
     SearchResult,
     SearchStatus,
 )
+from bots5.core.export import AttachmentPolicy, ChatExportSource
 
 
 class AppStateStore(Protocol):
@@ -100,6 +101,24 @@ class AppStateStore(Protocol):
 
     def list_attempt_attachment_metadata(self, attempt_id: str) -> tuple[Attachment, ...]:
         """Return durable attempt-attachment metadata without opening payload bytes."""
+        ...
+
+    def read_attachment_bytes(self, attachment_id: str) -> bytes:
+        """Read and verify authoritative attachment bytes through root authority."""
+        ...
+
+    def read_chat_export_source(
+        self, chat_id: str, *, attachment_policy: AttachmentPolicy
+    ) -> ChatExportSource:
+        """Materialise every export input from one storage-owned read cut."""
+        ...
+
+    def get_chat_model_selection(self, chat_id: str):
+        """Return the inert, chat-scoped continuation selection if one exists."""
+        ...
+
+    def get_chat_model_generation_config(self, chat_id: str, model_entry_id: str):
+        """Return only the chat-scoped settings override and its revision."""
         ...
 
     def next_message_sequence(self, chat_id: str) -> int:

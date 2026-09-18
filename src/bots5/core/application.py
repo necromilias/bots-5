@@ -51,6 +51,14 @@ from .generation import (
 )
 from .context import ContextBuilder, ContextPlan, ContextSource
 from .inspection import InspectionProjection, build_inspection_projection
+from .export import (
+    ArchiveProjection,
+    AttachmentPolicy,
+    TranscriptExport,
+    TranscriptScope,
+    build_archive_projection,
+    build_transcript,
+)
 from .ports import AppStateStore
 from .provider_configuration import ProviderConfiguration
 from .secrets import SecretStoreError, reject_secret_material, sanitize_secret_error
@@ -589,6 +597,52 @@ class BotsApplication:
                 attempt.id: self._store.list_attempt_attachment_metadata(attempt.id)
                 for attempt in attempts
             },
+        )
+
+    @_tracked_command
+    async def export_transcript(
+        self, chat_id: str, *, scope: TranscriptScope = TranscriptScope.ACTIVE_PATH
+    ) -> TranscriptExport:
+        """Build a non-mutating, core-owned Transcript v0.1 read projection."""
+        self._ensure_open()
+        source = self._store.read_chat_export_source(
+            chat_id, attachment_policy=AttachmentPolicy.EXTERNAL_REFERENCE
+        )
+        if source.chat is None:
+            raise StateError(f"chat not found: {chat_id}")
+        return build_transcript(
+            chat=source.chat, messages=source.messages, attempts=source.attempts,
+            message_attachments=source.message_attachments,
+            attempt_attachments=source.attempt_attachments, exported_at=source.captured_at, scope=scope,
+        )
+
+    @_tracked_command
+    async def prepare_archive_export(
+        self, chat_id: str, *, attachment_policy: AttachmentPolicy = AttachmentPolicy.EMBEDDED
+    ) -> ArchiveProjection:
+        """Build an Archive v1 projection without writing or mutating domain state."""
+        self._ensure_open()
+        source = self._store.read_chat_export_source(
+            chat_id, attachment_policy=attachment_policy
+        )
+        if source.chat is None:
+            raise StateError(f"chat not found: {chat_id}")
+        if any(item.state is AttemptState.RUNNING for item in source.attempts) or any(
+            item.state in {MessageState.SENDING, MessageState.STREAMING}
+            for item in source.messages
+        ):
+            raise StateError("Archive v1 refuses chats with a running generation")
+        return build_archive_projection(
+            archive_id=self._ids.new(), created_at=source.captured_at, chat=source.chat,
+            messages=source.messages, attempts=source.attempts, message_attachments=source.message_attachments,
+            attempt_attachments=source.attempt_attachments, payloads={
+                item.attachment.blob_digest: item.payload
+                for values in (*source.message_attachments.values(), *source.attempt_attachments.values())
+                for item in values if item.payload is not None
+            },
+            attachment_policy=attachment_policy, chat_configuration=source.chat_configuration,
+            application_version="0.1.0", migration_revision="0011_phase8_inspector_state",
+            context_plans=source.context_plans,
         )
 
     @_tracked_command
