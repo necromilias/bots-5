@@ -5,8 +5,8 @@
 B.O.T.S. now contains two related execution surfaces:
 
 1. the closed V0/V0.2 manifest-driven campaign harness; and
-2. the native Linux v0.1 desktop product, landed through Phase 8; Phase 9
-   import/export, backup, verification, and restore is the current implementation phase.
+2. the native Linux v0.1 desktop product, landed through Phase 9 Slice A; Phase 9 Slice B
+   validated Archive v1 import and durable import provenance is the current planning boundary.
 
 The campaign harness remains a bounded deterministic worker orchestrator. The desktop adds durable
 conversation state, native UI, streaming generation, SQLite-backed application persistence,
@@ -40,11 +40,12 @@ non-secret endpoint/configuration material; resolved credentials are not persist
 
 ## Linux v0.1 landed architecture
 
-The accepted desktop contract is `LINUX_V0_1_DESIGN.md`. Phases 1 through 8 are
-landed. Phase 7 (search and exact navigation) was accepted, committed, and pushed
+The accepted desktop contract is `LINUX_V0_1_DESIGN.md`. Phases 1 through 8 and
+Phase 9 Slice A are landed. Phase 7 (search and exact navigation) was accepted, committed, and pushed
 at `6ccdaf01ce880cf5f00fca55209c2a99dd06c1cd`. Phase 8 (inspection and provenance
 UX) was accepted, committed, and pushed at
-`f72e0ea6e10694972f3b3455d973651629de448a`; Phase 9 is current.
+`f72e0ea6e10694972f3b3455d973651629de448a`. Phase 9 Slice A — Transcript v0.1 and Archive v1 export —
+was accepted, committed, and pushed at `35b206a404d4cd3e2dd05a5c07ffdc6dd0e1ba40`. Slice B import/provenance is next.
 
 Linux v0.1 runs as one native Qt/PySide6 desktop process containing one authoritative, separable,
 headless-testable B.O.T.S. core. Multiple windows are clients/views over the same authority.
@@ -128,6 +129,18 @@ chat-level history remains unfiltered when no message is selected. Inspector vis
 message, and historical leaf are restored through additive migration `0011_phase8_inspector_state`,
 with stale identities falling back safely. Import/export provenance remains unavailable/not applicable
 until Phase 9.
+
+### Phase 9 Slice A interchange and export
+
+Phase 9 Slice A lands the readable Transcript v0.1 projection and strict one-chat Archive v1 export
+boundary. Transcript export can project the active path or full lineage. Archive export preserves the
+accepted full-fidelity chat-domain graph and uses the strict Archive v1 reader/container validation
+contract, with embedded-payload and external-reference policies for ordinary attachments. Archive export
+refuses a running generation rather than claiming a full-fidelity snapshot of unsettled chat truth.
+
+This landed export/interchange boundary is the input contract for Slice B. Slice B may add validated
+Archive v1 import and durable import provenance, but it does not turn chat interchange into whole-install
+restore. Backup/verification/restore remain later Phase 9 slices.
 
 ### Concurrency and events
 

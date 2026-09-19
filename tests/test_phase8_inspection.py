@@ -77,10 +77,11 @@ def test_inspector_states_that_phase9_import_export_provenance_is_unavailable():
     assert fields["Export provenance"] == "not applicable (Phase 9 not implemented)"
 
 
-def test_roadmap_current_state_includes_landed_phase7():
+def test_roadmap_current_state_includes_landed_phase9_slice_a():
     roadmap = (Path(__file__).resolve().parents[1] / "docs/ROADMAP.md").read_text(
         encoding="utf-8"
     )
 
-    assert "Phases **1 through 7 are implemented, validated, committed, and landed" in roadmap
-    assert "Phases **1 through 6 are implemented, validated, committed, and landed" not in roadmap
+    assert "Phases **1 through 8 and Phase 9 Slice A are implemented, validated, committed, and landed" in roadmap
+    assert "35b206a404d4cd3e2dd05a5c07ffdc6dd0e1ba40" in roadmap
+    assert "Phases **1 through 7 are implemented, validated, committed, and landed" not in roadmap

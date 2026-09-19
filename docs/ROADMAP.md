@@ -24,7 +24,7 @@ accepted. The build-facing contract is `docs/LINUX_V0_1_DESIGN.md`.
 
 ### Landed status
 
-Phases **1 through 8 are implemented, validated, committed, and landed on `main`**.
+Phases **1 through 8 and Phase 9 Slice A are implemented, validated, committed, and landed on `main`**.
 
 - Phase 1: native walking skeleton, core, persistence, events, fake streaming backend.
 - Phase 2: conversation truth, immutable lineage/revisions, and deterministic fake generation.
@@ -59,15 +59,18 @@ historical checkpoints and do not override the current closure record.
 - Phase 8 final T4 closure evidence: **1082 passed, 1 skipped, 3124 warnings in
   3946.05s (1:05:46)**, exit `0`, with Candidate E byte-identical and no
   provider/network/credential contact.
+- Phase 9 Slice A: Transcript v0.1 and strict Archive v1 export, accepted and landed at
+  `35b206a404d4cd3e2dd05a5c07ffdc6dd0e1ba40`.
+- Phase 9 Slice A final T4: **1133 passed, 1 skipped, 1 accepted pre-existing Phase 8 roadmap-test
+  failure**; fresh Sol/High final falsification reported no concrete current blocker.
 
 ### Current implementation phase
 
-**Phase 7 — search and exact navigation** was accepted, committed, and pushed at
-`6ccdaf01ce880cf5f00fca55209c2a99dd06c1cd`. Supplied final closure evidence is
-**1,065 passed, 1 expected provider skip, 0 failed**, with no provider/network
-activity. **Phase 8 — inspection/provenance UX** is closed and landed at
-`f72e0ea6e10694972f3b3455d973651629de448a`. **Phase 9 — import/export, backup,
-verification, and restore** is current.
+**Phase 7 — search and exact navigation** and **Phase 8 — inspection/provenance UX** are closed and
+landed. **Phase 9 Slice A — Transcript v0.1 and Archive v1 export** is closed and landed at
+`35b206a404d4cd3e2dd05a5c07ffdc6dd0e1ba40`. **Phase 9 Slice B — validated Archive v1 import and
+durable import provenance** is the current design/oracle boundary. Slice B implementation is not
+implicitly authorized by Slice A landing or by its accepted product semantics.
 
 The accepted desktop sequence remains:
 
@@ -80,7 +83,7 @@ The accepted desktop sequence remains:
 7. Phase 6: context and attachments — **closed**;
 8. Phase 7: search and exact navigation — **closed and landed**;
 9. Phase 8: inspection/provenance UX — **closed and landed**;
-10. Phase 9: import/export, backup, verification, and restore — **current implementation phase**;
+10. Phase 9: import/export, backup, verification, and restore — **Slice A landed; Slice B design/oracle next; Slices C–E later**;
 11. Phase 10: campaign desktop integration;
 12. Phase 11: product finishing and standalone packaging;
 13. Phase 12: Linux v0.1 torture run and separate closure adjudication.
