@@ -5,8 +5,8 @@
 B.O.T.S. now contains two related execution surfaces:
 
 1. the closed V0/V0.2 manifest-driven campaign harness; and
-2. the native Linux v0.1 desktop product, landed through Phase 9 Slice A; Phase 9 Slice B
-   validated Archive v1 import and durable import provenance is the current planning boundary.
+2. the native Linux v0.1 desktop product, landed through Phase 9 Slice B; Phase 9 Slice C
+   Backup v1 and independent verification is the next bounded sequence boundary.
 
 The campaign harness remains a bounded deterministic worker orchestrator. The desktop adds durable
 conversation state, native UI, streaming generation, SQLite-backed application persistence,
@@ -40,12 +40,11 @@ non-secret endpoint/configuration material; resolved credentials are not persist
 
 ## Linux v0.1 landed architecture
 
-The accepted desktop contract is `LINUX_V0_1_DESIGN.md`. Phases 1 through 8 and
-Phase 9 Slice A are landed. Phase 7 (search and exact navigation) was accepted, committed, and pushed
-at `6ccdaf01ce880cf5f00fca55209c2a99dd06c1cd`. Phase 8 (inspection and provenance
-UX) was accepted, committed, and pushed at
-`f72e0ea6e10694972f3b3455d973651629de448a`. Phase 9 Slice A — Transcript v0.1 and Archive v1 export —
-was accepted, committed, and pushed at `35b206a404d4cd3e2dd05a5c07ffdc6dd0e1ba40`. Slice B import/provenance is next.
+The accepted desktop contract is `LINUX_V0_1_DESIGN.md`. Phases 1 through 8 and Phase 9 Slices A and B
+are landed. Phase 9 Slice A — Transcript v0.1 and strict Archive v1 export — landed at
+`35b206a404d4cd3e2dd05a5c07ffdc6dd0e1ba40`. Phase 9 Slice B — validated Archive import and durable
+import provenance — landed at `9a84d38b6ad2d3968db58f471d53bf85820656b1`. Slice C backup/verification
+is next in the accepted sequence.
 
 Linux v0.1 runs as one native Qt/PySide6 desktop process containing one authoritative, separable,
 headless-testable B.O.T.S. core. Multiple windows are clients/views over the same authority.
@@ -127,8 +126,8 @@ provenance, while attachment inspection reads metadata only and never payload by
 attempts are bound to the resolved active or historical branch, including regenerated shared ancestors;
 chat-level history remains unfiltered when no message is selected. Inspector visibility, selected
 message, and historical leaf are restored through additive migration `0011_phase8_inspector_state`,
-with stale identities falling back safely. Import/export provenance remains unavailable/not applicable
-until Phase 9.
+with stale identities falling back safely. Phase 9 Slice B now supplies durable import provenance and
+branch-aware continuation evidence while native, never-imported history remains truthfully native.
 
 ### Phase 9 Slice A interchange and export
 
@@ -138,9 +137,32 @@ accepted full-fidelity chat-domain graph and uses the strict Archive v1 reader/c
 contract, with embedded-payload and external-reference policies for ordinary attachments. Archive export
 refuses a running generation rather than claiming a full-fidelity snapshot of unsettled chat truth.
 
-This landed export/interchange boundary is the input contract for Slice B. Slice B may add validated
-Archive v1 import and durable import provenance, but it does not turn chat interchange into whole-install
-restore. Backup/verification/restore remain later Phase 9 slices.
+This landed export/interchange boundary remains the compatibility input contract for Slice B. Slice B
+does not turn chat interchange into whole-install restore. Backup/verification/restore remain separate
+Phase 9 domains.
+
+### Phase 9 Slice B archive import and durable provenance
+
+Slice B lands additive migration `0012_phase9_archive_import`, validated Archive v1 intake, persistent
+import operations/queue state, fresh local object identities with durable immediate-source provenance,
+truthful broken external-attachment references with SHA-based healing, continuation/history bindings,
+and recovery/fail-closed integration with the existing data-root authority.
+
+Archive v1 remains strict and frozen. Strict Archive v2 is owned separately by
+`infrastructure/archive_v2.py` and carries the provenance/history additions required for lossless later
+export/import round trips. The v2 settings-provenance grammar includes truthful branch provenance rather
+than translating it into an older category merely for wire compatibility.
+
+Imported historical attempts remain inert source evidence. Local continuation maps receiving-installation
+provider/model/settings state separately, without creating or resurrecting provider configuration or
+credentials. Editing an imported user turn is an explicit local derivation: the source turn remains
+historical truth and the edit creates branch-aware local continuation rather than rewriting imported
+history.
+
+Import queue work is serialized per archive while unrelated native work may proceed. Expensive preflight
+work stays outside the consequential authoritative write boundary where practical; after that boundary the
+operation settles to a known-safe terminal state. Search remains derived and may catch up after a valid
+authoritative import rather than becoming an import-success gate.
 
 ### Concurrency and events
 

@@ -8,7 +8,7 @@ inspectable state, durable evidence, and human-controlled consequential actions.
 The original campaign harness baseline is closed and preserved. V0.2 adds the built-in
 `local_openai` provider while preserving the bounded manifest-driven execution model.
 
-Linux v0.1 is implemented and landed through **Phase 9 Slice A**:
+Linux v0.1 is implemented and landed through **Phase 9 Slice B**:
 
 1. native walking skeleton;
 2. conversation truth, immutable lineage/revisions, and deterministic fake generation;
@@ -19,7 +19,9 @@ Linux v0.1 is implemented and landed through **Phase 9 Slice A**:
    rooted SQLite/native durability handling, and fail-closed effect ownership.
 7. search and exact navigation through authoritative branch/message identities;
 8. core-owned inspection and provenance UX over durable request-time facts;
-9. Phase 9 Slice A readable Transcript v0.1 export and strict one-chat Archive v1 export.
+9. Phase 9 Slice A readable Transcript v0.1 export and strict one-chat Archive v1 export;
+10. Phase 9 Slice B validated Archive v1 import, strict Archive v2 provenance-preserving interchange,
+    durable import provenance, queue/recovery semantics, and branch-aware continuation.
 
 The landed Phase 6 implementation is commit
 `20847c7a49e26679d0d3dfe99798a2c211bec436`. Its final reserved acceptance gates were
@@ -39,17 +41,23 @@ export — was substantively accepted, committed, and pushed at
 **1133 passed, 1 skipped, and the sole accepted pre-existing Phase 8 roadmap-test failure**.
 `docs/LINUX_V0_1_PHASE9_SLICE_A_CLOSURE_REPORT.md` is the authoritative Slice A landing record.
 
-Phase 9 Slice B — validated Archive v1 import and durable import provenance — is the next planning
-boundary. Its accepted product semantics are recorded in Organisational Memory decision 0010 at
-`cd8d8f4638359c68a778ff211329a0c530b29712`; implementation still requires a live-repository
-design/oracle pass and separate mutation authority.
+Phase 9 Slice B is substantively accepted and landed at
+`9a84d38b6ad2d3968db58f471d53bf85820656b1`. Slice B adds additive migration
+`0012_phase9_archive_import`, validated Archive v1 import, strict Archive v2 evolution for durable
+provenance/continuation round trips, persistent import-queue/recovery state, truthful missing-attachment
+handling/healing, and branch-aware imported continuation. Final current-byte validation recorded
+**1038 passed, 1 skipped** on the accepted T2 preservation selection and **1238 passed, 1 skipped** on
+T4 with the candidate unchanged. See `docs/LINUX_V0_1_PHASE9_SLICE_B_CLOSURE_REPORT.md`.
+
+Phase 9 Slice C — Backup v1 and independent verification — is the next bounded Phase 9 boundary. Its
+existence in the accepted sequence does not itself authorize implementation.
 
 The build-facing Linux v0.1 contract remains `docs/LINUX_V0_1_DESIGN.md`. The cumulative Phase 6
 implementation history remains in `docs/LINUX_V0_1_PHASE6_IMPLEMENTATION_REPORT.md` and the later
 phase implementation reports. Their earlier candidate-status statements are historical evidence;
 the applicable phase closure reports record current landing authority. Phase 7 and Phase 8 do not
-change the landed Phase 6 disposition. The Phase 9 Slice A closure report records the current
-interchange/export landing boundary.
+change the landed Phase 6 disposition. The Phase 9 Slice A and Slice B closure reports record the
+current interchange/export/import landing boundaries.
 
 The provisional UI authority remains `docs/LINUX_V0_1_UI_UX_DRAFT_1.md`; it has not been promoted to
 final design authority.
@@ -195,4 +203,5 @@ Key records include:
 - `docs/LINUX_V0_1_PHASE8_IMPLEMENTATION_REPORT.md` — cumulative Phase 8 implementation archaeology;
 - `docs/LINUX_V0_1_PHASE8_CLOSURE_REPORT.md` — authoritative Phase 8 closure and landing record;
 - `docs/LINUX_V0_1_PHASE9_SLICE_A_CLOSURE_REPORT.md` — authoritative Phase 9 Slice A closure and landing record;
+- `docs/LINUX_V0_1_PHASE9_SLICE_B_CLOSURE_REPORT.md` — authoritative Phase 9 Slice B closure and landing record;
 - `docs/LINUX_V0_1_DESIGN.md` — accepted Linux v0.1 build-facing contract.

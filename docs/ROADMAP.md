@@ -24,7 +24,7 @@ accepted. The build-facing contract is `docs/LINUX_V0_1_DESIGN.md`.
 
 ### Landed status
 
-Phases **1 through 8 and Phase 9 Slice A are implemented, validated, committed, and landed on `main`**.
+Phases **1 through 8 and Phase 9 Slices A and B are implemented, validated, committed, and landed on `main`**.
 
 - Phase 1: native walking skeleton, core, persistence, events, fake streaming backend.
 - Phase 2: conversation truth, immutable lineage/revisions, and deterministic fake generation.
@@ -63,14 +63,20 @@ historical checkpoints and do not override the current closure record.
   `35b206a404d4cd3e2dd05a5c07ffdc6dd0e1ba40`.
 - Phase 9 Slice A final T4: **1133 passed, 1 skipped, 1 accepted pre-existing Phase 8 roadmap-test
   failure**; fresh Sol/High final falsification reported no concrete current blocker.
+- Phase 9 Slice B: validated Archive v1 import, strict Archive v2 provenance evolution, durable import
+  provenance, persistent import queue/recovery, attachment healing, and branch-aware continuation;
+  substantively accepted and landed at `9a84d38b6ad2d3968db58f471d53bf85820656b1`.
+- Phase 9 Slice B current-byte T2: **1038 passed, 1 skipped**; final T4: **1238 passed, 1 skipped**,
+  exit `0`, candidate unchanged. Independent adversarial review and final oracle both returned PASS;
+  the authorized shared review-model substitution is retained as an evidence-diversity limitation.
 
 ### Current implementation phase
 
-**Phase 7 — search and exact navigation** and **Phase 8 — inspection/provenance UX** are closed and
-landed. **Phase 9 Slice A — Transcript v0.1 and Archive v1 export** is closed and landed at
-`35b206a404d4cd3e2dd05a5c07ffdc6dd0e1ba40`. **Phase 9 Slice B — validated Archive v1 import and
-durable import provenance** is the current design/oracle boundary. Slice B implementation is not
-implicitly authorized by Slice A landing or by its accepted product semantics.
+**Phase 7 — search and exact navigation**, **Phase 8 — inspection/provenance UX**, **Phase 9 Slice A —
+Transcript v0.1 and strict Archive v1 export**, and **Phase 9 Slice B — validated archive import and
+durable import provenance** are closed and landed. Slice B is landed at
+`9a84d38b6ad2d3968db58f471d53bf85820656b1`. **Phase 9 Slice C — Backup v1 and independent
+verification** is the next bounded sequence boundary; it is not implicitly authorized by Slice B landing.
 
 The accepted desktop sequence remains:
 
@@ -83,7 +89,7 @@ The accepted desktop sequence remains:
 7. Phase 6: context and attachments — **closed**;
 8. Phase 7: search and exact navigation — **closed and landed**;
 9. Phase 8: inspection/provenance UX — **closed and landed**;
-10. Phase 9: import/export, backup, verification, and restore — **Slice A landed; Slice B design/oracle next; Slices C–E later**;
+10. Phase 9: import/export, backup, verification, and restore — **Slices A and B landed; Slice C backup/verification next; Slices D–E later**;
 11. Phase 10: campaign desktop integration;
 12. Phase 11: product finishing and standalone packaging;
 13. Phase 12: Linux v0.1 torture run and separate closure adjudication.

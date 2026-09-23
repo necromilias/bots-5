@@ -1,13 +1,13 @@
 # Linux v0.1 accepted design
 
-Status: accepted build-facing design. **Phases 1 through 8 and Phase 9 Slice A are implemented,
-independently validated, committed, and landed on `main`; Slice A is
-`35b206a404d4cd3e2dd05a5c07ffdc6dd0e1ba40`.** Phase 8 remains landed at
-`f72e0ea6e10694972f3b3455d973651629de448a`. Phase 9 Slice A's final T4 recorded
-**1133 passed, 1 skipped, and one accepted pre-existing Phase 8 roadmap-test failure**; fresh Sol/High
-falsification found no concrete current blocker. Phase 9 Slice B — validated Archive v1 import and
-durable import provenance — is the current planning boundary. See
-`LINUX_V0_1_PHASE9_SLICE_A_CLOSURE_REPORT.md` for the Slice A administrative landing record.
+Status: accepted build-facing design. **Phases 1 through 8 and Phase 9 Slices A and B are implemented,
+independently validated, committed, and landed on `main`; Slice B is
+`9a84d38b6ad2d3968db58f471d53bf85820656b1`.** Slice B's final current-byte T2 preservation gate
+recorded **1038 passed, 1 skipped** and full T4 recorded **1238 passed, 1 skipped**, exit `0`, with the
+sealed candidate unchanged. Independent adversarial review and final oracle both returned PASS; their
+authorized model substitution reduced reviewer diversity and remains a recorded evidence limitation.
+Phase 9 Slice C — Backup v1 and independent verification — is the current sequence boundary. See
+`LINUX_V0_1_PHASE9_SLICE_B_CLOSURE_REPORT.md` for the Slice B administrative landing record.
 
 This document remains the build-facing technical contract for the first native Linux B.O.T.S. desktop
 application. Organisational Memory owns the broader decision rationale and supersession history; this
@@ -335,7 +335,7 @@ Build through validated vertical slices:
 7. Phase 6: deterministic context and content-addressed attachments — **closed and landed**;
 8. Phase 7: search and exact navigation — **closed and landed**;
 9. Phase 8: inspection/provenance UX — **closed and landed**;
-10. Phase 9: import/export, backup, verification, and restore — **Slice A landed; Slice B is the current design/oracle boundary; Slices C–E remain later Phase 9 work**;
+10. Phase 9: import/export, backup, verification, and restore — **Slices A and B landed; Slice C Backup v1 + independent verification next; Slices D–E later**;
 11. Phase 10: campaign desktop integration;
 12. Phase 11: product finishing and standalone packaging;
 13. Phase 12: Linux v0.1 torture run and separate closure adjudication.

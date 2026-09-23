@@ -77,11 +77,12 @@ def test_inspector_reports_native_import_and_export_provenance_truthfully():
     assert fields["Export provenance"] == "not recorded"
 
 
-def test_roadmap_current_state_includes_landed_phase9_slice_a():
+def test_roadmap_current_state_includes_landed_phase9_slice_b():
     roadmap = (Path(__file__).resolve().parents[1] / "docs/ROADMAP.md").read_text(
         encoding="utf-8"
     )
 
-    assert "Phases **1 through 8 and Phase 9 Slice A are implemented, validated, committed, and landed" in roadmap
-    assert "35b206a404d4cd3e2dd05a5c07ffdc6dd0e1ba40" in roadmap
-    assert "Phases **1 through 7 are implemented, validated, committed, and landed" not in roadmap
+    assert "Phases **1 through 8 and Phase 9 Slices A and B are implemented, validated, committed, and landed" in roadmap
+    assert "9a84d38b6ad2d3968db58f471d53bf85820656b1" in roadmap
+    assert "Phase 9 Slice C" in roadmap
+    assert "Phases **1 through 8 and Phase 9 Slice A are implemented, validated, committed, and landed" not in roadmap
