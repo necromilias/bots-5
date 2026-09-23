@@ -70,11 +70,11 @@ def test_unknown_future_snapshot_is_unsupported_and_never_rendered_as_provenance
     assert "temperature" not in rendered
 
 
-def test_inspector_states_that_phase9_import_export_provenance_is_unavailable():
+def test_inspector_reports_native_import_and_export_provenance_truthfully():
     fields = {item.name: item.value for item in _projection("{}").fields}
 
-    assert fields["Import provenance"] == "unavailable (Phase 9 not implemented)"
-    assert fields["Export provenance"] == "not applicable (Phase 9 not implemented)"
+    assert fields["Import provenance"] == "native"
+    assert fields["Export provenance"] == "not recorded"
 
 
 def test_roadmap_current_state_includes_landed_phase9_slice_a():

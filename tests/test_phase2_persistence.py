@@ -43,7 +43,7 @@ def test_phase2_schema_has_lineage_columns_and_is_idempotent(tmp_path: Path):
             chat_columns = {column["name"] for column in inspect(store.engine).get_columns("chats")}
             assert {"head_message_id", "revision"} <= chat_columns
             with store.engine.connect() as connection:
-                assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0011_phase8_inspector_state"
+                assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0012_phase9_archive_import"
             foreign_keys = inspect(store.engine).get_foreign_keys("chats")
         assert any(
             foreign_key["referred_table"] == "messages"
@@ -781,7 +781,7 @@ def test_upgrade_from_existing_phase2_revision_installs_integrity_boundary(tmp_p
     store = SQLiteAppStateStore.open(database)
     try:
         with store.command_admission(), store.engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0011_phase8_inspector_state"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0012_phase9_archive_import"
             assert connection.execute(
                 text("SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'messages_validate_insert'")
             ).scalar_one() == 1

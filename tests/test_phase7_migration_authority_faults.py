@@ -42,7 +42,7 @@ from tests._authority_test_support import upgrade_to
 
 
 REPO = Path(__file__).resolve().parents[1]
-HEAD = "0011_phase8_inspector_state"
+HEAD = "0012_phase9_archive_import"
 PRIOR_REVISIONS = (
     "0001_desktop_state",
     "0002_conversation_lineage",

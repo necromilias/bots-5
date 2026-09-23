@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import hashlib
 import math
+import os
 import re
 import sqlite3
+from pathlib import Path
 
 from contextlib import ExitStack, contextmanager, nullcontext
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
 from datetime import UTC, datetime
 from functools import wraps
@@ -28,6 +31,8 @@ from bots5.core.errors import (
     SearchUnavailable,
     StateError,
 )
+from bots5.core.interchange import canonical_json_bytes
+from bots5.core.import_history import ContinuationReadiness, ContinuationRequirement
 from bots5.domain.clock import parse_utc, utc_iso
 from bots5.domain.models import (
     AttemptState,
@@ -43,12 +48,16 @@ from bots5.domain.models import (
 from bots5.domain.provider import (
     CAPABILITY_KEYS,
     CATALOGUE_REFRESH_FAILURE_MESSAGES,
+    CapabilityKey,
     CapabilitySource,
     CapabilityState,
+    CatalogueAvailability,
     CatalogueRefreshFailureClass,
     CatalogueRefreshStatus,
     validate_capability_value,
+    GenerationSettings,
 )
+from bots5.core.provider_configuration import _validate_settings, resolve_capability
 from bots5.domain.search import (
     SearchBranchState,
     SearchDocumentKind,
@@ -85,6 +94,13 @@ from .schema import (
     search_index_state,
     search_source_state,
 )
+
+
+# Import publication creates one capture inode per distinct new payload plus
+# exact journal/row/index records.  These fixed units are deliberately larger
+# than their serialized rows and are rounded to the observed filesystem unit.
+_PHASE9_PAYLOAD_ROW_OVERHEAD = 16 * 1024
+_PHASE9_PAYLOAD_JOURNAL_OVERHEAD = 32 * 1024
 from .phase3_validation import (
     PHASE3_BACKEND_ID,
     is_phase3_record,
@@ -105,6 +121,13 @@ from .transition_guard import (
     require_phase7_consumed,
     require_phase6_consumed,
     install_transition_guard,
+    arm_phase9_import_graph,
+    arm_phase9_import_continuation_rows,
+    arm_phase9_object_derivations,
+    clear_phase9_object_derivations,
+    clear_phase9_import_graph,
+    arm_phase9_attachment_healing,
+    clear_phase9_attachment_healing,
 )
 from .phase5_store import (
     Phase5StoreMixin,
@@ -115,6 +138,7 @@ from .phase5_store import (
     _settings,
 )
 from .phase6_schema import validate_phase6_schema
+from .phase9_schema import validate_phase9_schema
 from .phase7_schema import (
     PHASE7_REVISION,
     SEARCH_SCHEMA_VERSION,
@@ -137,6 +161,7 @@ from .search import (
 )
 from bots5.infrastructure.attachments import (
     AttachmentCleanupUncertain,
+    CapturedAttachment,
     AttachmentIntegrityError,
     _open_attachment_fs,
     classify_attachment_text,
@@ -154,6 +179,34 @@ def _fault(point: str) -> None:
     if hook is not None:
         hook(point)
 from bots5.infrastructure.data_root_authority import DataRootAuthority
+from bots5.core.archive_import import (
+    ArchiveSourcePlan,
+    ImportErrorCode,
+    capture_validated_archive,
+    close_payload_snapshots,
+    resolve_external_payloads,
+    resolve_source,
+    source_fingerprint,
+    with_initial_receiver_continuation,
+)
+from bots5.core.import_queue import ImportQueueState, QueueItem, QueuePage, reorder as reorder_queue
+from bots5.infrastructure.persistence.archive_import_store import (
+    ArchiveImportStoreError,
+    JournalIntent,
+    assert_enqueueable,
+    begin_graph_commit,
+    complete_known_graph,
+    begin_staging,
+    cancel_waiting,
+    claim,
+    advance_queue_control,
+    enqueue as enqueue_archive_import,
+    fail_known_pregraph,
+    queue_control,
+    queue_item as archive_queue_item,
+    recover_known_operation,
+    settle_preflight_without_journal,
+)
 
 
 _MESSAGE_STATES = {state.value for state in MessageState}
@@ -204,6 +257,7 @@ _PHASE4_WORKSPACE_NOT_NULL = {
     "updated_at",
 }
 _PHASE8_REVISION = "0011_phase8_inspector_state"
+_PHASE9_REVISION = "0012_phase9_archive_import"
 _PHASE8_WORKSPACE_COLUMN_TYPES = {
     "inspector_open": "BOOLEAN",
     "inspector_message_id": "VARCHAR(64)",
@@ -693,7 +747,7 @@ def _is_persisted_phase6_attempt(attempt: GenerationAttempt) -> bool:
     return isinstance(snapshot, dict) and snapshot.get("snapshot_version") == 3
 
 
-def _validate_phase6_attempt_authority(connection, attempt: GenerationAttempt) -> None:
+def _validate_phase6_attempt_authority(connection, attempt: GenerationAttempt, branch_choice_context=None) -> None:
     """CAS-check every durable fact used by a frozen v3 plan.
 
     The request snapshot is built outside the persistence transaction.  A
@@ -751,7 +805,17 @@ def _validate_phase6_attempt_authority(connection, attempt: GenerationAttempt) -
         select(chat_model_selection.c.model_entry_id, chat_model_selection.c.selection_required)
         .where(chat_model_selection.c.chat_id == attempt.chat_id)
     ).first()
-    if selection is None or selection.model_entry_id != model_entry_id or selection.selection_required:
+    branch_choice = connection.exec_driver_sql(
+        "SELECT c.explicit_settings FROM archive_continuation_branches b JOIN archive_continuation_choices c ON c.chat_id=b.chat_id AND c.base_key=b.base_key AND c.choice_revision=b.choice_revision WHERE b.attempt_id=? AND c.local_model_entry_id=? AND c.local_connection_id=?",
+        (attempt.id, model_entry_id, connection_id),
+    ).first()
+    if branch_choice is None and branch_choice_context is not None:
+        base_key, choice_revision = branch_choice_context
+        branch_choice = connection.exec_driver_sql(
+            "SELECT explicit_settings FROM archive_continuation_choices WHERE chat_id=? AND base_key=? AND choice_revision=? AND local_model_entry_id=? AND local_connection_id=?",
+            (attempt.chat_id, base_key, choice_revision, model_entry_id, connection_id),
+        ).first()
+    if (selection is None or selection.model_entry_id != model_entry_id or selection.selection_required) and branch_choice is None:
         raise StateError("Phase 6 chat model selection changed before start")
 
     # Compare the effective settings plus each contributing layer revision.
@@ -797,6 +861,17 @@ def _validate_phase6_attempt_authority(connection, attempt: GenerationAttempt) -
             value = float(value)
         effective[key] = value
         provenance[key] = source
+    if branch_choice is not None:
+        try:
+            branch_settings = json.loads(str(branch_choice[0]))
+        except (TypeError, ValueError) as exc:
+            raise StateError("imported continuation choice settings are malformed") from exc
+        if not isinstance(branch_settings, dict) or set(branch_settings) != set(defaults):
+            raise StateError("imported continuation choice settings are malformed")
+        for key, value in branch_settings.items():
+            if value is not None:
+                effective[key] = value
+                provenance[key] = "branch"
     expected_settings = snapshot.get("effective_settings")
     expected_provenance = snapshot.get("settings_provenance")
     if expected_settings != effective or expected_provenance != provenance:
@@ -1017,26 +1092,26 @@ def _validate_open_connection(
     allow_repairable_search_index_version: bool = False,
 ) -> None:
     """Validate the exact authoritative schema and destructive guard behavior."""
-    phase7 = expected_revision in {PHASE7_REVISION, _PHASE8_REVISION}
+    phase7 = expected_revision in {PHASE7_REVISION, _PHASE8_REVISION, _PHASE9_REVISION}
     if phase7:
         arm_phase7_source_mutation(connection, "phase7 schema validation")
     try:
-        integrity = __import__(
-            "bots5.infrastructure.persistence.migrations.versions.0003_integrity_boundaries",
-            fromlist=["_validate_existing_state"],
-        )
-        integrity._validate_existing_state(connection)
         revision = connection.exec_driver_sql(
             "SELECT version_num FROM alembic_version"
         ).scalar_one_or_none()
         if revision != expected_revision:
             raise RuntimeError("current database revision is not authoritative")
+        if expected_revision != _PHASE9_REVISION:
+            integrity = __import__("bots5.infrastructure.persistence.migrations.versions.0003_integrity_boundaries", fromlist=["_validate_existing_state"])
+            integrity._validate_existing_state(connection)
         _validate_phase4_schema(connection)
-        if expected_revision == _PHASE8_REVISION:
+        if expected_revision in {_PHASE8_REVISION, _PHASE9_REVISION}:
             _validate_phase8_schema(connection)
         _validate_phase5_schema(connection)
         _validate_phase5_trigger_behavior(connection)
         validate_phase6_schema(connection, destructive=destructive_phase6)
+        if expected_revision == _PHASE9_REVISION:
+            validate_phase9_schema(connection)
     finally:
         if phase7:
             clear_phase7_source_mutation(connection)
@@ -1981,6 +2056,31 @@ def _validate_phase5_trigger_behavior(connection) -> None:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class ArchiveImportPreflight:
+    """One owned, sealed intake plan awaiting its durable settlement."""
+
+    queue_id: str
+    queue_revision: int
+    owner_epoch: str
+    import_as_archived: bool
+    captured: ArchiveSourcePlan
+
+    def close(self) -> None:
+        """Release the private snapshots if no durable settlement will run."""
+        close_payload_snapshots(self.captured)
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveImportSettlement:
+    """A plan that crossed the durable cutoff and must now settle or recover."""
+
+    preflight: ArchiveImportPreflight
+    operation_id: str
+    timestamp: str
+    staging_revision: int
+
+
 class SQLiteAppStateStore(Phase5StoreMixin):
     _CONSTRUCTION_KEY = object()
 
@@ -2028,11 +2128,10 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         try:
             lease.assert_live()
             with engine.begin() as connection:
-                integrity = __import__(
-                    "bots5.infrastructure.persistence.migrations.versions.0003_integrity_boundaries",
-                    fromlist=["_validate_existing_state"],
-                )
-                integrity._validate_existing_state(connection)
+                revision = connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one_or_none()
+                if revision != _PHASE9_REVISION:
+                    integrity = __import__("bots5.infrastructure.persistence.migrations.versions.0003_integrity_boundaries", fromlist=["_validate_existing_state"])
+                    integrity._validate_existing_state(connection)
                 column_info = {
                     row[1]: row
                     for row in connection.exec_driver_sql(
@@ -2040,9 +2139,6 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     ).fetchall()
                 }
                 columns = set(column_info)
-                revision = connection.exec_driver_sql(
-                    "SELECT version_num FROM alembic_version"
-                ).scalar_one_or_none()
                 phase3_columns = {
                     "provider_id",
                     "returned_model",
@@ -2096,10 +2192,10 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     _validate_phase5_schema(connection)
                     _validate_phase5_trigger_behavior(connection)
                     validate_phase6_schema(connection)
-                if revision == _PHASE8_REVISION:
+                if revision in {_PHASE8_REVISION, _PHASE9_REVISION}:
                     _validate_open_connection(
                         connection,
-                        expected_revision=_PHASE8_REVISION,
+                        expected_revision=revision,
                         destructive_phase6=False,
                         require_fts=False,
                         allow_missing_search_index_state=True,
@@ -2169,6 +2265,12 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                 ).scalar_one()
             if phase6_tables:
                 store._reconcile_attachments_startup()
+            # A new authority holds the database/root claim only after the
+            # old owner is gone.  Reconcile durable journal facts before any
+            # ordinary command can claim work; this never reopens intake
+            # source bytes and only releases an unjournalled PREFLIGHTING
+            # claim whose prior owner cannot still run.
+            store._recover_archive_imports_startup(now=datetime.now(UTC))
         except BaseException as exc:
             # Startup verification has failed.  Release existing bearers only;
             # do not open another database connection from the caught path.
@@ -2211,6 +2313,2344 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         except AuthorityError as exc:
             raise StateError("event publication authority is unavailable") from exc
 
+    # Phase 9 Archive import -------------------------------------------------
+    # The queue has two public effects deliberately.  Admission records one
+    # immutable source identity, while staging captures and validates that
+    # identity before its durable, non-cancellable cutoff transaction.
+    def enqueue_archive_import(
+        self,
+        source: Path | str,
+        *,
+        resolver_roots: tuple[Path | str, ...],
+        now,
+        queue_id: str | None = None,
+        import_as_archived: bool = False,
+    ) -> QueueItem:
+        self._ensure_open()
+        # Queue admission deliberately does not resolve roots or read archive
+        # content.  Those potentially expensive and replacement-sensitive
+        # operations belong to the worker's preflight immediately before the
+        # first durable cutoff.
+        path = Path(source)
+        if not path.is_absolute() or type(import_as_archived) is not bool:
+            raise StateError("archive import intake path or resolver roots are invalid")
+        if any(not Path(root).is_absolute() for root in resolver_roots):
+            raise StateError("archive import resolver root is invalid")
+        fingerprint = source_fingerprint(path)
+        identifier = queue_id or str(uuid7())
+        if not identifier:
+            raise StateError("archive import queue ID is invalid")
+        item = QueueItem(identifier, 1, 0, ImportQueueState.QUEUED, fingerprint)
+        timestamp = utc_iso(now)
+        with self.command_admission():
+            with self._authority.transition():
+                connection = self._engine.connect()
+                try:
+                    connection.exec_driver_sql("BEGIN IMMEDIATE")
+                    assert_enqueueable(connection)
+                    enqueue_archive_import(
+                        connection, item, source_path=str(path),
+                        resolver_roots=tuple(str(Path(root)) for root in resolver_roots),
+                        options={"import_as_archived": import_as_archived}, enqueued_at=timestamp,
+                    )
+                    self._commit_attachment_transaction(connection, "enqueue archive import")
+                except ArchiveImportStoreError as exc:
+                    self._rollback_attachment_transaction(connection, "enqueue archive import")
+                    raise StateError(str(exc)) from exc
+                except BaseException:
+                    self._rollback_attachment_transaction(connection, "enqueue archive import")
+                    raise
+                finally:
+                    connection.close()
+        return item
+
+    def cancel_archive_import(self, queue_id: str, *, expected_revision: int, now) -> QueueItem:
+        """CAS-cancel an unjournalled import at the shared queue mutex."""
+        self._ensure_open()
+        if not queue_id or type(expected_revision) is not int or expected_revision < 1:
+            raise StateError("archive import cancellation request is invalid")
+        timestamp = utc_iso(now)
+        with self.command_admission(independent=True), self._authority.transition():
+            connection = self._engine.connect()
+            try:
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+                cancelled = cancel_waiting(connection, queue_id, expected_revision, now=timestamp)
+                self._commit_attachment_transaction(connection, "archive import cancellation")
+                return cancelled
+            except ArchiveImportStoreError as exc:
+                self._rollback_attachment_transaction(connection, "archive import cancellation")
+                raise StateError(str(exc)) from exc
+            except BaseException:
+                self._rollback_attachment_transaction(connection, "archive import cancellation")
+                raise
+            finally:
+                self._close_attachment_connection(connection, "archive import cancellation")
+
+    def list_archive_imports(self, *, limit: int = 50, cursor: tuple[int, str] | None = None) -> QueuePage:
+        self._ensure_open()
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise StateError("archive import page request is invalid")
+        args: tuple[object, ...] = ()
+        where = ""
+        if cursor is not None:
+            if type(cursor) is not tuple or len(cursor) != 2 or type(cursor[0]) is not int or type(cursor[1]) is not str:
+                raise StateError("archive import page request is invalid")
+            where = " WHERE ordinal>? OR (ordinal=? AND id>?)"
+            args = (cursor[0], cursor[0], cursor[1])
+        with self.command_admission(), self._engine.connect() as connection:
+            connection.exec_driver_sql("BEGIN")
+            try:
+                queue_revision, _, _ = queue_control(connection)
+                rows = connection.exec_driver_sql(
+                    "SELECT id,queue_revision,ordinal,state,source_device,source_inode,source_size,source_mtime_ns,source_ctime_ns,failure_code,operation_id FROM archive_import_queue" + where + " ORDER BY ordinal,id LIMIT ?",
+                    (*args, limit + 1),
+                ).fetchall()
+            finally:
+                connection.exec_driver_sql("ROLLBACK")
+        items = tuple(QueueItem(str(row[0]), int(row[1]), int(row[2]), ImportQueueState(str(row[3])), tuple(int(value) for value in row[4:9]), row[9], row[10]) for row in rows[:limit])
+        return QueuePage(items, (items[-1].ordinal, items[-1].id) if len(rows) > limit else None, queue_revision)
+
+    def reorder_archive_imports(self, expected_queue_revision: int, ordered_ids: tuple[str, ...], *, now) -> tuple[QueueItem, ...]:
+        self._ensure_open()
+        if type(expected_queue_revision) is not int or expected_queue_revision < 0:
+            raise StateError("archive import queue revision is invalid")
+        with self.command_admission(), self._authority.transition():
+            connection = self._engine.connect()
+            try:
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+                queue_revision, claimed_queue_id, owner_epoch = queue_control(connection)
+                if queue_revision != expected_queue_revision:
+                    raise ArchiveImportStoreError("queue reorder revision conflict")
+                if claimed_queue_id is not None or owner_epoch is not None:
+                    raise ArchiveImportStoreError("queue reorder is unavailable while an import is active")
+                rows = connection.exec_driver_sql("SELECT id,queue_revision,ordinal,state,source_device,source_inode,source_size,source_mtime_ns,source_ctime_ns,failure_code,operation_id FROM archive_import_queue WHERE state='QUEUED' ORDER BY ordinal,id").fetchall()
+                current = tuple(QueueItem(str(row[0]),int(row[1]),int(row[2]),ImportQueueState(str(row[3])),tuple(int(x) for x in row[4:9]),row[9],row[10]) for row in rows)
+                changed = reorder_queue(current, ordered_ids)
+                for item in changed:
+                    if connection.exec_driver_sql("UPDATE archive_import_queue SET ordinal=?,queue_revision=? WHERE id=? AND queue_revision=? AND state='QUEUED'", (item.ordinal,item.revision,item.id,item.revision-1)).rowcount != 1:
+                        raise ArchiveImportStoreError("queue reorder compare-and-set failed")
+                advance_queue_control(
+                    connection, queue_revision, claimed_queue_id=None, owner_epoch=None,
+                )
+                self._commit_attachment_transaction(connection, "reorder archive imports")
+                return changed
+            except (ArchiveImportStoreError, ValueError) as exc:
+                self._rollback_attachment_transaction(connection, "reorder archive imports")
+                raise StateError(str(exc)) from exc
+            finally:
+                self._close_attachment_connection(connection, "reorder archive imports")
+
+    def remove_waiting_archive_import(self, queue_id: str, *, expected_revision: int, now) -> QueueItem:
+        self._ensure_open()
+        with self.command_admission(), self._authority.transition():
+            connection = self._engine.connect()
+            try:
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+                removed = cancel_waiting(connection, queue_id, expected_revision, now=utc_iso(now), queued_only=True)
+                self._commit_attachment_transaction(connection, "remove waiting archive import")
+                return removed
+            except ArchiveImportStoreError as exc:
+                self._rollback_attachment_transaction(connection, "remove waiting archive import")
+                raise StateError(str(exc)) from exc
+            finally:
+                self._close_attachment_connection(connection, "remove waiting archive import")
+
+    def retry_archive_import(self, queue_id: str, *, now) -> QueueItem:
+        self._ensure_open(); timestamp = utc_iso(now)
+        with self.command_admission(), self._authority.transition():
+            connection = self._engine.connect()
+            try:
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+                row = connection.exec_driver_sql("SELECT source_path,resolver_roots,options,state FROM archive_import_queue WHERE id=?", (queue_id,)).first()
+                if row is None or str(row[3]) not in {"FAILED", "CANCELLED"}:
+                    raise ArchiveImportStoreError("only failed or cancelled imports may retry")
+                fingerprint = source_fingerprint(Path(str(row[0])))
+                ordinal = int(connection.exec_driver_sql("SELECT coalesce(max(ordinal),-1)+1 FROM archive_import_queue").scalar_one())
+                item = QueueItem(str(uuid7()), 1, ordinal, ImportQueueState.QUEUED, fingerprint)
+                enqueue_archive_import(connection, item, source_path=str(row[0]), resolver_roots=tuple(json.loads(str(row[1]))), options=json.loads(str(row[2])), enqueued_at=timestamp, retry_of=queue_id)
+                self._commit_attachment_transaction(connection, "retry archive import")
+                return item
+            except (ArchiveImportStoreError, ValueError, OSError) as exc:
+                self._rollback_attachment_transaction(connection, "retry archive import")
+                raise StateError(str(exc)) from exc
+            finally:
+                self._close_attachment_connection(connection, "retry archive import")
+
+    def clear_archive_import_history(self, ids: tuple[str, ...]) -> None:
+        self._ensure_open()
+        if not ids or len(set(ids)) != len(ids) or any(not value for value in ids):
+            raise StateError("archive import clear request is invalid")
+        markers = ",".join("?" for _ in ids)
+        with self.command_admission(), self._authority.transition():
+            connection = self._engine.connect()
+            try:
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+                rows = connection.exec_driver_sql(f"SELECT id,state FROM archive_import_queue WHERE id IN ({markers})", ids).fetchall()
+                if len(rows) != len(ids) or any(str(row[1]) not in {"COMPLETED", "FAILED", "CANCELLED"} for row in rows):
+                    raise ArchiveImportStoreError("only terminal import history may clear")
+                connection.exec_driver_sql(f"DELETE FROM archive_import_queue WHERE id IN ({markers})", ids)
+                revision, claimed_queue_id, owner_epoch = queue_control(connection)
+                advance_queue_control(
+                    connection, revision, claimed_queue_id=claimed_queue_id, owner_epoch=owner_epoch,
+                )
+                self._commit_attachment_transaction(connection, "clear archive import history")
+            except ArchiveImportStoreError as exc:
+                self._rollback_attachment_transaction(connection, "clear archive import history")
+                raise StateError(str(exc)) from exc
+            finally:
+                self._close_attachment_connection(connection, "clear archive import history")
+
+    def stage_archive_import(
+        self,
+        queue_id: str,
+        *,
+        now,
+        operation_id: str | None = None,
+    ) -> QueueItem:
+        """Capture, validate, then durably cross the import cancellation cutoff."""
+        self._ensure_open()
+        if not queue_id:
+            raise StateError("archive import queue ID is invalid")
+        # Read queued intake facts first. No state changes occur if capture,
+        # resolver admission, or wire validation fails.
+        with self.command_admission():
+            with self._engine.connect() as connection:
+                row = connection.exec_driver_sql(
+                    "SELECT source_path,source_device,source_inode,source_size,source_mtime_ns,source_ctime_ns,resolver_roots,state,queue_revision FROM archive_import_queue WHERE id=?",
+                    (queue_id,),
+                ).first()
+        if row is None:
+            raise StateError("archive import queue item is absent")
+        if str(row[7]) != ImportQueueState.QUEUED.value:
+            raise StateError("archive import queue item is no longer waiting")
+        try:
+            roots_raw = json.loads(str(row[6]))
+            if type(roots_raw) is not list or any(type(root) is not str for root in roots_raw):
+                raise ValueError
+            path = resolve_source(Path(str(row[0])), tuple(Path(root) for root in roots_raw))
+            plan = capture_validated_archive(path, tuple(int(value) for value in row[1:6]))
+            plan = resolve_external_payloads(plan, tuple(Path(root) for root in roots_raw))
+        except ImportErrorCode as exc:
+            raise StateError(str(exc)) from exc
+        except (ValueError, ArchiveImportStoreError) as exc:
+            raise StateError("archive import intake record is malformed") from exc
+        timestamp = utc_iso(now)
+        operation = operation_id or str(uuid7())
+        try:
+            digest = bytes.fromhex(plan.binding.sha256)
+            graph_digest = plan.plan.graph_plan_sha256
+        except ValueError as exc:
+            close_payload_snapshots(plan)
+            raise StateError("archive import capture digest is malformed") from exc
+        intent = JournalIntent(
+            operation, plan.archive_id, plan.archive_version, plan.logical_content_digest,
+            plan.source_chat_id, plan.source_chat_revision, digest, plan.binding.byte_size,
+            timestamp, timestamp, graph_digest,
+            self._sealed_import_graph(plan.plan),
+            tuple({"digest": bytes.fromhex(digest), "size": raw.size} for digest, raw in plan.payloads),
+        )
+        with self.command_admission(independent=True):
+            with self._authority.transition():
+                connection = self._engine.connect()
+                try:
+                    connection.exec_driver_sql("BEGIN IMMEDIATE")
+                    current = archive_queue_item(connection, queue_id)
+                    if current.state is not ImportQueueState.QUEUED or current.revision != int(row[8]):
+                        raise ArchiveImportStoreError("archive import queue changed during preflight")
+                    claimed = claim(connection, queue_id, current.revision, now=timestamp, owner_epoch=operation)
+                    staged = begin_staging(connection, queue_id, claimed.revision, intent)
+                    self._commit_attachment_transaction(connection, "stage archive import")
+                except ArchiveImportStoreError as exc:
+                    self._rollback_attachment_transaction(connection, "stage archive import")
+                    close_payload_snapshots(plan)
+                    raise StateError(str(exc)) from exc
+                except BaseException:
+                    self._rollback_attachment_transaction(connection, "stage archive import")
+                    close_payload_snapshots(plan)
+                    raise
+                finally:
+                    connection.close()
+        close_payload_snapshots(plan)
+        return staged
+
+    def preflight_archive_import(
+        self, queue_id: str, *, owner_epoch: str | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> ArchiveImportPreflight:
+        """Capture one queue item before its first durable import effect.
+
+        The returned object owns anonymous payload snapshots.  Its caller must
+        pass it to :meth:`settle_archive_import` or close its snapshots if the
+        cancellable preflight is abandoned before the cutoff.
+        """
+        self._ensure_open()
+        if not queue_id:
+            raise StateError("archive import queue ID is invalid")
+        owner = owner_epoch or str(uuid7())
+        with self.command_admission(independent=True), self._authority.transition():
+            connection = self._engine.connect()
+            try:
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+                current = archive_queue_item(connection, queue_id)
+                claimed = claim(
+                    connection, queue_id, current.revision, now=utc_iso(datetime.now(UTC)),
+                    owner_epoch=owner,
+                )
+                self._commit_attachment_transaction(connection, "archive import preflight claim")
+            except ArchiveImportStoreError as exc:
+                self._rollback_attachment_transaction(connection, "archive import preflight claim")
+                raise StateError(str(exc)) from exc
+            except BaseException:
+                self._rollback_attachment_transaction(connection, "archive import preflight claim")
+                raise
+            finally:
+                self._close_attachment_connection(connection, "archive import preflight claim")
+        with self.command_admission(independent=True), self._engine.connect() as connection:
+            row = connection.exec_driver_sql(
+                "SELECT source_path,source_device,source_inode,source_size,source_mtime_ns,source_ctime_ns,resolver_roots,options,state,queue_revision FROM archive_import_queue WHERE id=?",
+                (queue_id,),
+            ).first()
+        if (row is None or str(row[8]) != ImportQueueState.PREFLIGHTING.value
+                or int(row[9]) != claimed.revision):
+            raise StateError("archive import queue item is no longer waiting")
+        try:
+            roots = json.loads(str(row[6])); options = json.loads(str(row[7]))
+            if (type(roots) is not list or any(type(root) is not str for root in roots)
+                    or type(options) is not dict or set(options) != {"import_as_archived"}
+                    or type(options["import_as_archived"]) is not bool):
+                raise ValueError
+            source = resolve_source(Path(str(row[0])), tuple(Path(root) for root in roots))
+            captured = resolve_external_payloads(
+                capture_validated_archive(
+                    source, tuple(int(value) for value in row[1:6]), cancelled=cancelled,
+                ),
+                tuple(Path(root) for root in roots),
+                cancelled=cancelled,
+            )
+        except ImportErrorCode as exc:
+            self._settle_archive_import_preflight(
+                queue_id, claimed.revision, owner,
+                target=(ImportQueueState.QUEUED if str(exc) == "RESOLUTION_CANCELLED" else ImportQueueState.FAILED),
+                failure_code=None if str(exc) == "RESOLUTION_CANCELLED" else str(exc),
+            )
+            raise StateError(str(exc)) from exc
+        except (ValueError, ArchiveImportStoreError) as exc:
+            self._settle_archive_import_preflight(
+                queue_id, claimed.revision, owner,
+                target=ImportQueueState.FAILED, failure_code="ARCHIVE_INVALID",
+            )
+            raise StateError("archive import intake record is malformed") from exc
+        try:
+            with self._authority.operation(), self._engine.connect() as connection:
+                # Receiver-local automatic equivalence is decided before the
+                # first import journal effect and folded into the same sealed
+                # plan as source identities.  Publication must consume these
+                # facts; it may not query today's catalogue and bless a new
+                # target after the cutoff.
+                captured = replace(
+                    captured,
+                    plan=with_initial_receiver_continuation(
+                        captured.plan,
+                        self._plan_initial_receiver_continuation(captured.plan),
+                    ),
+                )
+                captured = replace(
+                    captured,
+                    verified_ready_payloads=self._assert_import_payload_capacity(
+                        captured, connection, verify_ready=True,
+                    ),
+                )
+        except StateError as exc:
+            close_payload_snapshots(captured)
+            self._settle_archive_import_preflight(
+                queue_id, claimed.revision, owner,
+                target=ImportQueueState.FAILED, failure_code="RESOURCE_LIMIT",
+            )
+            raise
+        return ArchiveImportPreflight(
+            queue_id=queue_id,
+            queue_revision=int(row[9]),
+            owner_epoch=owner,
+            import_as_archived=bool(options["import_as_archived"]),
+            captured=captured,
+        )
+
+    def _settle_archive_import_preflight(
+        self, queue_id: str, expected_revision: int, owner_epoch: str, *,
+        target: ImportQueueState, failure_code: str | None,
+    ) -> QueueItem:
+        """Close an owned, journal-free preflight with its claim release."""
+        timestamp = utc_iso(datetime.now(UTC))
+        with self.command_admission(independent=True), self._authority.transition():
+            connection = self._engine.connect()
+            try:
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+                result = settle_preflight_without_journal(
+                    connection, queue_id, expected_revision, owner_epoch,
+                    target=target, failure_code=failure_code, now=timestamp,
+                )
+                self._commit_attachment_transaction(connection, "archive import preflight settlement")
+                return result
+            except ArchiveImportStoreError as exc:
+                self._rollback_attachment_transaction(connection, "archive import preflight settlement")
+                raise StateError(str(exc)) from exc
+            except BaseException:
+                self._rollback_attachment_transaction(connection, "archive import preflight settlement")
+                raise
+            finally:
+                self._close_attachment_connection(connection, "archive import preflight settlement")
+
+    @staticmethod
+    def _round_capacity(value: int, unit: int) -> int:
+        return ((value + unit - 1) // unit) * unit
+
+    def _assert_import_payload_capacity(self, captured, connection, *, verify_ready: bool) -> tuple[tuple[str, int], ...]:
+        """Check the exact retained payload plan without reading payload bytes.
+
+        The preflight snapshots already consume their scratch allocation.  The
+        only later scratch need is one bounded read buffer per distinct retained
+        snapshot; destination needs one rooted capture per *new* digest plus
+        conservative journal/SQLite/directory metadata.
+        """
+        distinct: dict[str, object] = {}
+        for digest, snapshot in captured.payloads:
+            prior = distinct.setdefault(digest, snapshot)
+            if prior.size != snapshot.size:
+                raise StateError("sealed payload digest has contradictory sizes")
+        destination_device, destination_free, destination_unit = (
+            self._attachment_manager.namespace_capacity("captures")
+        )
+        object_device, object_free, object_unit = self._attachment_manager.namespace_capacity("objects")
+        if destination_device != object_device:
+            raise StateError("attachment capture and object namespaces are on different devices")
+        new_bytes = 0
+        retained_ready = {
+            digest: (size, identity)
+            for digest, size, identity in captured.verified_ready_payloads
+        }
+        verified_ready: list[tuple[str, int, object]] = []
+        for digest, snapshot in distinct.items():
+            try:
+                digest_bytes = bytes.fromhex(digest)
+            except ValueError as exc:
+                raise StateError("sealed archive payload digest is malformed") from exc
+            existing = connection.execute(
+                select(attachment_blobs.c.state, attachment_blobs.c.byte_size).where(
+                    attachment_blobs.c.digest == digest_bytes
+                )
+            ).first()
+            if existing is None:
+                new_bytes += self._round_capacity(snapshot.size, destination_unit)
+            elif existing.state != "ready" or int(existing.byte_size) != snapshot.size:
+                raise StateError("archive payload lifecycle is not ready")
+            elif verify_ready:
+                # This is deliberately outside the cutoff transaction.  The
+                # later transition only rechecks the retained identity.
+                verified_ready.append((
+                    digest, snapshot.size,
+                    self._attachment_manager.verified_object_identity(
+                        digest_bytes, expected_size=snapshot.size,
+                    ),
+                ))
+            elif digest not in retained_ready:
+                raise StateError("ready archive payload was not verified before cutoff")
+            else:
+                try:
+                    current_identity = self._attachment_manager.object_identity(digest_bytes)
+                except AttachmentIntegrityError as exc:
+                    raise StateError("ready archive payload changed after preflight verification") from exc
+                if current_identity != retained_ready[digest][1]:
+                    raise StateError("ready archive payload changed after preflight verification")
+        graph_bytes = len(canonical_json_bytes(self._sealed_import_graph(captured.plan)))
+        payload_bytes = len(canonical_json_bytes([
+            {"digest": digest, "size": snapshot.size}
+            for digest, snapshot in distinct.items()
+        ]))
+        metadata = (
+            graph_bytes + payload_bytes + _PHASE9_PAYLOAD_JOURNAL_OVERHEAD
+            + len(distinct) * _PHASE9_PAYLOAD_ROW_OVERHEAD
+        )
+        destination_required = new_bytes + self._round_capacity(metadata, destination_unit)
+        page_size = int(connection.exec_driver_sql("PRAGMA page_size").scalar_one())
+        page_count = int(connection.exec_driver_sql("PRAGMA page_count").scalar_one())
+        if page_size <= 0 or page_count < 1:
+            raise StateError("archive import database page size is invalid")
+        schema_objects = int(connection.exec_driver_sql(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table','index') "
+            "AND name NOT LIKE 'sqlite_%'"
+        ).scalar_one())
+        if schema_objects < 1:
+            raise StateError("archive import database schema capacity is invalid")
+        # A SQLite rollback/WAL journal can transiently retain the complete
+        # existing database.  For new graph growth, charge every current
+        # table/index object one rounded sealed-graph image; this deliberately
+        # overestimates the rows and all PK/unique/FK index fan-out without
+        # relying on an unjustified fixed index count per row.
+        database_journal_ceiling = page_count * page_size
+        database_growth = self._round_capacity(
+            (graph_bytes + payload_bytes + metadata + page_size) * schema_objects,
+            page_size,
+        )
+        database_required = database_journal_ceiling + database_growth
+        database_fd = self._authority._directory_fd("database")
+        try:
+            database_status = os.fstatvfs(database_fd)
+            database_identity = os.fstat(database_fd)
+            database_unit = database_status.f_frsize or database_status.f_bsize
+        except OSError as exc:
+            raise StateError("archive import database capacity is unavailable") from exc
+        if database_unit <= 0:
+            raise StateError("archive import database capacity is invalid")
+        database_free = database_status.f_bavail * database_unit
+        combined_required = destination_required + database_required
+        if (
+            destination_free < destination_required
+            or object_free < self._round_capacity(metadata, object_unit)
+            or database_free < database_required
+            or (
+                database_identity.st_dev == destination_device
+                and destination_free < combined_required
+            )
+        ):
+            raise StateError("archive import destination capacity is insufficient")
+        return tuple(verified_ready)
+
+    def execute_archive_import(
+        self,
+        queue_id: str,
+        *,
+        now,
+        operation_id: str | None = None,
+    ) -> str:
+        """Import one queued archive from its one exact captured plan.
+
+        This is intentionally separate from the stage-only diagnostic surface.
+        It retains the canonical plan from descriptor capture through the
+        authority-owned cutoff and known graph settlement; it never reopens the
+        intake pathname after the plan has been sealed.
+        """
+        return self.settle_archive_import(
+            self.cross_archive_import_cutoff(
+                self.preflight_archive_import(queue_id, owner_epoch=operation_id),
+                now=now, operation_id=operation_id,
+            )
+        )
+
+    def cross_archive_import_cutoff(
+        self,
+        preflight: ArchiveImportPreflight,
+        *,
+        now,
+        operation_id: str | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> ArchiveImportSettlement:
+        """Persist the first irreversible journal effect for one sealed plan."""
+        self._ensure_open()
+        queue_id = preflight.queue_id
+        captured = preflight.captured
+        # One frozen capture supplies both graph and payload plan.  External
+        # candidates were verified during preflight; unresolved
+        # ``missing-external`` rows remain truthful graph facts.
+        timestamp = utc_iso(now)
+        operation = operation_id or preflight.owner_epoch
+        if operation != preflight.owner_epoch:
+            close_payload_snapshots(captured)
+            raise StateError("archive import operation does not own its preflight claim")
+        try:
+            intent = JournalIntent(
+                operation, captured.archive_id, captured.archive_version,
+                captured.logical_content_digest, captured.source_chat_id,
+                captured.source_chat_revision, bytes.fromhex(captured.binding.sha256),
+                captured.binding.byte_size, timestamp, timestamp,
+                captured.plan.graph_plan_sha256, self._sealed_import_graph(captured.plan),
+                tuple({"digest": bytes.fromhex(digest), "size": raw.size} for digest, raw in captured.payloads),
+            )
+        except ValueError as exc:
+            close_payload_snapshots(captured)
+            raise StateError("archive import capture digest is malformed") from exc
+        with self._authority.transition():
+            # A captured plan owns open payload snapshots until the durable
+            # cutoff connection has closed successfully.  A committed journal
+            # without a known close outcome remains an authority failure, and
+            # must not leak those private handles while recovery determines
+            # the durable result.
+            try:
+                connection = self._engine.connect()
+            except BaseException:
+                close_payload_snapshots(captured)
+                raise
+            handed_off = False
+            close_pending = True
+            try:
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+                current = archive_queue_item(connection, queue_id)
+                if current.state is ImportQueueState.CANCELLED:
+                    raise StateError("RESOLUTION_CANCELLED")
+                if (current.state is not ImportQueueState.PREFLIGHTING
+                        or current.revision != preflight.queue_revision):
+                    raise ArchiveImportStoreError("archive import queue changed during preflight")
+                control = connection.exec_driver_sql(
+                    "SELECT claimed_queue_id,owner_epoch FROM archive_import_queue_control WHERE singleton=1"
+                ).first()
+                if (control is None or str(control[0]) != queue_id
+                        or str(control[1]) != operation):
+                    raise ArchiveImportStoreError("archive import preflight owner changed")
+                # This is the cancellation/effect linearization point.  The
+                # transition to PREFLIGHTING is still inside this uncommitted
+                # transaction; cancellation here rolls it back with no journal
+                # or graph effect.  Once begin_staging executes, the journal
+                # owns all later settlement.
+                if cancelled is not None and cancelled():
+                    raise StateError("RESOLUTION_CANCELLED")
+                # Capacity may have changed after preflight.  Recheck only
+                # retained-plan metadata and filesystem counters here; never
+                # hash or reopen a source under the transition.
+                self._assert_import_payload_capacity(captured, connection, verify_ready=False)
+                staged = begin_staging(connection, queue_id, current.revision, intent)
+                self._commit_attachment_transaction(connection, "archive import durable cutoff")
+                settlement = ArchiveImportSettlement(
+                    preflight=preflight, operation_id=operation, timestamp=timestamp,
+                    staging_revision=staged.revision,
+                )
+            except ArchiveImportStoreError as exc:
+                self._rollback_attachment_transaction(connection, "archive import durable cutoff")
+                raise StateError(str(exc)) from exc
+            except BaseException:
+                self._rollback_attachment_transaction(connection, "archive import durable cutoff")
+                raise
+            else:
+                # The sealed capture may be handed to settlement only after
+                # the cutoff connection has a known close result.  Otherwise
+                # restart recovery owns the durable journal, never live file
+                # descriptors from this process.
+                try:
+                    close_pending = False
+                    self._close_attachment_connection(connection, "archive import durable cutoff")
+                except BaseException:
+                    raise
+                handed_off = True
+                return settlement
+            finally:
+                if not handed_off:
+                    try:
+                        if close_pending:
+                            self._close_attachment_connection(connection, "archive import durable cutoff")
+                    finally:
+                        close_payload_snapshots(captured)
+
+    def settle_archive_import(self, settlement: ArchiveImportSettlement) -> str:
+        """Settle the exact cutoff plan without reopening its intake source."""
+        self._ensure_open()
+        preflight = settlement.preflight
+        captured = preflight.captured
+        queue_id = preflight.queue_id
+        operation = settlement.operation_id
+        timestamp = settlement.timestamp
+        with self._authority.transition():
+            connection = None
+            commit_attempted = False
+            try:
+                self._publish_import_payloads(captured, operation, timestamp)
+                connection = self._engine.connect()
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+                committing = begin_graph_commit(
+                    connection, queue_id, settlement.staging_revision, operation, now=timestamp,
+                )
+                self._assert_sealed_import_graph(connection, operation, captured.plan)
+                source_revision = self._publish_import_graph(
+                    connection, captured, operation, timestamp,
+                    import_as_archived=preflight.import_as_archived,
+                )
+                completed = complete_known_graph(
+                    connection, queue_id, committing.revision, operation,
+                    captured.plan.local_id("chat", captured.source_chat_id), now=timestamp,
+                )
+                if completed.state is not ImportQueueState.COMPLETED:
+                    raise ArchiveImportStoreError("import queue terminal marker is invalid")
+                commit_attempted = True
+                self._commit_attachment_transaction(connection, "archive import graph commit")
+                self._accept_search_receipt(
+                    SearchReceipt(
+                        source_revision,
+                        frozenset(
+                            {
+                                f"chat:{captured.plan.local_id('chat', captured.source_chat_id)}",
+                                *(f"message:{captured.plan.local_id('message', str(item['source_id']))}" for item in captured.plan.messages),
+                                *(f"attachment:{captured.plan.local_id('attachment', str(item['source_id']))}" for item in captured.plan.attachments),
+                            }
+                        ),
+                    )
+                )
+                return captured.plan.local_id("chat", captured.source_chat_id)
+            except ArchiveImportStoreError as exc:
+                if not commit_attempted and connection is not None:
+                    self._rollback_attachment_transaction(connection, "archive import graph commit")
+                raise StateError(str(exc)) from exc
+            except BaseException:
+                if not commit_attempted and connection is not None:
+                    self._rollback_attachment_transaction(connection, "archive import graph commit")
+                raise
+            finally:
+                try:
+                    if connection is not None:
+                        self._close_attachment_connection(connection, "archive import graph commit")
+                finally:
+                    # This includes rollback and post-commit connection-close
+                    # failures.  Payload snapshots are process resources, not
+                    # recovery inputs, so recovery must never inherit them.
+                    close_payload_snapshots(captured)
+
+    def _publish_import_payloads(self, captured, operation_id: str, timestamp: str) -> None:
+        """Publish sealed embedded bytes without creating a normal attachment ID."""
+        for digest_text, raw in captured.payloads:
+            try:
+                digest = bytes.fromhex(digest_text)
+            except ValueError as exc:
+                raise StateError("sealed archive payload digest is malformed") from exc
+            connection = self._engine.connect()
+            captured_blob = None
+            try:
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+                existing = connection.execute(
+                    select(attachment_blobs).where(attachment_blobs.c.digest == digest)
+                ).first()
+                if existing is not None:
+                    if existing.state != "ready" or int(existing.byte_size) != raw.size:
+                        raise StateError("archive payload lifecycle is not ready")
+                    # Verify the existing canonical object before allocating a
+                    # second capture.  This hashes in bounded chunks only.
+                    self._attachment_manager.verify_object(digest, expected_size=raw.size)
+                    changed = connection.exec_driver_sql(
+                        "UPDATE archive_import_payload_reservations SET publication_state='READY' "
+                        "WHERE operation_id=? AND digest=? AND size=? AND publication_state='PLANNED'",
+                        (operation_id, digest, raw.size),
+                    ).rowcount
+                    if changed != 1:
+                        raise StateError("archive payload reservation changed during publication")
+                    self._commit_attachment_transaction(connection, "archive import payload ready dedup")
+                    continue
+                self._commit_attachment_transaction(connection, "archive import payload dedup absence")
+                connection.close(); connection = None
+                captured_blob = self._attachment_manager.capture_verified_snapshot(
+                    raw.handle, digest, raw.size,
+                )
+                connection = self._engine.connect(); connection.exec_driver_sql("BEGIN IMMEDIATE")
+                existing = connection.execute(
+                    select(attachment_blobs).where(attachment_blobs.c.digest == digest)
+                ).first()
+                if existing is not None:
+                    # The transition gate normally excludes this race.  If a
+                    # recovered native publication won it, discard our exact
+                    # capture and use the verified ready object.
+                    if existing.state != "ready" or int(existing.byte_size) != raw.size:
+                        raise StateError("archive payload lifecycle is not ready")
+                    self._attachment_manager.verify_object(digest, expected_size=raw.size)
+                    self._attachment_manager.discard_capture(captured_blob.operation_id)
+                else:
+                    arm_phase6_blob_transition(connection, digest, "", "staging", operation_id=captured_blob.operation_id, stage_name=captured_blob.operation_id, byte_size=raw.size)
+                    try:
+                        connection.execute(insert(attachment_blobs).values(digest=digest, byte_size=raw.size, state="staging", operation_id=captured_blob.operation_id, stage_name=captured_blob.operation_id, gc_id=None, created_at=timestamp)); require_phase6_consumed(connection)
+                    finally: clear_phase6(connection)
+                    self._commit_attachment_transaction(connection, "archive import payload staging")
+                    connection.close(); connection = None
+                    self._attachment_manager.capture_to_stage(captured_blob.operation_id, digest, raw.size)
+                    self._attachment_manager.stage_to_object(captured_blob.operation_id, digest, raw.size)
+                    self._attachment_manager.prove_staging_publication(captured_blob.operation_id, digest, raw.size)
+                    connection = self._engine.connect(); connection.exec_driver_sql("BEGIN IMMEDIATE")
+                    arm_phase6_blob_transition(connection, digest, "staging", "ready", byte_size=raw.size)
+                    try:
+                        connection.execute(update(attachment_blobs).where(attachment_blobs.c.digest == digest).values(state="ready", operation_id=None, stage_name=None, gc_id=None)); require_phase6_consumed(connection)
+                    finally: clear_phase6(connection)
+                changed = connection.exec_driver_sql(
+                    "UPDATE archive_import_payload_reservations SET publication_state='READY' "
+                    "WHERE operation_id=? AND digest=? AND size=? AND publication_state='PLANNED'",
+                    (operation_id, digest, raw.size),
+                ).rowcount
+                if changed != 1:
+                    raise StateError("archive payload reservation changed during publication")
+                self._commit_attachment_transaction(connection, "archive import payload ready")
+            except BaseException:
+                if connection is not None:
+                    self._rollback_attachment_transaction(connection, "archive import payload publication")
+                raise
+            finally:
+                if connection is not None:
+                    connection.close()
+
+    def _recover_archive_imports(
+        self, *, now, reclaim_interrupted_preflight: bool,
+        startup: bool,
+    ) -> tuple[tuple[str, str], ...]:
+        """Mechanically settle only durable, non-contradictory import evidence.
+
+        Recovery never reopens an intake pathname or replays a plan.  A durable
+        pregraph operation with no graph becomes a retained failed result;
+        committed evidence remains intact.  Any partial graph or contradictory
+        marker poisons the authority through the normal transaction fence.
+        """
+        self._ensure_open()
+        timestamp = utc_iso(now)
+        outcomes: list[tuple[str, str]] = []
+        admission = nullcontext() if startup else self.command_admission(independent=True)
+        with admission:
+            with self._authority.transition():
+                connection = self._engine.connect()
+                try:
+                    connection.exec_driver_sql("BEGIN IMMEDIATE")
+                    rows = connection.exec_driver_sql(
+                        "SELECT id FROM archive_import_operations "
+                        "WHERE state IN ('STAGING','COMMITTING','COMMITTED') ORDER BY id"
+                    ).fetchall()
+                    for (operation_id,) in rows:
+                        operation = str(operation_id)
+                        mapped = connection.exec_driver_sql(
+                            "SELECT chat_id FROM archive_import_chats WHERE operation_id=?",
+                            (operation,),
+                        ).fetchall()
+                        def graph_exists(chat_id: str) -> bool:
+                            return (
+                                len(mapped) == 1
+                                and str(mapped[0][0]) == chat_id
+                                and connection.exec_driver_sql(
+                                    "SELECT count(*) FROM chats WHERE id=?", (chat_id,)
+                                ).scalar_one() == 1
+                            )
+                        result = recover_known_operation(
+                            connection, operation, graph_exists=graph_exists
+                        )
+                        if result == "COMMITTED":
+                            self._assert_reconstructed_import_graph(connection, operation)
+                        if result == "KNOWN_NO_COMMIT":
+                            queue = connection.exec_driver_sql(
+                                "SELECT id,queue_revision FROM archive_import_queue WHERE operation_id=?",
+                                (operation,),
+                            ).first()
+                            if queue is None:
+                                raise ArchiveImportStoreError("pregraph operation lacks its queue item")
+                            fail_known_pregraph(
+                                connection, str(queue[0]), int(queue[1]), operation,
+                                code="RECOVERED_NO_GRAPH", now=timestamp,
+                            )
+                        outcomes.append((operation, result))
+                    revision, claimed_queue_id, owner_epoch = queue_control(connection)
+                    if claimed_queue_id is not None:
+                        row = connection.exec_driver_sql(
+                            "SELECT state,operation_id,queue_revision FROM archive_import_queue WHERE id=?",
+                            (claimed_queue_id,),
+                        ).first()
+                        if row is None:
+                            raise ArchiveImportStoreError("queue controller refers to an absent item")
+                        if (
+                            reclaim_interrupted_preflight
+                            and str(row[0]) == ImportQueueState.PREFLIGHTING.value
+                            and row[1] is None
+                            and owner_epoch is not None
+                        ):
+                            settle_preflight_without_journal(
+                                connection, str(claimed_queue_id), int(row[2]), str(owner_epoch),
+                                target=ImportQueueState.QUEUED, failure_code=None,
+                                now=timestamp,
+                            )
+                            outcomes.append((str(claimed_queue_id), "RECLAIMED_PREFLIGHT"))
+                        else:
+                            raise ArchiveImportStoreError(
+                                "interrupted queue claim cannot be safely reclaimed"
+                            )
+                    self._commit_attachment_transaction(connection, "recover archive imports")
+                except ArchiveImportStoreError as exc:
+                    self._rollback_attachment_transaction(connection, "recover archive imports")
+                    self._authority.poison("archive import recovery evidence is contradictory")
+                    raise StateError("archive import recovery requires controlled restart") from exc
+                except BaseException:
+                    self._rollback_attachment_transaction(connection, "recover archive imports")
+                    raise
+                finally:
+                    connection.close()
+        return tuple(outcomes)
+
+    def recover_archive_imports(self, *, now) -> tuple[tuple[str, str], ...]:
+        return self._recover_archive_imports(
+            now=now, reclaim_interrupted_preflight=False, startup=False,
+        )
+
+    def _recover_archive_imports_startup(self, *, now) -> tuple[tuple[str, str], ...]:
+        """Recover only after startup has proved the prior authority is gone."""
+        return self._recover_archive_imports(
+            now=now, reclaim_interrupted_preflight=True, startup=True,
+        )
+
+    @staticmethod
+    def _sealed_import_graph(plan) -> dict[str, object]:
+        """The exact preflight graph admitted at the durable cutoff."""
+        return {
+            "inventory": list(plan.graph_inventory), "chat": plan.chat,
+            "messages": list(plan.messages), "attempts": list(plan.attempts),
+            "attachments": list(plan.attachments), "context_plans": list(plan.context_plans),
+            "message_attachment_relations": list(plan.message_attachment_relations),
+            "attempt_attachment_relations": list(plan.attempt_attachment_relations),
+            "chat_configuration": plan.chat_configuration,
+            "archive_provenance": plan.archive_provenance, "manifest": plan.manifest,
+            "source_binding": plan.source_binding,
+            "object_provenance": list(plan.object_provenance),
+            "provenance_node_ids": list(plan.provenance_node_ids),
+            "continuation_history": plan.continuation_history,
+            "history_bindings": list(plan.history_bindings),
+            "initial_receiver_continuation": list(plan.initial_receiver_continuation),
+        }
+
+    @staticmethod
+    def _journal_graph(connection, operation_id: str) -> dict[str, object]:
+        row = connection.exec_driver_sql(
+            "SELECT graph_plan_sha256,graph_inventory FROM archive_import_journal WHERE operation_id=?",
+            (operation_id,),
+        ).first()
+        if row is None:
+            raise ArchiveImportStoreError("import graph journal is absent")
+        try:
+            graph = json.loads(str(row[1]))
+        except (TypeError, ValueError) as exc:
+            raise ArchiveImportStoreError("import graph journal is malformed") from exc
+        if not isinstance(graph, dict) or bytes(row[0]) != hashlib.sha256(canonical_json_bytes(graph)).digest():
+            raise ArchiveImportStoreError("import graph journal digest is contradictory")
+        return graph
+
+    def _assert_sealed_import_graph(self, connection, operation_id: str, plan) -> None:
+        if self._journal_graph(connection, operation_id) != self._sealed_import_graph(plan):
+            raise ArchiveImportStoreError("import graph admission differs from its sealed journal")
+
+    def _assert_reconstructed_import_graph(self, connection, operation_id: str) -> None:
+        """Refuse a committed marker unless durable rows reconstruct its sealed graph."""
+        graph = self._journal_graph(connection, operation_id)
+        required = {"inventory", "chat", "messages", "attempts", "attachments", "message_attachment_relations", "attempt_attachment_relations"}
+        if not required <= set(graph):
+            raise ArchiveImportStoreError("import graph journal lacks full reconstruction evidence")
+        chat = connection.exec_driver_sql(
+            "SELECT c.id,c.title,c.created_at,c.updated_at,c.head_message_id,c.revision,c.archived_at,"
+            "i.source_chat_id,i.source_chat_revision,i.source_archived_at,i.source_node_id,i.source_configuration,i.source_continuation_history "
+            "FROM chats AS c JOIN archive_import_chats AS i ON i.chat_id=c.id WHERE i.operation_id=?", (operation_id,)
+        ).mappings().one_or_none()
+        expected_chat = graph["chat"]
+        def same_time(actual: object, expected: object) -> bool:
+            if actual is None or expected is None:
+                return actual is expected
+            return utc_iso(parse_utc(str(actual))) == utc_iso(parse_utc(str(expected)))
+        # The live chat is allowed to evolve after the terminal import: a
+        # native continuation advances its head/revision and ordinary owner
+        # actions may rename or archive it.  Recovery verifies the immutable
+        # source snapshot in archive_import_chats below, not those live fields.
+        if chat is None:
+            raise ArchiveImportStoreError("committed import chat contradicts sealed graph")
+        operation = connection.exec_driver_sql(
+            "SELECT archive_id,archive_version,logical_content_digest,source_chat_id,source_chat_revision,"
+            "source_content_sha256,source_byte_size,imported_at "
+            "FROM archive_import_operations WHERE id=?", (operation_id,)
+        ).mappings().one_or_none()
+        if operation is None:
+            raise ArchiveImportStoreError("committed import operation is absent")
+        manifest = graph.get("manifest")
+        binding = graph.get("source_binding")
+        if not isinstance(manifest, dict) or not isinstance(binding, dict):
+            raise ArchiveImportStoreError("sealed import operation evidence is malformed")
+        try:
+            operation_matches_sealed_source = (
+                str(operation["archive_id"]) == str(manifest["archive_id"])
+                and int(operation["archive_version"]) == int(manifest["archive_version"])
+                and str(operation["logical_content_digest"])
+                == str(manifest["logical_content_digest"])
+                and str(operation["source_chat_id"]) == str(expected_chat["source_id"])
+                and int(operation["source_chat_revision"]) == int(expected_chat["revision"])
+                and bytes(operation["source_content_sha256"]).hex() == str(binding["sha256"])
+                and int(operation["source_byte_size"]) == int(binding["byte_size"])
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ArchiveImportStoreError("sealed import operation evidence is malformed") from exc
+        if not operation_matches_sealed_source:
+            raise ArchiveImportStoreError("committed import operation contradicts sealed graph")
+        try:
+            sealed_nodes = {
+                (str(row["object_kind"]), str(row["source_id"]), int(row["ordinal"])): str(row["node_id"])
+                for row in graph["provenance_node_ids"]
+            }
+            provenance_rows = graph["object_provenance"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ArchiveImportStoreError("sealed provenance node plan is malformed") from exc
+        expected_nodes: list[tuple[object, ...]] = []
+        receiver_node_ids: dict[tuple[str, str], str] = {}
+        for provenance in provenance_rows:
+            if not isinstance(provenance, dict):
+                raise ArchiveImportStoreError("sealed provenance node plan is malformed")
+            kind, source_id = str(provenance["object_kind"]), str(provenance["object_id"])
+            source = provenance.get("source")
+            if not isinstance(source, dict):
+                raise ArchiveImportStoreError("sealed provenance node plan is malformed")
+            hops = [] if source.get("immediate") is None else [source["immediate"]]
+            hops.extend(source.get("prior_chain", ()))
+            prior_id = None
+            for ordinal, hop in enumerate(reversed(hops)):
+                node_id = sealed_nodes[(kind, source_id, ordinal)]
+                expected_nodes.append((node_id, kind, str(hop["archive_id"]), str(hop["logical_content_digest"]), str(hop["object_id"]), str(hop["imported_at"]), int(hop["archive_version"]), prior_id))
+                prior_id = node_id
+            node_id = sealed_nodes[(kind, source_id, len(hops))]
+            receiver_node_ids[(kind, source_id)] = node_id
+            expected_nodes.append((node_id, kind, str(operation["archive_id"]), str(operation["logical_content_digest"]), source_id, str(operation["imported_at"]), int(operation["archive_version"]), prior_id))
+        actual_nodes = connection.exec_driver_sql(
+            "SELECT id,object_kind,archive_id,logical_content_digest,source_object_id,imported_at,source_format,prior_node_id "
+            "FROM archive_lineage_nodes WHERE id IN (" + ",".join("?" for _ in expected_nodes) + ")",
+            tuple(row[0] for row in expected_nodes),
+        ).fetchall() if expected_nodes else []
+        if {tuple(row) for row in actual_nodes} != set(expected_nodes):
+            raise ArchiveImportStoreError("committed import provenance nodes contradict sealed graph")
+        if str(chat["source_node_id"]) != receiver_node_ids[("chat", str(expected_chat["source_id"]))]:
+            raise ArchiveImportStoreError("committed import chat node mapping contradicts sealed graph")
+        expected_head = expected_chat.get("head_message_id")
+        if expected_head is not None:
+            # The durable value is local; only the mapping can prove its source identity.
+            mapped_head = connection.exec_driver_sql(
+                "SELECT source_message_id FROM archive_import_messages WHERE message_id=?", (chat["head_message_id"],)
+            ).scalar_one_or_none()
+            # A later native continuation legitimately owns the live head;
+            # only an imported head must still map to the sealed source head.
+            if mapped_head is not None and str(mapped_head) != str(expected_head):
+                raise ArchiveImportStoreError("committed import chat head contradicts sealed graph")
+        expected_configuration = graph.get("chat_configuration", {})
+        expected_history = graph.get("continuation_history") or {}
+        try:
+            configuration = json.loads(str(chat["source_configuration"]))
+            history = json.loads(str(chat["source_continuation_history"]))
+        except ValueError as exc:
+            raise ArchiveImportStoreError("committed import chat evidence is malformed") from exc
+        if (str(chat["source_chat_id"]) != str(expected_chat["source_id"])
+                or int(chat["source_chat_revision"]) != int(expected_chat["revision"])
+                or not same_time(chat["source_archived_at"], expected_chat.get("archived_at"))
+                or configuration != expected_configuration or history != expected_history):
+            raise ArchiveImportStoreError("committed import chat metadata contradicts sealed graph")
+        expected_branches = expected_history.get("branches", []) if isinstance(expected_history, dict) else []
+        if not isinstance(expected_branches, list):
+            raise ArchiveImportStoreError("sealed import branch history is malformed")
+        imported_branches = connection.exec_driver_sql(
+            "SELECT b.base_key,b.choice_snapshot,first_source.source_message_id AS first_source_id,"
+            "base_source.source_message_id AS base_source_id,a.source_attempt_id "
+            "FROM archive_imported_branch_choices b "
+            "JOIN archive_import_messages first_source ON first_source.message_id=b.first_message_id AND first_source.chat_id=b.chat_id "
+            "LEFT JOIN archive_import_messages base_source ON base_source.message_id=b.base_key AND base_source.chat_id=b.chat_id "
+            "JOIN archive_imported_attempts a ON a.id=b.attempt_id AND a.chat_id=b.chat_id "
+            "WHERE b.chat_id=?", (chat["id"],)
+        ).mappings().all()
+        if len(imported_branches) != len(expected_branches):
+            raise ArchiveImportStoreError("committed import branch history count contradicts sealed graph")
+        expected_branch_snapshots = {
+            canonical_json_bytes(item).decode("utf-8").removesuffix("\n") for item in expected_branches
+        }
+        observed_branch_snapshots: set[str] = set()
+        for branch in imported_branches:
+            try:
+                snapshot = json.loads(str(branch["choice_snapshot"]))
+            except ValueError as exc:
+                raise ArchiveImportStoreError("committed import branch snapshot is malformed") from exc
+            canonical_snapshot = canonical_json_bytes(snapshot).decode("utf-8").removesuffix("\n")
+            expected_base = "empty" if str(branch["base_key"]) == "empty" else branch["base_source_id"]
+            if (
+                canonical_snapshot not in expected_branch_snapshots
+                or canonical_snapshot != str(branch["choice_snapshot"])
+                or snapshot.get("anchor_key") != expected_base
+                or snapshot.get("first_message_id") != str(branch["first_source_id"])
+                or snapshot.get("attempt_id") != str(branch["source_attempt_id"])
+            ):
+                raise ArchiveImportStoreError("committed import branch history contradicts sealed graph")
+            observed_branch_snapshots.add(canonical_snapshot)
+        if observed_branch_snapshots != expected_branch_snapshots:
+            raise ArchiveImportStoreError("committed import branch history contradicts sealed graph")
+        expected_messages = {str(item["source_id"]): item for item in graph["messages"]}
+        rows = connection.exec_driver_sql(
+            "SELECT i.source_message_id,i.source_lineage_id,i.source_node_id,m.parent_id,m.role,m.state,m.content,m.sequence,m.created_at,m.lineage_id,m.revision,m.supersedes_id "
+            "FROM archive_import_messages AS i JOIN messages AS m ON m.id=i.message_id "
+        "WHERE i.chat_id=?", (chat["id"],)
+        ).mappings().all()
+        if len(rows) != len(expected_messages):
+            raise ArchiveImportStoreError("committed import message count contradicts sealed graph")
+        for row in rows:
+            expected = expected_messages.get(str(row["source_message_id"]))
+            if (expected is None
+                    or str(row["source_node_id"]) != receiver_node_ids[("message", str(row["source_message_id"]))]
+                    or str(row["lineage_id"]) != next(item["local_id"] for item in graph["inventory"] if item["object_kind"] == "lineage" and item["source_id"] == str(expected["lineage_id"]))
+                    or any(str(row[key]) != str(expected[key]) for key in ("role", "state", "content", "sequence", "revision"))
+                    or not same_time(row["created_at"], expected["created_at"])):
+                raise ArchiveImportStoreError("committed import message contradicts sealed graph")
+            for source_key, local_key in (("parent_id", "parent_id"), ("supersedes_id", "supersedes_id")):
+                actual = row[local_key]
+                if expected.get(source_key) is None:
+                    if actual is not None:
+                        raise ArchiveImportStoreError("committed import message relation contradicts sealed graph")
+                else:
+                    mapped = connection.exec_driver_sql(
+                        "SELECT source_message_id FROM archive_import_messages WHERE message_id=?", (actual,)
+                    ).scalar_one_or_none()
+                    if str(mapped) != str(expected[source_key]):
+                        raise ArchiveImportStoreError("committed import message relation contradicts sealed graph")
+            if str(row["source_lineage_id"]) != str(expected["lineage_id"]):
+                raise ArchiveImportStoreError("committed import message lineage contradicts sealed graph")
+        expected_attempts = {str(item["source_id"]): item for item in graph["attempts"]}
+        attempts = connection.exec_driver_sql(
+            "SELECT source_attempt_id,state,started_at,ended_at,source_attempt,source_evidence_binding FROM archive_imported_attempts WHERE chat_id=?", (chat["id"],)
+        ).mappings().all()
+        if len(attempts) != len(expected_attempts):
+            raise ArchiveImportStoreError("committed import attempt count contradicts sealed graph")
+        for row in attempts:
+            expected = expected_attempts.get(str(row["source_attempt_id"]))
+            if expected is None:
+                raise ArchiveImportStoreError("committed import attempt contradicts sealed graph")
+            try:
+                stored = json.loads(str(row["source_attempt"]))
+            except ValueError as exc:
+                raise ArchiveImportStoreError("committed import attempt evidence is malformed") from exc
+            source_attempt_id = str(row["source_attempt_id"])
+            expected_binding = [
+                binding_row
+                for binding_row in graph.get("history_bindings", [])
+                if isinstance(binding_row, dict)
+                and binding_row.get("attempt_id") == source_attempt_id
+            ]
+            try:
+                binding = json.loads(str(row["source_evidence_binding"]))
+            except ValueError as exc:
+                raise ArchiveImportStoreError("committed import attempt binding is malformed") from exc
+            state = "incomplete" if str(expected["state"]) == "truncated" else str(expected["state"])
+            if (stored != expected or binding != expected_binding
+                    or str(row["state"]) != state
+                    or not same_time(row["started_at"], expected["started_at"])
+                    or not same_time(row["ended_at"], expected["ended_at"])):
+                raise ArchiveImportStoreError("committed import attempt contradicts sealed graph")
+        expected_attachments = {str(item["source_id"]): item for item in graph["attachments"]}
+        attachments = connection.exec_driver_sql(
+            "SELECT source_attachment_id,expected_digest,expected_size,source_metadata,availability,attachment_id "
+            "FROM archive_import_attachment_refs WHERE operation_id=?", (operation_id,)
+        ).mappings().all()
+        if len(attachments) != len(expected_attachments):
+            raise ArchiveImportStoreError("committed import attachment count contradicts sealed graph")
+        for row in attachments:
+            expected = expected_attachments.get(str(row["source_attachment_id"]))
+            try:
+                metadata = json.loads(str(row["source_metadata"]))
+            except ValueError as exc:
+                raise ArchiveImportStoreError("committed import attachment metadata is malformed") from exc
+            if (expected is None or metadata != expected
+                    or bytes(row["expected_digest"]).hex() != str(expected["blob_digest"])
+                    or int(row["expected_size"]) != int(expected["byte_size"])
+                    or str(row["availability"]) not in {"READY", "MISSING_EXTERNAL"}
+                    or ((row["attachment_id"] is None) != (str(row["availability"]) == "MISSING_EXTERNAL"))):
+                raise ArchiveImportStoreError("committed import attachment contradicts sealed graph")
+        expected_message_links = {
+            (str(row["message_id"]), str(row["attachment_id"]), int(row["ordinal"]))
+            for row in graph["message_attachment_relations"]
+        }
+        expected_attempt_links = {
+            (str(row["attempt_id"]), str(row["attachment_id"]), int(row["ordinal"]))
+            for row in graph["attempt_attachment_relations"]
+        }
+        message_links = connection.exec_driver_sql(
+            "SELECT m.source_message_id,r.source_attachment_id,l.ordinal "
+            "FROM archive_import_message_attachment_refs AS l "
+            "JOIN archive_import_messages AS m ON m.message_id=l.message_id "
+            "JOIN archive_import_attachment_refs AS r ON r.id=l.attachment_ref_id WHERE m.chat_id=?", (chat["id"],)
+        ).fetchall()
+        attempt_links = connection.exec_driver_sql(
+            "SELECT a.source_attempt_id,r.source_attachment_id,l.ordinal "
+            "FROM archive_import_attempt_attachment_refs AS l "
+            "JOIN archive_imported_attempts AS a ON a.id=l.attempt_id "
+            "JOIN archive_import_attachment_refs AS r ON r.id=l.attachment_ref_id WHERE a.chat_id=?", (chat["id"],)
+        ).fetchall()
+        if {tuple((str(row[0]), str(row[1]), int(row[2]))) for row in message_links} != expected_message_links:
+            raise ArchiveImportStoreError("committed import message attachment links contradict sealed graph")
+        if {tuple((str(row[0]), str(row[1]), int(row[2]))) for row in attempt_links} != expected_attempt_links:
+            raise ArchiveImportStoreError("committed import attempt attachment links contradict sealed graph")
+        expected_contexts = {str(item["attempt_id"]): item for item in graph.get("context_plans", [])}
+        contexts = connection.exec_driver_sql(
+            "SELECT a.source_attempt_id,c.source_plan,c.source_plan_digest,c.local_bindings "
+            "FROM archive_imported_context_plans AS c JOIN archive_imported_attempts AS a ON a.id=c.attempt_id WHERE a.chat_id=?", (chat["id"],)
+        ).mappings().all()
+        if len(contexts) != len(expected_contexts):
+            raise ArchiveImportStoreError("committed import context count contradicts sealed graph")
+        for row in contexts:
+            expected = expected_contexts.get(str(row["source_attempt_id"]))
+            try:
+                source_plan = json.loads(str(row["source_plan"]))
+                bindings = json.loads(str(row["local_bindings"]))
+            except ValueError as exc:
+                raise ArchiveImportStoreError("committed import context evidence is malformed") from exc
+            if (expected is None or source_plan != expected
+                    or str(row["source_plan_digest"]) != hashlib.sha256(canonical_json_bytes(expected)).hexdigest()
+                    or str(bindings.get("source_attempt_id")) != str(row["source_attempt_id"])):
+                raise ArchiveImportStoreError("committed import context contradicts sealed graph")
+        # Only derivations whose object is part of this imported operation are
+        # immutable import facts.  Later native continuations share the chat but
+        # must remain admissible after a legitimate reopen.
+        expected_derivations = {
+            (
+                str(row["object_kind"]),
+                str(row["object_id"]),
+                str(row["derivation"]["predecessor"]["object_id"]),
+            )
+            for row in graph.get("object_provenance", [])
+            if isinstance(row, dict)
+            and row.get("object_kind") in {"message", "attempt"}
+            and isinstance(row.get("derivation"), dict)
+            and row["derivation"].get("kind") == "local-continuation"
+            and isinstance(row["derivation"].get("predecessor"), dict)
+        }
+        imported_derivations = connection.exec_driver_sql(
+            "SELECT d.object_kind,"
+            "CASE d.object_kind WHEN 'message' THEN im.source_message_id "
+            "WHEN 'attempt' THEN ia.source_attempt_id END AS source_object_id,"
+            "pm.source_message_id AS predecessor_source_id "
+            "FROM archive_object_derivations d "
+            "LEFT JOIN archive_import_messages im ON d.object_kind='message' AND im.message_id=d.object_id "
+            "LEFT JOIN archive_imported_attempts ia ON d.object_kind='attempt' AND ia.id=d.object_id "
+            "JOIN archive_import_messages pm ON pm.message_id=d.predecessor_message_id "
+            "WHERE d.chat_id=? AND (im.chat_id=? OR ia.chat_id=?)",
+            (chat["id"], chat["id"], chat["id"]),
+        ).fetchall()
+        observed_derivations = {
+            (str(kind), str(source_object_id), str(predecessor_source_id))
+            for kind, source_object_id, predecessor_source_id in imported_derivations
+        }
+        if observed_derivations != expected_derivations:
+            raise ArchiveImportStoreError("committed import derivations contradict sealed graph")
+
+        # These rows are the immutable imported continuation projection.  A
+        # later native branch may add anchors, choices, requirements, and
+        # candidates in the same chat, so reconstruct only the rows owned by
+        # the sealed imported bases and imported attempts.
+        inventory = {
+            (str(row["object_kind"]), str(row["source_id"])): str(row["local_id"])
+            for row in graph["inventory"]
+            if isinstance(row, dict)
+        }
+        history = graph.get("continuation_history") or {}
+        if not isinstance(history, dict):
+            raise ArchiveImportStoreError("sealed continuation history is malformed")
+        anchors = history.get("anchors", [])
+        if not isinstance(anchors, list):
+            raise ArchiveImportStoreError("sealed continuation anchors are malformed")
+        source_bases = ["empty"] + [
+            str(row["source_id"])
+            for row in graph["messages"]
+            if isinstance(row, dict)
+            and str(row.get("role")) == "assistant"
+            and str(row.get("state")) in {"complete", "incomplete", "failed", "aborted", "truncated"}
+        ]
+        expected_anchor_rows: set[tuple[object, ...]] = set()
+        for source_base in dict.fromkeys(source_bases):
+            if source_base != "empty" and ("message", source_base) not in inventory:
+                raise ArchiveImportStoreError("sealed continuation anchor base is malformed")
+            source_anchor = next(
+                (row for row in anchors if isinstance(row, dict) and row.get("anchor_key") == source_base),
+                {},
+            )
+            configuration = source_anchor.get("source_configuration", expected_configuration)
+            if not isinstance(configuration, dict):
+                raise ArchiveImportStoreError("sealed continuation anchor configuration is malformed")
+            local_base = None if source_base == "empty" else inventory[("message", source_base)]
+            expected_anchor_rows.add((
+                "empty" if local_base is None else local_base, local_base, 1,
+                json.dumps(configuration, sort_keys=True, separators=(",", ":")),
+            ))
+        actual_anchor_rows = connection.exec_driver_sql(
+            "SELECT base_key,base_message_id,revision,source_configuration "
+            "FROM archive_continuation_anchors WHERE chat_id=?",
+            (chat["id"],),
+        ).fetchall()
+        actual_imported_anchors = {
+            (str(base_key), None if base_message_id is None else str(base_message_id), int(revision), str(configuration))
+            for base_key, base_message_id, revision, configuration in actual_anchor_rows
+            if str(base_key) in {row[0] for row in expected_anchor_rows}
+        }
+        if actual_imported_anchors != expected_anchor_rows:
+            raise ArchiveImportStoreError("committed import continuation anchors contradict sealed graph")
+
+        expected_source_choices: set[tuple[object, ...]] = set()
+        choices = history.get("choices", [])
+        if not isinstance(choices, list):
+            raise ArchiveImportStoreError("sealed continuation choices are malformed")
+        for choice in choices:
+            if not isinstance(choice, dict):
+                raise ArchiveImportStoreError("sealed continuation choice is malformed")
+            source_base = choice.get("anchor_key")
+            revision = choice.get("choice_revision")
+            settings = choice.get("explicit_settings")
+            exclusions = choice.get("excluded_context_refs")
+            descriptor = choice.get("mapped_model")
+            if (
+                not isinstance(source_base, str) or type(revision) is not int
+                or not isinstance(settings, dict) or not isinstance(exclusions, list)
+                or not isinstance(descriptor, dict)
+            ):
+                raise ArchiveImportStoreError("sealed continuation choice is malformed")
+            local_base = "empty" if source_base == "empty" else inventory.get(("message", source_base))
+            if local_base is None:
+                raise ArchiveImportStoreError("sealed continuation choice base is malformed")
+            local_exclusions: list[dict[str, object]] = []
+            for exclusion in exclusions:
+                if not isinstance(exclusion, dict):
+                    raise ArchiveImportStoreError("sealed continuation exclusion is malformed")
+                local_exclusion = dict(exclusion)
+                attachment_id = local_exclusion.get("attachment_id")
+                if attachment_id is not None:
+                    if not isinstance(attachment_id, str) or ("attachment", attachment_id) not in inventory:
+                        raise ArchiveImportStoreError("sealed continuation exclusion is malformed")
+                    local_exclusion["attachment_id"] = inventory[("attachment", attachment_id)]
+                local_exclusions.append(local_exclusion)
+            decision = choice.get("decision_kind")
+            if decision == "operator-resolution":
+                decision = "operator_resolution"
+            if decision not in {"equivalent", "operator_resolution"}:
+                raise ArchiveImportStoreError("sealed continuation choice is malformed")
+            try:
+                chosen_at = utc_iso(parse_utc(str(choice["chosen_at"])))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ArchiveImportStoreError("sealed continuation choice is malformed") from exc
+            expected_source_choices.add((
+                local_base, revision,
+                json.dumps(settings, sort_keys=True, separators=(",", ":")),
+                1 if local_exclusions else 0,
+                json.dumps(local_exclusions, separators=(",", ":")), str(decision),
+                json.dumps(descriptor, sort_keys=True, separators=(",", ":")), chosen_at,
+            ))
+        actual_source_choices = {
+            (str(base_key), int(revision), str(settings), int(degraded), str(exclusions), str(decision), str(descriptor), str(created_at))
+            for base_key, revision, settings, degraded, exclusions, decision, descriptor, created_at in connection.exec_driver_sql(
+                "SELECT base_key,choice_revision,explicit_settings,degraded,excluded_refs,decision_kind,safe_target_descriptor,created_at "
+                "FROM archive_continuation_choices WHERE chat_id=? "
+                "AND local_connection_id IS NULL AND local_model_entry_id IS NULL",
+                (chat["id"],),
+            ).fetchall()
+        }
+        if actual_source_choices != expected_source_choices:
+            raise ArchiveImportStoreError("committed import continuation choices contradict sealed graph")
+
+        # A receiver-local automatic equivalent is not source provenance, but
+        # it was admitted from the pre-cutoff receiver snapshot and is sealed
+        # in this journal.  Compare that immutable initial row directly;
+        # later operator choices may append higher revisions without causing
+        # recovery to reinterpret the old target through today's catalogue.
+        initial_receiver = graph.get("initial_receiver_continuation", [])
+        if not isinstance(initial_receiver, list):
+            raise ArchiveImportStoreError("sealed receiver continuation is malformed")
+        expected_receiver_choices: set[tuple[object, ...]] = set()
+        expected_receiver_anchors: set[tuple[object, ...]] = set()
+        for item in initial_receiver:
+            if not isinstance(item, dict):
+                raise ArchiveImportStoreError("sealed receiver continuation is malformed")
+            try:
+                base_key = str(item["base_key"])
+                connection_id = str(item["connection_id"])
+                model_id = str(item["model_id"])
+                settings = item["explicit_settings"]
+                descriptor = item["safe_target_descriptor"]
+                resolution = str(item["resolution"])
+                evidence = item["resolution_evidence"]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ArchiveImportStoreError("sealed receiver continuation is malformed") from exc
+            if (not isinstance(settings, dict) or not isinstance(descriptor, dict)
+                    or resolution != "EQUIVALENT" or not isinstance(evidence, dict)):
+                raise ArchiveImportStoreError("sealed receiver continuation is malformed")
+            expected_receiver_choices.add((
+                base_key, 1, connection_id, model_id,
+                json.dumps(settings, sort_keys=True, separators=(",", ":")),
+                0, "[]", "equivalent",
+                json.dumps(descriptor, sort_keys=True, separators=(",", ":")),
+                str(operation["imported_at"]),
+            ))
+            expected_receiver_anchors.add((
+                base_key, resolution,
+                json.dumps(evidence, sort_keys=True, separators=(",", ":")),
+            ))
+        receiver_keys = tuple(sorted(item[0] for item in expected_receiver_choices))
+        if receiver_keys:
+            placeholders = ",".join("?" for _ in receiver_keys)
+            receiver_rows = connection.exec_driver_sql(
+                "SELECT base_key,choice_revision,local_connection_id,local_model_entry_id,explicit_settings,"
+                "degraded,excluded_refs,decision_kind,safe_target_descriptor,created_at "
+                "FROM archive_continuation_choices WHERE chat_id=? AND base_key IN (" + placeholders + ") "
+                "AND choice_revision=1",
+                (chat["id"], *receiver_keys),
+            ).fetchall()
+            actual_receiver_choices = {
+                (str(base), int(revision), str(connection_id), str(model_id), str(settings), int(degraded),
+                 str(exclusions), str(decision), str(descriptor), str(created_at))
+                for base, revision, connection_id, model_id, settings, degraded, exclusions, decision, descriptor, created_at
+                in receiver_rows
+            }
+            anchor_rows = connection.exec_driver_sql(
+                "SELECT base_key,resolution,resolution_evidence FROM archive_continuation_anchors "
+                "WHERE chat_id=? AND base_key IN (" + placeholders + ")",
+                (chat["id"], *receiver_keys),
+            ).fetchall()
+            actual_receiver_anchors = {
+                (str(base), str(resolution), str(evidence))
+                for base, resolution, evidence in anchor_rows
+            }
+            if actual_receiver_choices != expected_receiver_choices:
+                raise ArchiveImportStoreError("initial receiver continuation choices contradict sealed graph")
+            if actual_receiver_anchors != expected_receiver_anchors:
+                raise ArchiveImportStoreError("initial receiver continuation anchors contradict sealed graph")
+
+        attachment_by_source = {
+            str(row["source_id"]): row for row in graph["attachments"] if isinstance(row, dict)
+        }
+        selected_by_attempt: dict[str, list[dict[str, object]]] = {}
+        for relation in graph["attempt_attachment_relations"]:
+            if not isinstance(relation, dict):
+                raise ArchiveImportStoreError("sealed continuation relation is malformed")
+            selected_by_attempt.setdefault(str(relation["attempt_id"]), []).append(relation)
+        bindings_by_attempt: dict[str, list[dict[str, object]]] = {}
+        for binding in graph.get("history_bindings", []):
+            if not isinstance(binding, dict) or binding.get("binding_kind") != "context-source":
+                continue
+            snapshot, current = binding.get("snapshot_source"), binding.get("current_binding")
+            if (
+                not isinstance(snapshot, dict) or snapshot.get("kind") != "attachment"
+                or not isinstance(binding.get("attempt_id"), str) or type(binding.get("ordinal")) is not int
+                or (current is not None and (not isinstance(current, dict) or current.get("object_kind") != "attachment"))
+            ):
+                continue
+            bindings_by_attempt.setdefault(str(binding["attempt_id"]), []).append(binding)
+        expected_requirements: set[tuple[object, ...]] = set()
+        expected_candidates: set[tuple[object, ...]] = set()
+        terminal_attempts = {
+            str(row["source_id"]): str(row["assistant_message_id"])
+            for row in graph["attempts"] if isinstance(row, dict)
+            and str(row.get("state")) in {"complete", "incomplete", "failed", "aborted", "truncated"}
+        }
+        for source_attempt, source_base in terminal_attempts.items():
+            local_base = inventory.get(("message", source_base))
+            local_attempt = inventory.get(("attempt", source_attempt))
+            if local_base is None or local_attempt is None:
+                raise ArchiveImportStoreError("sealed continuation requirement owner is malformed")
+            selected = sorted(selected_by_attempt.get(source_attempt, []), key=lambda row: int(row["ordinal"]))
+            bindings = sorted(bindings_by_attempt.get(source_attempt, []), key=lambda row: int(row["ordinal"]))
+            if selected and not bindings:
+                continue
+            for binding in bindings:
+                snapshot = binding["snapshot_source"]
+                evidence_digest = str(snapshot.get("evidence_digest"))
+                source_status = snapshot.get("source_id_status")
+                ordinal = int(binding["ordinal"])
+                if source_status == "available" and binding.get("binding_state") == "bound":
+                    source_attachment = str(snapshot.get("source_id"))
+                    current = binding.get("current_binding")
+                    if not isinstance(current, dict) or str(current.get("object_id")) != source_attachment:
+                        continue
+                    candidates = [row for row in selected if str(row["attachment_id"]) == source_attachment]
+                    binding_kind = "identity"
+                elif (
+                    binding.get("binding_state") in {"unavailable", "historical-only"}
+                    and binding.get("current_binding") is None
+                ):
+                    candidates = [
+                        row for row in selected
+                        if str(attachment_by_source.get(str(row["attachment_id"]), {}).get("text_digest")) == evidence_digest
+                        and attachment_by_source.get(str(row["attachment_id"]), {}).get("text_eligibility") == "eligible"
+                    ]
+                    binding_kind = "digest"
+                else:
+                    continue
+                if not candidates:
+                    continue
+                candidate_rows = [attachment_by_source.get(str(row["attachment_id"])) for row in candidates]
+                if any(row is None for row in candidate_rows):
+                    raise ArchiveImportStoreError("sealed continuation candidate is malformed")
+                digests = {str(row["blob_digest"]) for row in candidate_rows}
+                sizes = {int(row["byte_size"]) for row in candidate_rows}
+                if len(digests) != 1 or len(sizes) != 1:
+                    continue
+                digest, size = digests.pop(), sizes.pop()
+                bound_ref = inventory[("attachment", str(candidates[0]["attachment_id"]))] if binding_kind == "identity" else None
+                expected_requirements.add((
+                    local_base, ordinal, local_attempt, bytes.fromhex(digest), size,
+                    bytes.fromhex(evidence_digest), binding_kind, bound_ref,
+                ))
+                expected_candidates.update((
+                    local_base, ordinal, inventory[("attachment", str(candidate["attachment_id"]))],
+                    inventory[("attachment", str(candidate["attachment_id"]))],
+                ) for candidate in candidates)
+        actual_requirements = {
+            (str(base_key), int(ordinal), str(source_attempt), bytes(expected_digest), int(expected_size),
+             bytes(representation_digest), str(binding_kind), None if bound_ref is None else str(bound_ref))
+            for base_key, ordinal, source_attempt, expected_digest, expected_size, representation_digest, binding_kind, bound_ref in connection.exec_driver_sql(
+                "SELECT r.base_key,r.ordinal,r.source_imported_attempt_id,r.expected_digest,r.expected_size,"
+                "r.representation_digest,r.binding_kind,r.bound_imported_ref_id "
+                "FROM archive_continuation_requirements r JOIN archive_imported_attempts a ON a.id=r.source_imported_attempt_id "
+                "WHERE a.chat_id=?", (chat["id"],),
+            ).fetchall()
+        }
+        if actual_requirements != expected_requirements:
+            raise ArchiveImportStoreError("committed import continuation requirements contradict sealed graph")
+        actual_candidates = {
+            (str(base_key), int(ordinal), str(candidate_id), str(imported_ref_id))
+            for base_key, ordinal, candidate_id, imported_ref_id in connection.exec_driver_sql(
+                "SELECT c.base_key,c.ordinal,c.candidate_attachment_id,c.imported_ref_id "
+                "FROM archive_continuation_requirement_candidates c "
+                "JOIN archive_continuation_requirements r ON r.chat_id=c.chat_id AND r.base_key=c.base_key AND r.ordinal=c.ordinal "
+                "JOIN archive_imported_attempts a ON a.id=r.source_imported_attempt_id WHERE a.chat_id=?",
+                (chat["id"],),
+            ).fetchall()
+        }
+        if actual_candidates != expected_candidates:
+            raise ArchiveImportStoreError("committed import continuation candidates contradict sealed graph")
+
+    def _phase9_fake_candidate_is_runnable(
+        self,
+        model_entry_id: str,
+        explicit_settings: GenerationSettings,
+    ) -> bool:
+        """Apply the native Phase 5 admission rules before auto-selecting a fake.
+
+        Archive import only has enough authority to choose a deterministic fake
+        target.  That choice must nevertheless survive the same capability and
+        effective-settings checks that a later continuation uses.
+        """
+        model = self.get_model_catalogue_entry(model_entry_id)
+        if model is None:
+            return False
+        provider = self.get_provider_connection(model.connection_id)
+        if provider is None:
+            return False
+        facts = tuple(
+            fact for fact in self.list_capability_facts(model.id)
+            if not (
+                fact.source in {
+                    CapabilitySource.CONFIRMED_ENDPOINT,
+                    CapabilitySource.PROVIDER_METADATA,
+                }
+                and fact.source_revision is not None
+                and fact.source_revision != provider.catalogue_revision
+            )
+        )
+        overrides = {item.key: item for item in self.list_capability_overrides(model.id)}
+        capabilities = {
+            key: resolve_capability(facts, overrides.get(key), key)
+            for key in CAPABILITY_KEYS
+        }
+        application_settings = self.get_application_generation_settings()
+        model_settings = self.get_model_generation_settings(model.id)
+        values = {
+            key: (
+                getattr(explicit_settings, key)
+                if getattr(explicit_settings, key) is not None
+                else getattr(model_settings, key)
+                if model_settings is not None and getattr(model_settings, key) is not None
+                else getattr(application_settings, key)
+            )
+            for key in ("temperature", "max_output_tokens", "reasoning_effort", "timeout_seconds")
+        }
+        try:
+            resolved = GenerationSettings(**values)
+            _validate_settings(resolved)
+        except (TypeError, ValueError, StateError):
+            return False
+        for key in (
+            CapabilityKey.STREAMING.value,
+            CapabilityKey.TEMPERATURE.value,
+            CapabilityKey.MAX_OUTPUT_TOKENS.value,
+        ):
+            if capabilities[key].state is not CapabilityState.SUPPORTED:
+                return False
+        if resolved.reasoning_effort is not None and (
+            capabilities[CapabilityKey.REASONING_NONE.value].state
+            is not CapabilityState.SUPPORTED
+        ):
+            return False
+        output_limit = capabilities[CapabilityKey.OUTPUT_TOKENS.value]
+        request_limit = capabilities[CapabilityKey.MAX_OUTPUT_TOKENS.value]
+        if (
+            output_limit.state is CapabilityState.SUPPORTED
+            and output_limit.value is not None
+            and resolved.max_output_tokens > output_limit.value
+        ):
+            return False
+        if (
+            (output_limit.state is not CapabilityState.SUPPORTED or output_limit.value is None)
+            and request_limit.value is not None
+            and resolved.max_output_tokens > request_limit.value
+        ):
+            return False
+        return True
+
+    def _plan_initial_receiver_continuation(self, plan) -> tuple[dict[str, object], ...]:
+        """Freeze deterministic fake equivalence before the import cutoff.
+
+        This deliberately sees only the validated portable source
+        configuration and receiver-safe catalogue facts.  It records no
+        provider credentials and does not create provider rows.  The result
+        is a receiver-local internal plan, not archive provenance.
+        """
+        history = plan.continuation_history or {}
+        anchor_rows = history.get("anchors", []) if isinstance(history, dict) else []
+        automatic_anchors = (
+            anchor_rows if isinstance(anchor_rows, list) and anchor_rows
+            else [{
+                "anchor_key": plan.chat.get("head_message_id") or "empty",
+                "source_configuration": plan.chat_configuration,
+            }]
+        )
+        source_choices = history.get("choices", []) if isinstance(history, dict) else []
+        rows: list[dict[str, object]] = []
+        with self._engine.connect() as connection:
+            for anchor in automatic_anchors:
+                if not isinstance(anchor, dict):
+                    continue
+                source_key = anchor.get("anchor_key")
+                configuration = anchor.get("source_configuration")
+                selection = configuration.get("selection") if isinstance(configuration, dict) else None
+                source_model = selection.get("model") if isinstance(selection, dict) else None
+                overrides = configuration.get("overrides") if isinstance(configuration, dict) else None
+                if not isinstance(source_key, str) or not isinstance(source_model, dict) or not isinstance(overrides, list):
+                    continue
+                required = {
+                    "source_model_entry_id", "source_model_entry_id_status",
+                    "source_connection_id", "source_connection_id_status",
+                    "backend_type", "backend_type_status", "provider_profile",
+                    "provider_profile_status", "provider_model_id",
+                    "provider_model_id_status", "display_name", "display_name_status",
+                    "origin", "origin_status", "availability", "availability_status",
+                    "model_revision", "connection_revision", "catalogue_revision",
+                }
+                capabilities_recorded = "capabilities" in source_model
+                optional_capabilities = source_model.get("capabilities", [])
+                if (
+                    (set(source_model) != required and set(source_model) != required | {"capabilities"})
+                    or source_model.get("backend_type") != "fake"
+                    or source_model.get("provider_profile") != "generic"
+                    or source_model.get("availability") != "available"
+                    or any(source_model.get(f"{key}_status") != "available" for key in (
+                        "backend_type", "provider_profile", "provider_model_id", "availability",
+                    ))
+                    or not isinstance(optional_capabilities, list)
+                    or any(isinstance(item, dict) and item.get("anchor_key") == source_key for item in source_choices)
+                ):
+                    continue
+                matching_overrides = [
+                    row for row in overrides
+                    if isinstance(row, dict)
+                    and set(row) == {"model", "revision", "temperature", "max_output_tokens", "reasoning_effort", "timeout_seconds"}
+                    and row["model"] == source_model and type(row["revision"]) is int and row["revision"] >= 1
+                ]
+                if len(matching_overrides) > 1:
+                    continue
+                settings = (
+                    {key: matching_overrides[0][key] for key in ("temperature", "max_output_tokens", "reasoning_effort", "timeout_seconds")}
+                    if matching_overrides else
+                    {"temperature": None, "max_output_tokens": None, "reasoning_effort": None, "timeout_seconds": None}
+                )
+                try:
+                    requested_settings = GenerationSettings(**settings)
+                    _validate_settings(requested_settings)
+                except (TypeError, ValueError):
+                    continue
+                source_caps = {
+                    (item.get("key"), item.get("state"), item.get("value"))
+                    for item in optional_capabilities
+                    if isinstance(item, dict) and set(item) == {"key", "state", "value"}
+                }
+                if len(source_caps) != len(optional_capabilities):
+                    continue
+                candidates = connection.exec_driver_sql(
+                    "SELECT m.id AS model_id,p.id AS connection_id FROM model_catalogue_entries m "
+                    "JOIN provider_connections p ON p.id=m.connection_id "
+                    "WHERE p.backend_type='fake' AND p.profile='generic' AND p.enabled=1 AND p.retired=0 "
+                    "AND m.availability='available' AND m.provider_model_id=? ORDER BY p.id,m.id",
+                    (source_model["provider_model_id"],),
+                ).mappings().all()
+                chosen = None
+                for candidate in candidates:
+                    actual_caps = {
+                        (str(item["capability_key"]), str(item["state"]), item["value"])
+                        for item in connection.exec_driver_sql(
+                            "SELECT capability_key,state,value FROM capability_facts WHERE model_entry_id=?",
+                            (candidate["model_id"],),
+                        ).mappings().all()
+                    }
+                    if (self._phase9_fake_candidate_is_runnable(str(candidate["model_id"]), requested_settings)
+                            and (not capabilities_recorded or actual_caps == source_caps)):
+                        chosen = candidate
+                        break
+                if chosen is None:
+                    continue
+                local_key = "empty" if source_key == "empty" else plan.local_id("message", source_key)
+                descriptor = {
+                    "backend_type": "fake", "provider_profile": "generic",
+                    "provider_model_id": source_model["provider_model_id"],
+                    "availability": "available", "capabilities": optional_capabilities,
+                }
+                rows.append({
+                    "base_key": local_key,
+                    "connection_id": str(chosen["connection_id"]),
+                    "model_id": str(chosen["model_id"]),
+                    "explicit_settings": settings,
+                    "safe_target_descriptor": descriptor,
+                    "resolution": "EQUIVALENT",
+                    "resolution_evidence": {"kind": "deterministic-fake-equivalence"},
+                })
+        return tuple(rows)
+
+    def _publish_import_graph(
+        self, connection, captured, operation_id: str, timestamp: str, *, import_as_archived: bool = False,
+    ) -> int:
+        """Insert an already validated, payload-free canonical graph atomically."""
+        plan = captured.plan
+        def canonical_time(value: object) -> str:
+            return utc_iso(parse_utc(str(value)))
+        identities = tuple(
+            (entry.object_kind, entry.local_id)
+            for entry in plan.identities
+            if entry.object_kind in {"chat", "message", "attachment"}
+        )
+        # Messages and the head use dedicated 0012 current-schema admission;
+        # Phase 7 remains independently armed and verifies exactly one source
+        # revision at the end of the complete transaction.
+        chat_id = plan.local_id("chat", captured.source_chat_id)
+        provenance_by_identity = {
+            (str(row["object_kind"]), str(row["object_id"])): row
+            for row in plan.object_provenance
+        }
+        sealed_node_ids = {
+            (str(row["object_kind"]), str(row["source_id"]), int(row["ordinal"])): str(row["node_id"])
+            for row in plan.provenance_node_ids
+        }
+        # Node IDs and their predecessor links are sealed before the graph arm.
+        # The insert trigger consumes these complete rows; no later UUID choice
+        # can cross-link a valid planned provenance node.
+        node_grants: list[tuple[object, ...]] = []
+        node_ids: dict[tuple[str, str], str] = {}
+        for identity in plan.identities:
+            row = provenance_by_identity[(identity.object_kind, identity.source_id)]
+            source = row["source"]
+            hops = []
+            if source.get("immediate") is not None:
+                hops.append(source["immediate"])
+            hops.extend(source.get("prior_chain", ()))
+            prior_id = None
+            for ordinal, hop in enumerate(reversed(hops)):
+                node_id = sealed_node_ids[(identity.object_kind, identity.source_id, ordinal)]
+                node_grants.append((
+                    node_id, identity.object_kind, str(hop["archive_id"]), str(hop["logical_content_digest"]),
+                    str(hop["object_id"]), str(hop["imported_at"]), int(hop["archive_version"]), prior_id,
+                ))
+                prior_id = node_id
+            node_id = sealed_node_ids[(identity.object_kind, identity.source_id, len(hops))]
+            node_grants.append((
+                node_id, identity.object_kind, captured.archive_id, captured.logical_content_digest,
+                identity.source_id, timestamp, captured.archive_version, prior_id,
+            ))
+            node_ids[(identity.object_kind, identity.source_id)] = node_id
+        message_grants = tuple(
+            (
+                plan.local_id("message", str(item["source_id"])), chat_id,
+                None if item.get("parent_id") is None else plan.local_id("message", str(item["parent_id"])),
+                int(item["sequence"]), str(item["role"]), str(item["state"]), str(item["content"]),
+                canonical_time(item["created_at"]), plan.local_id("lineage", str(item["lineage_id"])),
+                int(item["revision"]), None if item.get("supersedes_id") is None else plan.local_id("message", str(item["supersedes_id"])),
+            )
+            for item in plan.messages
+        )
+        head = plan.chat.get("head_message_id")
+        initial_archived_at = timestamp if import_as_archived else None
+        chat_grants = (
+            (chat_id, str(plan.chat["title"]), canonical_time(plan.chat["created_at"]), canonical_time(plan.chat["updated_at"]), None, 0, initial_archived_at),
+            (chat_id, str(plan.chat["title"]), canonical_time(plan.chat["created_at"]), canonical_time(plan.chat["updated_at"]), None if head is None else plan.local_id("message", str(head)), 1, initial_archived_at),
+        )
+        link_grants = tuple(
+            ("message-attachment", plan.local_id("message", str(row["message_id"])),
+             plan.local_id("attachment", str(row["attachment_id"])), int(row["ordinal"]))
+            for row in plan.message_attachment_relations
+        ) + tuple(
+            ("attempt-attachment", plan.local_id("attempt", str(row["attempt_id"])),
+             plan.local_id("attachment", str(row["attachment_id"])), int(row["ordinal"]))
+            for row in plan.attempt_attachment_relations
+        )
+        attempt_grants = tuple(
+            (
+                plan.local_id("attempt", str(item["source_id"])), chat_id,
+                plan.local_id("message", str(item["user_message_id"])),
+                plan.local_id("message", str(item["assistant_message_id"])), str(item["source_id"]),
+                node_ids[("attempt", str(item["source_id"]))],
+                "incomplete" if str(item["state"]) == "truncated" else str(item["state"]),
+                canonical_time(item["started_at"]), canonical_time(item["ended_at"]),
+                json.dumps(item, sort_keys=True, separators=(",", ":")),
+                json.dumps(
+                    [row for row in plan.history_bindings if row.get("attempt_id") == str(item["source_id"])],
+                    sort_keys=True, separators=(",", ":"),
+                ),
+            )
+            for item in plan.attempts
+        )
+        context_grants = tuple(
+            (
+                plan.local_id("attempt", str(item["attempt_id"])),
+                canonical_json_bytes(item).decode("utf-8"),
+                hashlib.sha256(canonical_json_bytes(item)).hexdigest(),
+                json.dumps(
+                    {"source_attempt_id": str(item["attempt_id"]),
+                     "local_attempt_id": plan.local_id("attempt", str(item["attempt_id"]))},
+                    sort_keys=True, separators=(",", ":"),
+                ),
+            )
+            for item in plan.context_plans
+        )
+        attachment_grants = tuple(
+            (
+                plan.local_id("attachment", str(item["source_id"])), operation_id, str(item["source_id"]),
+                node_ids[("attachment", str(item["source_id"]))],
+                plan.local_id("attachment", str(item["source_id"])) if connection.execute(
+                    select(attachment_blobs.c.digest).where(
+                        attachment_blobs.c.digest == bytes.fromhex(str(item["blob_digest"])),
+                        attachment_blobs.c.byte_size == int(item["byte_size"]),
+                        attachment_blobs.c.state == "ready",
+                    )
+                ).first() is not None else None,
+                bytes.fromhex(str(item["blob_digest"])), int(item["byte_size"]),
+                json.dumps(item, sort_keys=True, separators=(",", ":")),
+                "READY" if connection.execute(
+                    select(attachment_blobs.c.digest).where(
+                        attachment_blobs.c.digest == bytes.fromhex(str(item["blob_digest"])),
+                        attachment_blobs.c.byte_size == int(item["byte_size"]),
+                        attachment_blobs.c.state == "ready",
+                    )
+                ).first() is not None else "MISSING_EXTERNAL",
+                timestamp,
+                timestamp if connection.execute(
+                    select(attachment_blobs.c.digest).where(
+                        attachment_blobs.c.digest == bytes.fromhex(str(item["blob_digest"])),
+                        attachment_blobs.c.byte_size == int(item["byte_size"]),
+                        attachment_blobs.c.state == "ready",
+                    )
+                ).first() is not None else None,
+            )
+            for item in plan.attachments
+        )
+        source_grants = ((
+            chat_id, operation_id, captured.source_chat_id, captured.source_chat_revision,
+            plan.chat.get("archived_at"), node_ids[("chat", captured.source_chat_id)], timestamp,
+            json.dumps(plan.chat_configuration, sort_keys=True, separators=(",", ":")),
+            json.dumps(plan.continuation_history or {}, sort_keys=True, separators=(",", ":")),
+        ),)
+        message_source_grants = tuple(
+            (
+                plan.local_id("message", str(item["source_id"])), chat_id,
+                str(item["source_id"]), str(item["lineage_id"]),
+                node_ids[("message", str(item["source_id"]))],
+            )
+            for item in plan.messages
+        )
+        lineage_grants = tuple(
+            (chat_id, plan.local_id("lineage", source_lineage), source_lineage,
+             node_ids[("lineage", source_lineage)])
+            for source_lineage in dict.fromkeys(str(item["lineage_id"]) for item in plan.messages)
+        )
+        derivation_grants = tuple(
+            (
+                chat_id,
+                str(row["object_kind"]),
+                plan.local_id(str(row["object_kind"]), str(row["object_id"])),
+                plan.local_id("message", str(row["derivation"]["predecessor"]["object_id"])),
+            )
+            for row in plan.object_provenance
+            if isinstance(row.get("derivation"), dict)
+            and row["derivation"].get("kind") == "local-continuation"
+        )
+        history = plan.continuation_history or {}
+        source_branches = history.get("branches", []) if isinstance(history, dict) else []
+
+        def sealed_imported_branch(branch: object) -> tuple[object, ...]:
+            if not isinstance(branch, dict):
+                raise ArchiveImportStoreError("continuation branch is malformed")
+            source_key, source_first, source_attempt = (
+                branch.get("anchor_key"), branch.get("first_message_id"), branch.get("attempt_id")
+            )
+            revision = branch.get("choice_revision")
+            if (not isinstance(source_key, str) or not isinstance(source_first, str)
+                    or not isinstance(source_attempt, str) or type(revision) is not int):
+                raise ArchiveImportStoreError("continuation branch is malformed")
+            local_key = "empty" if source_key == "empty" else plan.local_id("message", source_key)
+            snapshot = {
+                "anchor_key": source_key,
+                "choice_revision": revision,
+                "first_message_id": source_first,
+                "attempt_id": source_attempt,
+                "created_at": branch.get("created_at"),
+            }
+            return (
+                plan.local_id("message", source_first), chat_id,
+                plan.local_id("attempt", source_attempt), local_key,
+                json.dumps(snapshot, sort_keys=True, separators=(",", ":")),
+            )
+
+        imported_branch_grants = tuple(
+            sealed_imported_branch(branch) for branch in source_branches
+        )
+        anchor_rows = history.get("anchors", []) if isinstance(history, dict) else []
+        terminal_source_bases = (
+            ["empty"] + [
+                str(row["anchor_key"]) for row in anchor_rows
+                if isinstance(row, dict) and row.get("anchor_key") != "empty"
+            ]
+            if isinstance(anchor_rows, list) and anchor_rows
+            else ["empty"] + [
+                str(item["source_id"]) for item in plan.messages
+                if str(item["role"]) == "assistant"
+                and str(item["state"]) in {"complete", "incomplete", "failed", "aborted", "truncated"}
+            ]
+        )
+        continuation_anchor_grants = tuple(
+            (
+                chat_id, "empty" if base_key == "empty" else plan.local_id("message", base_key),
+                None if base_key == "empty" else plan.local_id("message", base_key), 1,
+                json.dumps(
+                    next((row for row in anchor_rows if row.get("anchor_key") == base_key), {}).get(
+                        "source_configuration", plan.chat_configuration
+                    ), sort_keys=True, separators=(",", ":"),
+                ),
+                "UNRESOLVED",
+                json.dumps({"kind":"imported-source","reason":"provider mapping requires explicit local admission"}, sort_keys=True, separators=(",", ":")),
+            )
+            for base_key in dict.fromkeys(terminal_source_bases)
+        )
+        arm_phase9_import_graph(
+            connection, operation_id, identities, messages=message_grants, chats=chat_grants,
+            links=link_grants, attempts=attempt_grants, contexts=context_grants, attachments=attachment_grants,
+            sources=source_grants,
+            nodes=tuple(node_grants),
+            imported_branches=imported_branch_grants,
+            message_sources=message_source_grants,
+            lineages=lineage_grants,
+            continuation_anchors=continuation_anchor_grants,
+            derivations=derivation_grants,
+        )
+        arm_phase7_source_mutation(connection, "archive import graph")
+        try:
+            connection.exec_driver_sql(
+                "INSERT INTO chats(id,title,created_at,updated_at,head_message_id,revision,archived_at) VALUES (?,?,?,?,NULL,0,?)",
+                (chat_id, str(plan.chat["title"]), canonical_time(plan.chat["created_at"]), canonical_time(plan.chat["updated_at"]),
+                 timestamp if import_as_archived else None),
+            )
+            self._insert_import_lineage_nodes(connection, tuple(node_grants))
+            chat_node = node_ids[("chat", captured.source_chat_id)]
+            connection.exec_driver_sql(
+                "INSERT INTO archive_import_chats(chat_id,operation_id,source_chat_id,source_chat_revision,source_archived_at,source_node_id,imported_at,source_configuration,source_continuation_history) VALUES (?,?,?,?,?,?,?,?,?)",
+                (chat_id, operation_id, captured.source_chat_id, captured.source_chat_revision,
+                 plan.chat.get("archived_at"), chat_node, timestamp,
+                 json.dumps(plan.chat_configuration, sort_keys=True, separators=(",", ":")),
+                 json.dumps(plan.continuation_history or {}, sort_keys=True, separators=(",", ":"))),
+            )
+            for item in plan.messages:
+                local_id = plan.local_id("message", str(item["source_id"]))
+                local_parent = None if item.get("parent_id") is None else plan.local_id("message", str(item["parent_id"]))
+                local_supersedes = None if item.get("supersedes_id") is None else plan.local_id("message", str(item["supersedes_id"]))
+                local_lineage = plan.local_id("lineage", str(item["lineage_id"]))
+                connection.exec_driver_sql(
+                    "INSERT INTO messages(id,chat_id,parent_id,sequence,role,state,content,created_at,lineage_id,revision,supersedes_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (local_id, chat_id, local_parent, int(item["sequence"]), str(item["role"]), str(item["state"]), str(item["content"]), canonical_time(item["created_at"]), local_lineage, int(item["revision"]), local_supersedes),
+                )
+                connection.exec_driver_sql(
+                    "INSERT INTO archive_import_messages(message_id,chat_id,source_message_id,source_lineage_id,source_node_id) VALUES (?,?,?,?,?)",
+                    (local_id, chat_id, str(item["source_id"]), str(item["lineage_id"]), node_ids[("message", str(item["source_id"]))]),
+                )
+            payload_text_facts = {
+                digest: (snapshot.text_representation_id, snapshot.ineligibility_reason)
+                for digest, snapshot in captured.payloads
+            }
+            for item in plan.attachments:
+                source_id = str(item["source_id"])
+                attachment_id = plan.local_id("attachment", source_id)
+                digest = bytes.fromhex(str(item["blob_digest"]))
+                archived_filename = (
+                    str(item["filename"])
+                    if item.get("filename_status") == "available" and isinstance(item.get("filename"), str)
+                    else "imported-attachment"
+                )
+                backing = connection.execute(
+                    select(attachments).select_from(attachments.join(attachment_blobs, attachments.c.blob_digest == attachment_blobs.c.digest))
+                    .where(attachment_blobs.c.digest == digest, attachment_blobs.c.byte_size == int(item["byte_size"]), attachment_blobs.c.state == "ready")
+                    .order_by(attachments.c.id).limit(1)
+                ).first()
+                blob_ready = connection.execute(select(attachment_blobs.c.digest).where(attachment_blobs.c.digest == digest, attachment_blobs.c.byte_size == int(item["byte_size"]), attachment_blobs.c.state == "ready")).first()
+                if backing is not None or blob_ready is not None:
+                    text_representation_id, ineligibility_reason = (
+                        (backing.text_representation_id, backing.ineligibility_reason)
+                        if backing is not None else payload_text_facts.get(str(item["blob_digest"]), (None, None))
+                    )
+                    if backing is None and str(item["blob_digest"]) not in payload_text_facts:
+                        raise ArchiveImportStoreError(
+                            "ready imported payload lacks sealed text classification"
+                        )
+                    arm_phase6_attachment_insert(connection, attachment_id)
+                    try:
+                        connection.execute(insert(attachments).values(
+                            id=attachment_id, blob_digest=digest, filename=archived_filename,
+                            source_kind="imported", source_name=archived_filename,
+                            text_representation_id=text_representation_id,
+                            text_digest=text_representation_id,
+                            ineligibility_reason=ineligibility_reason, created_at=timestamp,
+                        ))
+                        require_phase6_consumed(connection)
+                    finally:
+                        clear_phase6(connection)
+                connection.exec_driver_sql(
+                    "INSERT INTO archive_import_attachment_refs(id,operation_id,source_attachment_id,source_node_id,attachment_id,expected_digest,expected_size,source_metadata,availability,created_at,healed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (attachment_id, operation_id, source_id,
+                     node_ids[("attachment", source_id)], attachment_id if (backing is not None or blob_ready is not None) else None, digest,
+                     int(item["byte_size"]), json.dumps(item, sort_keys=True, separators=(",", ":")),
+                     "READY" if (backing is not None or blob_ready is not None) else "MISSING_EXTERNAL", timestamp,
+                     timestamp if (backing is not None or blob_ready is not None) else None),
+                )
+            for relation in plan.message_attachment_relations:
+                connection.exec_driver_sql(
+                    "INSERT INTO archive_import_message_attachment_refs(message_id,attachment_ref_id,ordinal) VALUES (?,?,?)",
+                    (plan.local_id("message", str(relation["message_id"])),
+                     plan.local_id("attachment", str(relation["attachment_id"])), int(relation["ordinal"])),
+                )
+            for source_lineage in dict.fromkeys(str(item["lineage_id"]) for item in plan.messages):
+                connection.exec_driver_sql(
+                    "INSERT INTO archive_import_lineages(chat_id,local_lineage_id,source_lineage_id,source_node_id) VALUES (?,?,?,?)",
+                    (chat_id, plan.local_id("lineage", source_lineage), source_lineage, node_ids[("lineage", source_lineage)]),
+                )
+            for item in plan.attempts:
+                source_id = str(item["source_id"])
+                state = "incomplete" if str(item["state"]) == "truncated" else str(item["state"])
+                connection.exec_driver_sql(
+                    "INSERT INTO archive_imported_attempts(id,chat_id,user_message_id,assistant_message_id,source_attempt_id,source_node_id,state,started_at,ended_at,source_attempt,source_evidence_binding) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (plan.local_id("attempt", source_id), chat_id,
+                     plan.local_id("message", str(item["user_message_id"])),
+                     plan.local_id("message", str(item["assistant_message_id"])),
+                     source_id, node_ids[("attempt", source_id)], state,
+                     canonical_time(item["started_at"]), canonical_time(item["ended_at"]),
+                     json.dumps(item, sort_keys=True, separators=(",", ":")),
+                     json.dumps([row for row in plan.history_bindings if row.get("attempt_id") == source_id], sort_keys=True, separators=(",", ":"))),
+                )
+            for derivation in derivation_grants:
+                connection.exec_driver_sql(
+                    "INSERT INTO archive_object_derivations(chat_id,object_kind,object_id,predecessor_message_id) VALUES (?,?,?,?)",
+                    derivation,
+                )
+            for item in plan.context_plans:
+                source_attempt_id = str(item["attempt_id"])
+                local_attempt_id = plan.local_id("attempt", source_attempt_id)
+                source_plan = canonical_json_bytes(item).decode("utf-8")
+                connection.exec_driver_sql(
+                    "INSERT INTO archive_imported_context_plans(attempt_id,source_plan,source_plan_digest,local_bindings) VALUES (?,?,?,?)",
+                    (local_attempt_id, source_plan, hashlib.sha256(source_plan.encode("utf-8")).hexdigest(),
+                     json.dumps({"source_attempt_id": source_attempt_id, "local_attempt_id": local_attempt_id}, sort_keys=True, separators=(",", ":"))),
+                )
+            anchor_rows = history.get("anchors", [])
+            terminal_bases = (
+                ["empty"] + [
+                    str(row["anchor_key"]) for row in anchor_rows
+                    if isinstance(row, dict) and row.get("anchor_key") != "empty"
+                ]
+                if isinstance(anchor_rows, list) and anchor_rows
+                else ["empty"] + [
+                    str(item["source_id"]) for item in plan.messages
+                    if str(item["role"]) == "assistant"
+                    and str(item["state"]) in {"complete", "incomplete", "failed", "aborted", "truncated"}
+                ]
+            )
+            for base_key in dict.fromkeys(terminal_bases):
+                source_anchor = next(
+                    (row for row in anchor_rows if row.get("anchor_key") == base_key), {}
+                ) if isinstance(anchor_rows, list) else {}
+                configuration = source_anchor.get("source_configuration", plan.chat_configuration)
+                local_base = None if base_key == "empty" else plan.local_id("message", base_key)
+                local_key = "empty" if local_base is None else local_base
+                connection.exec_driver_sql(
+                    "INSERT INTO archive_continuation_anchors("
+                    "chat_id,base_key,base_message_id,revision,source_configuration,resolution,resolution_evidence) "
+                    "VALUES (?,?,?,?,?,'UNRESOLVED',?)",
+                    (chat_id, local_key, local_base, 1,
+                     json.dumps(configuration, sort_keys=True, separators=(",", ":")),
+                     json.dumps({"kind":"imported-source","reason":"provider mapping requires explicit local admission"}, sort_keys=True, separators=(",", ":"))),
+                )
+            # Deterministic receiver equivalence was selected during preflight
+            # and sealed with the internal import graph.  Do not query or
+            # reselect receiver catalogue state after the durable cutoff.
+            for automatic in plan.initial_receiver_continuation:
+                if not isinstance(automatic, dict):
+                    raise ArchiveImportStoreError("sealed receiver continuation is malformed")
+                try:
+                    local_key = str(automatic["base_key"])
+                    connection_id = str(automatic["connection_id"])
+                    model_id = str(automatic["model_id"])
+                    settings = automatic["explicit_settings"]
+                    descriptor = automatic["safe_target_descriptor"]
+                    resolution = str(automatic["resolution"])
+                    evidence = automatic["resolution_evidence"]
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ArchiveImportStoreError("sealed receiver continuation is malformed") from exc
+                if (not isinstance(settings, dict) or not isinstance(descriptor, dict)
+                        or resolution != "EQUIVALENT" or not isinstance(evidence, dict)):
+                    raise ArchiveImportStoreError("sealed receiver continuation is malformed")
+                try:
+                    _validate_settings(GenerationSettings(**settings))
+                except (TypeError, ValueError) as exc:
+                    raise ArchiveImportStoreError("sealed receiver continuation is malformed") from exc
+                # The preflight target is sealed by identity.  Revalidate that
+                # exact pair at graph admission, but never fall through to a
+                # newly discovered candidate if it was disabled, retired, or
+                # otherwise ceased to be runnable after preflight.
+                target = connection.exec_driver_sql(
+                    "SELECT p.backend_type,p.profile,p.enabled,p.retired,m.availability,m.provider_model_id "
+                    "FROM model_catalogue_entries m JOIN provider_connections p ON p.id=m.connection_id "
+                    "WHERE p.id=? AND m.id=?",
+                    (connection_id, model_id),
+                ).mappings().one_or_none()
+                if (target is None or str(target["backend_type"]) != "fake"
+                        or str(target["profile"]) != "generic" or not bool(target["enabled"])
+                        or bool(target["retired"]) or str(target["availability"]) != "available"
+                        or str(target["provider_model_id"]) != str(descriptor.get("provider_model_id"))
+                        or not self._phase9_fake_candidate_is_runnable(
+                            model_id, GenerationSettings(**settings),
+                        )):
+                    raise ArchiveImportStoreError("sealed receiver continuation target is no longer runnable")
+                automatic_choice = (
+                    chat_id, local_key, 1, connection_id, model_id,
+                    json.dumps(settings, sort_keys=True, separators=(",", ":")), 0, "[]",
+                    "equivalent", json.dumps(descriptor, sort_keys=True, separators=(",", ":")), timestamp,
+                )
+                arm_phase9_import_continuation_rows(connection, choices=(automatic_choice,))
+                connection.exec_driver_sql(
+                    "INSERT INTO archive_continuation_choices(chat_id,base_key,choice_revision,local_connection_id,local_model_entry_id,explicit_settings,degraded,excluded_refs,decision_kind,safe_target_descriptor,created_at) VALUES (?,?,1,?,?,?,0,'[]','equivalent',?,?)",
+                    (chat_id, local_key, connection_id, model_id,
+                     json.dumps(settings, sort_keys=True, separators=(",", ":")),
+                     json.dumps(descriptor, sort_keys=True, separators=(",", ":")), timestamp),
+                )
+                connection.exec_driver_sql(
+                    "UPDATE archive_continuation_anchors SET resolution=?,resolution_evidence=? WHERE chat_id=? AND base_key=?",
+                    (resolution, json.dumps(evidence, sort_keys=True, separators=(",", ":")), chat_id, local_key),
+                )
+            # Archive choices are historical source facts.  They retain their
+            # portable descriptor/settings/exclusions but deliberately have
+            # no local target IDs: importing must never create or select a
+            # provider.  A later local choice is appended separately.
+            source_choices = history.get("choices", []) if isinstance(history, dict) else []
+            for choice in source_choices:
+                if not isinstance(choice, dict):
+                    raise ArchiveImportStoreError("continuation choice is malformed")
+                source_key = choice.get("anchor_key")
+                revision = choice.get("choice_revision")
+                if not isinstance(source_key, str) or type(revision) is not int:
+                    raise ArchiveImportStoreError("continuation choice is malformed")
+                local_key = "empty" if source_key == "empty" else plan.local_id("message", source_key)
+                exclusions = choice.get("excluded_context_refs")
+                descriptor = choice.get("mapped_model")
+                settings = choice.get("explicit_settings")
+                if not isinstance(exclusions, list) or not isinstance(descriptor, dict) or not isinstance(settings, dict):
+                    raise ArchiveImportStoreError("continuation choice is malformed")
+                local_exclusions = []
+                for exclusion in exclusions:
+                    if not isinstance(exclusion, dict):
+                        raise ArchiveImportStoreError("continuation exclusion is malformed")
+                    mapped = dict(exclusion)
+                    if mapped.get("attachment_id") is not None:
+                        if not isinstance(mapped["attachment_id"], str):
+                            raise ArchiveImportStoreError("continuation exclusion is malformed")
+                        mapped["attachment_id"] = plan.local_id("attachment", mapped["attachment_id"])
+                    local_exclusions.append(mapped)
+                decision_kind = choice.get("decision_kind")
+                if decision_kind == "operator-resolution":
+                    decision_kind = "operator_resolution"
+                if decision_kind not in {"equivalent", "operator_resolution"}:
+                    raise ArchiveImportStoreError("continuation choice is malformed")
+                source_choice = (
+                    chat_id, local_key, revision, None, None,
+                    json.dumps(settings, sort_keys=True, separators=(",", ":")),
+                    1 if local_exclusions else 0,
+                    json.dumps(local_exclusions, separators=(",", ":")), str(decision_kind),
+                    json.dumps(descriptor, sort_keys=True, separators=(",", ":")),
+                    canonical_time(str(choice.get("chosen_at"))),
+                )
+                arm_phase9_import_continuation_rows(connection, choices=(source_choice,))
+                connection.exec_driver_sql(
+                    "INSERT INTO archive_continuation_choices(chat_id,base_key,choice_revision,local_connection_id,local_model_entry_id,explicit_settings,degraded,excluded_refs,decision_kind,safe_target_descriptor,created_at) VALUES (?,?,?,NULL,NULL,?,?,?,?,?,?)",
+                    (chat_id, local_key, revision,
+                     json.dumps(settings, sort_keys=True, separators=(",", ":")),
+                     1 if local_exclusions else 0,
+                     json.dumps(local_exclusions, separators=(",", ":")), str(decision_kind),
+                     json.dumps(descriptor, sort_keys=True, separators=(",", ":")),
+                     canonical_time(str(choice.get("chosen_at")))),
+                )
+            for first_message_id, branch_chat_id, attempt_id, base_key, choice_snapshot in imported_branch_grants:
+                choice_revision = json.loads(str(choice_snapshot)).get("choice_revision")
+                if connection.exec_driver_sql(
+                    "SELECT 1 FROM archive_continuation_choices WHERE chat_id=? AND base_key=? AND choice_revision=?",
+                    (branch_chat_id, base_key, choice_revision),
+                ).first() is None:
+                    raise ArchiveImportStoreError("imported branch lacks its sealed continuation choice")
+                connection.exec_driver_sql(
+                    "INSERT INTO archive_imported_branch_choices(chat_id,first_message_id,attempt_id,base_key,choice_snapshot) VALUES (?,?,?,?,?)",
+                    (branch_chat_id, first_message_id, attempt_id, base_key, choice_snapshot),
+                )
+            for relation in plan.attempt_attachment_relations:
+                connection.exec_driver_sql(
+                    "INSERT INTO archive_import_attempt_attachment_refs(attempt_id,attachment_ref_id,ordinal) VALUES (?,?,?)",
+                    (plan.local_id("attempt", str(relation["attempt_id"])),
+                     plan.local_id("attachment", str(relation["attachment_id"])), int(relation["ordinal"])),
+                )
+            # Requirements come only from the source attempt's *selected*
+            # attachment slots.  A message link is historical graph context,
+            # not proof that the attachment was selected for this request.
+            # The v2 history binding fixes the source-context ordinal and the
+            # representation evidence; neither can be reconstructed from a
+            # digest-wide attachment search.
+            attachment_by_source = {str(item["source_id"]): item for item in plan.attachments}
+            terminal_attempts = {
+                str(item["source_id"]): str(item["assistant_message_id"])
+                for item in plan.attempts
+                if str(item["state"]) in {"complete", "incomplete", "failed", "aborted", "truncated"}
+            }
+            requirement_bases = list(terminal_attempts.items())
+            terminal_attempt_bases = set(terminal_attempts.values())
+            for branch in source_branches:
+                if branch.get("anchor_key") == "empty":
+                    continue
+                # A terminal assistant anchor already owns its original source
+                # requirement slots.  Branches rooted at that anchor are
+                # sibling native plans with their own dense ordinals; they must
+                # not overwrite or contradict the historical anchor's slots.
+                if str(branch["anchor_key"]) in terminal_attempt_bases:
+                    continue
+                pair = (str(branch["attempt_id"]), str(branch["anchor_key"]))
+                if pair not in requirement_bases:
+                    requirement_bases.append(pair)
+            bindings_by_attempt: dict[str, list[dict[str, object]]] = {}
+            for binding in plan.history_bindings:
+                if not isinstance(binding, dict) or binding.get("binding_kind") != "context-source":
+                    continue
+                snapshot = binding.get("snapshot_source")
+                current = binding.get("current_binding")
+                if (not isinstance(snapshot, dict) or snapshot.get("kind") != "attachment"
+                        or (current is not None and (not isinstance(current, dict) or current.get("object_kind") != "attachment"))
+                        or not isinstance(binding.get("attempt_id"), str)
+                        or type(binding.get("ordinal")) is not int):
+                    continue
+                bindings_by_attempt.setdefault(str(binding["attempt_id"]), []).append(binding)
+            unrepresentable_bases: set[str] = set()
+            for source_attempt, source_base_key in requirement_bases:
+                base_key = plan.local_id("message", source_base_key)
+                selected = [
+                    row for row in plan.attempt_attachment_relations
+                    if str(row["attempt_id"]) == source_attempt
+                ]
+                selected.sort(key=lambda row: int(row["ordinal"]))
+                bindings = sorted(bindings_by_attempt.get(source_attempt, []), key=lambda row: int(row["ordinal"]))
+                covered_source_attachments: set[str] = set()
+                if selected and not bindings:
+                    unrepresentable_bases.add(base_key)
+                for binding in bindings:
+                    snapshot = binding["snapshot_source"]
+                    evidence_digest = str(snapshot["evidence_digest"])
+                    source_status = snapshot.get("source_id_status")
+                    requirement_ordinal = int(binding["ordinal"])
+                    candidates: list[dict[str, object]]
+                    if source_status == "available" and binding.get("binding_state") == "bound":
+                        source_attachment = str(snapshot.get("source_id"))
+                        current = binding["current_binding"]
+                        if not isinstance(current, dict) or str(current.get("object_id")) != source_attachment:
+                            unrepresentable_bases.add(base_key)
+                            continue
+                        candidates = [row for row in selected if str(row["attachment_id"]) == source_attachment]
+                        if len(candidates) != 1:
+                            unrepresentable_bases.add(base_key)
+                            continue
+                        binding_kind = "identity"
+                    elif (
+                        binding.get("binding_state") in {"unavailable", "historical-only"}
+                        and binding.get("current_binding") is None
+                    ):
+                        # A sealed source slot without an exact typed current
+                        # arm can establish content dependency, never an
+                        # invented object identity.  Its complete candidate
+                        # set is restricted to this selected source attempt's
+                        # slots; a global same-digest row is not a candidate.
+                        candidates = [
+                            row for row in selected
+                            if str(attachment_by_source[str(row["attachment_id"])].get("text_digest")) == evidence_digest
+                            and attachment_by_source[str(row["attachment_id"])].get("text_eligibility") == "eligible"
+                        ]
+                        if not candidates:
+                            unrepresentable_bases.add(base_key)
+                            continue
+                        binding_kind = "digest"
+                    else:
+                        unrepresentable_bases.add(base_key)
+                        continue
+                    candidate_attachments = [attachment_by_source[str(row["attachment_id"])] for row in candidates]
+                    covered_source_attachments.update(str(row["attachment_id"]) for row in candidates)
+                    digests = {str(row["blob_digest"]) for row in candidate_attachments}
+                    sizes = {int(row["byte_size"]) for row in candidate_attachments}
+                    if len(digests) != 1 or len(sizes) != 1:
+                        unrepresentable_bases.add(base_key)
+                        continue
+                    expected_digest = digests.pop()
+                    expected_size = sizes.pop()
+                    if binding_kind == "identity":
+                        bound_ref_id = plan.local_id("attachment", str(candidates[0]["attachment_id"]))
+                    else:
+                        bound_ref_id = None
+                    requirement_grant = (
+                        chat_id, base_key, requirement_ordinal,
+                        plan.local_id("attempt", source_attempt), None,
+                        bytes.fromhex(expected_digest), expected_size, bytes.fromhex(evidence_digest),
+                        binding_kind, None, bound_ref_id,
+                    )
+                    candidate_grants = tuple(
+                        (chat_id, base_key, requirement_ordinal,
+                         plan.local_id("attachment", str(candidate["attachment_id"])), None,
+                         plan.local_id("attachment", str(candidate["attachment_id"])))
+                        for candidate in candidates
+                    )
+                    arm_phase9_import_continuation_rows(
+                        connection, requirements=(requirement_grant,), candidates=candidate_grants,
+                    )
+                    connection.exec_driver_sql(
+                        "INSERT INTO archive_continuation_requirements("
+                        "chat_id,base_key,ordinal,source_imported_attempt_id,source_native_attempt_id,expected_digest,expected_size,representation_digest,binding_kind,bound_native_attachment_id,bound_imported_ref_id) "
+                        "VALUES (?,?,?,?,NULL,?,?,?,?,NULL,?)",
+                        (chat_id, base_key, requirement_ordinal, plan.local_id("attempt", source_attempt),
+                         bytes.fromhex(expected_digest), expected_size, bytes.fromhex(evidence_digest),
+                         binding_kind, bound_ref_id),
+                    )
+                    for candidate in candidates:
+                        ref_id = plan.local_id("attachment", str(candidate["attachment_id"]))
+                        connection.exec_driver_sql(
+                            "INSERT INTO archive_continuation_requirement_candidates(chat_id,base_key,ordinal,candidate_attachment_id,native_attachment_id,imported_ref_id) VALUES (?,?,?,?,NULL,?)",
+                            (chat_id, base_key, requirement_ordinal, ref_id, ref_id),
+                        )
+                if any(str(row["attachment_id"]) not in covered_source_attachments for row in selected):
+                    unrepresentable_bases.add(base_key)
+            for base_key in unrepresentable_bases:
+                connection.exec_driver_sql(
+                    "UPDATE archive_continuation_anchors SET resolution='NEEDS_OPERATOR',resolution_evidence=? WHERE chat_id=? AND base_key=?",
+                    (json.dumps({"kind":"source-context","reason":"selected attachment slot lacks an exact typed history binding"}, sort_keys=True, separators=(",", ":")), chat_id, base_key),
+                )
+            if head is not None:
+                connection.exec_driver_sql(
+                    "UPDATE chats SET head_message_id=?,revision=1 WHERE id=? AND revision=0 AND head_message_id IS NULL",
+                    (plan.local_id("message", str(head)), chat_id),
+                )
+            return self._require_phase7_source_consumed(connection)
+        finally:
+            clear_phase9_import_graph(connection)
+            clear_phase9_object_derivations(connection)
+            clear_phase7_source_mutation(connection)
+
+    @staticmethod
+    def _insert_import_lineage_nodes(connection, nodes: tuple[tuple[object, ...], ...]) -> None:
+        """Persist the exact preallocated per-object provenance rows."""
+        for node in nodes:
+            connection.exec_driver_sql(
+                "INSERT INTO archive_lineage_nodes(id,object_kind,archive_id,logical_content_digest,source_object_id,imported_at,source_format,prior_node_id) VALUES (?,?,?,?,?,?,?,?)",
+                node,
+            )
+
     def _commit_attachment_transaction(self, connection, operation: str) -> None:
         """Classify an attachment-consequential commit at its only call site."""
         connection_info = getattr(connection, "info", None)
@@ -2227,6 +4667,11 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         with lock:
             try:
                 connection.commit()
+                # A caller cannot distinguish a successful SQLite commit
+                # followed by a transport/runtime failure from an uncertain
+                # commit return.  Exercise that exact post-return boundary in
+                # deterministic fault tests and fail closed here.
+                _fault(f"after-attachment-commit:{operation}")
             except BaseException as exc:
                 if connection_info is not None:
                     connection_info.pop(_PHASE7_PENDING_SOURCE_COMMIT, None)
@@ -2271,6 +4716,9 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         """Classify an uncertain close at a live attachment boundary."""
         try:
             connection.close()
+            # A close which succeeds below SQLite but loses its return path is
+            # uncertain to this authority just like a raised close result.
+            _fault(f"after-attachment-close:{operation}")
         except BaseException as exc:
             self._poison_attachment_lifecycle(
                 f"{operation} database connection close outcome uncertain"
@@ -2299,9 +4747,10 @@ class SQLiteAppStateStore(Phase5StoreMixin):
             revision = connection.exec_driver_sql(
                 "SELECT version_num FROM alembic_version"
             ).scalar_one_or_none()
-            if revision != _PHASE8_REVISION:
-                raise StateError("Phase 8 persistence schema is not current")
+            if revision != _PHASE9_REVISION:
+                raise StateError("Phase 9 persistence schema is not current")
             validate_phase6_schema(connection)
+            validate_phase9_schema(connection)
             validate_phase7_schema(
                 connection,
                 require_fts=self._search_available,
@@ -2408,6 +4857,396 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         assert result_chat is not None
         return result_chat
 
+    def admit_import_continuation_choice(
+        self, chat_id: str, base_key: str, *, expected_choice_revision: int,
+        connection_id: str, model_entry_id: str, explicit_settings: dict[str, object],
+        excluded_refs: tuple[dict[str, object], ...], now,
+    ) -> int:
+        """Append one explicit local continuation choice without creating providers."""
+        self._ensure_open()
+        if (not chat_id or not base_key or type(expected_choice_revision) is not int
+                or expected_choice_revision < 0 or not connection_id or not model_entry_id
+                or set(explicit_settings) != {"temperature", "max_output_tokens", "reasoning_effort", "timeout_seconds"}
+                or any(type(value) is not dict or set(value) != {"requirement_ordinal", "expected_digest", "attachment_id", "reason"} for value in excluded_refs)):
+            raise StateError("continuation choice is malformed")
+        try:
+            _validate_settings(GenerationSettings(**explicit_settings))
+        except (TypeError, ValueError) as exc:
+            raise StateError("continuation choice settings are malformed") from exc
+        timestamp = utc_iso(now)
+        with self._authority.transition(), self._search_transaction("admit imported continuation choice") as connection:
+            anchor = connection.exec_driver_sql(
+                "SELECT 1 FROM archive_continuation_anchors WHERE chat_id=? AND base_key=?", (chat_id, base_key)
+            ).first()
+            if anchor is None:
+                raise StateError("imported continuation anchor is absent")
+            latest = connection.exec_driver_sql(
+                "SELECT COALESCE(MAX(choice_revision),0) FROM archive_continuation_choices WHERE chat_id=? AND base_key=?",
+                (chat_id, base_key),
+            ).scalar_one()
+            if int(latest) != expected_choice_revision:
+                raise RevisionConflict("continuation choice revision changed")
+            ordinals = [item["requirement_ordinal"] for item in excluded_refs]
+            if ordinals != sorted(ordinals) or len(ordinals) != len(set(ordinals)) or any(type(value) is not int or value < 0 for value in ordinals):
+                raise StateError("continuation exclusions are not ordered unique requirements")
+            for item in excluded_refs:
+                requirement = connection.exec_driver_sql(
+                    "SELECT hex(expected_digest) AS expected_digest,binding_kind FROM archive_continuation_requirements WHERE chat_id=? AND base_key=? AND ordinal=?",
+                    (chat_id, base_key, item["requirement_ordinal"]),
+                ).mappings().one_or_none()
+                attachment_id = item["attachment_id"]
+                if (requirement is None or str(requirement["expected_digest"]).lower() != str(item["expected_digest"]).lower()
+                        or item["reason"] not in {"missing-external", "operator-excluded"}
+                        or (attachment_id is None and str(requirement["binding_kind"]) != "digest")
+                        or (attachment_id is not None and not isinstance(attachment_id, str))):
+                    raise StateError("continuation exclusion does not match its source requirement")
+                if attachment_id is not None and connection.exec_driver_sql(
+                    "SELECT 1 FROM archive_continuation_requirement_candidates WHERE chat_id=? AND base_key=? AND ordinal=? AND candidate_attachment_id=?",
+                    (chat_id, base_key, item["requirement_ordinal"], attachment_id),
+                ).first() is None:
+                    raise StateError("continuation exclusion attachment is not a source requirement candidate")
+            target = connection.execute(
+                select(
+                    provider_connections.c.id, provider_connections.c.backend_type,
+                    provider_connections.c.profile, provider_connections.c.endpoint,
+                    provider_connections.c.enabled, provider_connections.c.retired,
+                    provider_connections.c.revision.label("connection_revision"),
+                    model_catalogue_entries.c.id.label("model_entry_id"),
+                    model_catalogue_entries.c.connection_id, model_catalogue_entries.c.provider_model_id,
+                    model_catalogue_entries.c.availability, model_catalogue_entries.c.revision.label("model_revision"),
+                ).select_from(model_catalogue_entries.join(provider_connections, model_catalogue_entries.c.connection_id == provider_connections.c.id))
+                .where(provider_connections.c.id == connection_id, model_catalogue_entries.c.id == model_entry_id)
+            ).mappings().one_or_none()
+            if (target is None or not bool(target["enabled"]) or bool(target["retired"])
+                    or str(target["availability"]).lower() != "available"):
+                raise StateError("continuation target is not runnable")
+            descriptor = {
+                "connection_id": connection_id, "model_entry_id": model_entry_id,
+                "backend_type": str(target["backend_type"]), "provider_profile": str(target["profile"]),
+                "provider_model_id": str(target["provider_model_id"]),
+                "availability": str(target["availability"]),
+                "connection_revision": int(target["connection_revision"]), "model_revision": int(target["model_revision"]),
+            }
+            next_revision = expected_choice_revision + 1
+            connection.exec_driver_sql(
+                "INSERT INTO archive_continuation_choices(chat_id,base_key,choice_revision,local_connection_id,local_model_entry_id,explicit_settings,degraded,excluded_refs,decision_kind,safe_target_descriptor,created_at) VALUES (?,?,?,?,?,?,?,?,'operator_resolution',?,?)",
+                (chat_id, base_key, next_revision, connection_id, model_entry_id,
+                 json.dumps(explicit_settings, sort_keys=True, separators=(",", ":")),
+                 1 if excluded_refs else 0,
+                 json.dumps(list(excluded_refs), separators=(",", ":")),
+                 json.dumps(descriptor, sort_keys=True, separators=(",", ":")), timestamp),
+            )
+        return next_revision
+
+    def prepare_imported_user_edit_continuation(
+        self, chat_id: str, user_message_id: str, *, now,
+    ) -> ContinuationReadiness | None:
+        """Prepare one explicit local edit branch for an imported user turn.
+
+        The imported user remains immutable.  This method creates or reuses a
+        local continuation anchor on that user, copies the imported turn's
+        attachment requirements, and appends the edit's explicit local choice.
+        It returns ``None`` for an ordinary native user message.
+        """
+        self._ensure_open()
+        with self._authority.operation(), self._engine.connect() as connection:
+            donor = connection.exec_driver_sql(
+                "SELECT a.assistant_message_id "
+                "FROM archive_imported_attempts AS a "
+                "JOIN archive_import_messages AS m "
+                "ON m.message_id=a.user_message_id AND m.chat_id=a.chat_id "
+                "WHERE a.chat_id=? AND a.user_message_id=? "
+                "ORDER BY a.started_at,a.id LIMIT 1",
+                (chat_id, user_message_id),
+            ).first()
+            if donor is None:
+                return None
+            donor_base_key = str(donor[0])
+            donor_anchor = connection.exec_driver_sql(
+                "SELECT source_configuration FROM archive_continuation_anchors "
+                "WHERE chat_id=? AND base_key=?",
+                (chat_id, donor_base_key),
+            ).first()
+            if donor_anchor is None:
+                raise StateError("imported user edit lacks its source continuation anchor")
+            existing_anchor = connection.exec_driver_sql(
+                "SELECT 1 FROM archive_continuation_anchors WHERE chat_id=? AND base_key=?",
+                (chat_id, user_message_id),
+            ).first()
+
+        _application_settings, default_model_id, _revision = (
+            self.get_application_generation_config()
+        )
+        if default_model_id is None:
+            raise StateError("application default model is required to edit imported history")
+        model = self.get_model_catalogue_entry(default_model_id)
+        if model is None or model.availability is not CatalogueAvailability.AVAILABLE:
+            raise StateError("application default model is not available")
+
+        timestamp = utc_iso(now)
+        with self._authority.transition(), self._engine.begin() as connection:
+            if existing_anchor is None:
+                connection.exec_driver_sql(
+                    "INSERT INTO archive_continuation_anchors("
+                    "chat_id,base_key,base_message_id,revision,source_configuration,resolution,resolution_evidence"
+                    ") VALUES (?,?,?,?,?,'UNRESOLVED',?)",
+                    (chat_id, user_message_id, user_message_id, 1, donor_anchor[0],
+                     json.dumps({
+                         "kind": "imported-user-edit-branch",
+                         "source_base_key": donor_base_key,
+                     }, sort_keys=True, separators=(",", ":"))),
+                )
+                connection.exec_driver_sql(
+                    "INSERT INTO archive_continuation_requirements("
+                    "chat_id,base_key,ordinal,source_imported_attempt_id,source_native_attempt_id,"
+                    "expected_digest,expected_size,representation_digest,binding_kind,"
+                    "bound_native_attachment_id,bound_imported_ref_id"
+                    ") SELECT chat_id,?,ordinal,source_imported_attempt_id,source_native_attempt_id,"
+                    "expected_digest,expected_size,representation_digest,binding_kind,"
+                    "bound_native_attachment_id,bound_imported_ref_id "
+                    "FROM archive_continuation_requirements WHERE chat_id=? AND base_key=?",
+                    (user_message_id, chat_id, donor_base_key),
+                )
+                connection.exec_driver_sql(
+                    "INSERT INTO archive_continuation_requirement_candidates("
+                    "chat_id,base_key,ordinal,candidate_attachment_id,native_attachment_id,imported_ref_id"
+                    ") SELECT chat_id,?,ordinal,candidate_attachment_id,native_attachment_id,imported_ref_id "
+                    "FROM archive_continuation_requirement_candidates WHERE chat_id=? AND base_key=?",
+                    (user_message_id, chat_id, donor_base_key),
+                )
+
+            latest = int(connection.exec_driver_sql(
+                "SELECT COALESCE(MAX(choice_revision),0) FROM archive_continuation_choices "
+                "WHERE chat_id=? AND base_key=?",
+                (chat_id, user_message_id),
+            ).scalar_one())
+            target = connection.execute(
+                select(
+                    provider_connections.c.id, provider_connections.c.backend_type,
+                    provider_connections.c.profile, provider_connections.c.endpoint,
+                    provider_connections.c.enabled, provider_connections.c.retired,
+                    provider_connections.c.revision.label("connection_revision"),
+                    model_catalogue_entries.c.id.label("model_entry_id"),
+                    model_catalogue_entries.c.connection_id,
+                    model_catalogue_entries.c.provider_model_id,
+                    model_catalogue_entries.c.availability,
+                    model_catalogue_entries.c.revision.label("model_revision"),
+                ).select_from(
+                    model_catalogue_entries.join(
+                        provider_connections,
+                        provider_connections.c.id == model_catalogue_entries.c.connection_id,
+                    )
+                ).where(
+                    provider_connections.c.id == model.connection_id,
+                    model_catalogue_entries.c.id == model.id,
+                )
+            ).mappings().one_or_none()
+            if (target is None or not bool(target["enabled"]) or bool(target["retired"])
+                    or str(target["availability"]).lower() != "available"):
+                raise StateError("imported edit continuation target is not runnable")
+            descriptor = {
+                "connection_id": model.connection_id,
+                "model_entry_id": model.id,
+                "backend_type": str(target["backend_type"]),
+                "provider_profile": str(target["profile"]),
+                "provider_model_id": str(target["provider_model_id"]),
+                "availability": str(target["availability"]),
+                "connection_revision": int(target["connection_revision"]),
+                "model_revision": int(target["model_revision"]),
+            }
+            connection.exec_driver_sql(
+                "INSERT INTO archive_continuation_choices("
+                "chat_id,base_key,choice_revision,local_connection_id,local_model_entry_id,"
+                "explicit_settings,degraded,excluded_refs,decision_kind,safe_target_descriptor,created_at"
+                ") VALUES (?,?,?,?,?,?,0,'[]','operator_resolution',?,?)",
+                (chat_id, user_message_id, latest + 1, model.connection_id, model.id,
+                 json.dumps({
+                     "temperature": None, "max_output_tokens": None,
+                     "reasoning_effort": None, "timeout_seconds": None,
+                 }, sort_keys=True, separators=(",", ":")),
+                 json.dumps(descriptor, sort_keys=True, separators=(",", ":")), timestamp),
+            )
+        return self.import_continuation_readiness(chat_id, user_message_id)
+
+    def import_continuation_readiness(self, chat_id: str, base_key: str) -> ContinuationReadiness | None:
+        self._ensure_open()
+        with self._authority.operation(), self._engine.connect() as connection:
+            row = connection.exec_driver_sql(
+                "SELECT a.source_configuration,a.resolution,a.resolution_evidence,"
+                "c.choice_revision,c.local_connection_id,c.local_model_entry_id,c.explicit_settings,c.degraded,c.excluded_refs "
+                "FROM archive_continuation_anchors AS a LEFT JOIN archive_continuation_choices AS c "
+                "ON c.chat_id=a.chat_id AND c.base_key=a.base_key AND c.choice_revision=(SELECT MAX(x.choice_revision) FROM archive_continuation_choices AS x WHERE x.chat_id=a.chat_id AND x.base_key=a.base_key) "
+                "WHERE a.chat_id=? AND a.base_key=?", (chat_id, base_key)
+            ).mappings().one_or_none()
+            requirement_rows = connection.exec_driver_sql(
+                "SELECT r.ordinal,r.source_imported_attempt_id,r.source_native_attempt_id,"
+                "hex(r.expected_digest) AS expected_digest,r.expected_size,"
+                "hex(r.representation_digest) AS representation_digest,r.binding_kind,"
+                "r.bound_imported_ref_id,r.bound_native_attachment_id,"
+                "MAX(CASE WHEN ref.availability='READY' OR native_blob.state='ready' THEN 1 ELSE 0 END) AS identity_ready,"
+                "MAX(CASE WHEN candidate_ref.availability='READY' OR candidate_blob.state='ready' THEN 1 ELSE 0 END) AS candidate_ready "
+                "FROM archive_continuation_requirements AS r "
+                "LEFT JOIN archive_import_attachment_refs AS ref ON ref.id=r.bound_imported_ref_id "
+                "LEFT JOIN attachments AS native_ref ON native_ref.id=r.bound_native_attachment_id "
+                "LEFT JOIN attachment_blobs AS native_blob ON native_blob.digest=native_ref.blob_digest "
+                "LEFT JOIN archive_continuation_requirement_candidates AS candidate "
+                "ON candidate.chat_id=r.chat_id AND candidate.base_key=r.base_key AND candidate.ordinal=r.ordinal "
+                "LEFT JOIN archive_import_attachment_refs AS candidate_ref ON candidate_ref.id=candidate.imported_ref_id "
+                "LEFT JOIN attachments AS candidate_native ON candidate_native.id=candidate.native_attachment_id "
+                "LEFT JOIN attachment_blobs AS candidate_blob ON candidate_blob.digest=candidate_native.blob_digest "
+                "WHERE r.chat_id=? AND r.base_key=? "
+                "GROUP BY r.chat_id,r.base_key,r.ordinal,r.source_imported_attempt_id,r.source_native_attempt_id,"
+                "r.expected_digest,r.expected_size,r.representation_digest,r.binding_kind,r.bound_imported_ref_id,"
+                "r.bound_native_attachment_id ORDER BY r.ordinal",
+                (chat_id, base_key),
+            ).mappings().all()
+        if row is None:
+            return None
+        requirements = tuple(
+            ContinuationRequirement(
+                base_key, int(item["ordinal"]),
+                None if item["source_imported_attempt_id"] is None else str(item["source_imported_attempt_id"]),
+                None if item["source_native_attempt_id"] is None else str(item["source_native_attempt_id"]),
+                str(item["expected_digest"]).lower(), int(item["expected_size"]),
+                str(item["representation_digest"]).lower(), str(item["binding_kind"]),
+                None if item["bound_imported_ref_id"] is None else str(item["bound_imported_ref_id"]),
+                None if item["bound_native_attachment_id"] is None else str(item["bound_native_attachment_id"]),
+                ("missing-external" if str(item["binding_kind"]) == "identity"
+                 and int(item["identity_ready"] or 0) == 0 else
+                 "missing-external" if str(item["binding_kind"]) == "digest"
+                 and int(item["candidate_ready"] or 0) == 0 else None),
+            )
+            for item in requirement_rows
+        )
+        excluded = () if row["excluded_refs"] is None else tuple(json.loads(str(row["excluded_refs"])))
+        excluded_ordinals = {int(item["requirement_ordinal"]) for item in excluded}
+        blocked = next((
+            item for item in requirements
+            if item.blocked_reason is not None and item.ordinal not in excluded_ordinals
+        ), None)
+        resolution = "UNAVAILABLE" if blocked is not None else str(row["resolution"])
+        evidence = json.loads(str(row["resolution_evidence"]))
+        if blocked is not None:
+            evidence = {"kind": "attachment-requirement", "reason": blocked.blocked_reason,
+                        "ordinal": blocked.ordinal, "expected_digest": blocked.expected_digest}
+        return ContinuationReadiness(chat_id, base_key, json.loads(str(row["source_configuration"])),
+            resolution, evidence,
+            0 if row["choice_revision"] is None else int(row["choice_revision"]),
+            None if row["local_connection_id"] is None else str(row["local_connection_id"]),
+            None if row["local_model_entry_id"] is None else str(row["local_model_entry_id"]),
+            None if row["explicit_settings"] is None else json.loads(str(row["explicit_settings"])),
+            excluded,
+            requirements,
+        )
+
+    def materialize_import_continuation_attachments(self, chat_id: str, base_key: str) -> tuple[str, ...]:
+        """Resolve one local READY candidate per frozen source requirement.
+
+        This is deliberately a read projection: it neither creates attachment
+        identities nor adds message links to the imported user message.
+        Candidate rows retain source-slot multiplicity, so consuming a local
+        identity twice is rejected rather than silently collapsing slots.
+        """
+        self._ensure_open()
+        readiness = self.import_continuation_readiness(chat_id, base_key)
+        if readiness is None:
+            return ()
+        excluded_ordinals = {
+            int(item["requirement_ordinal"]) for item in readiness.excluded_refs
+        }
+        if readiness.resolution == "UNAVAILABLE" or any(
+            requirement.blocked_reason is not None
+            and requirement.ordinal not in excluded_ordinals
+            for requirement in readiness.requirements
+        ):
+            raise StateError("imported continuation attachment requirements are unavailable")
+        with self._authority.operation(), self._engine.connect() as connection:
+            rows = connection.exec_driver_sql(
+                "SELECT r.ordinal,r.binding_kind,r.bound_imported_ref_id,r.bound_native_attachment_id,"
+                "c.imported_ref_id,c.native_attachment_id,"
+                "COALESCE(ref.attachment_id,c.native_attachment_id) AS attachment_id "
+                "FROM archive_continuation_requirements r "
+                "JOIN archive_continuation_requirement_candidates c "
+                "ON c.chat_id=r.chat_id AND c.base_key=r.base_key AND c.ordinal=r.ordinal "
+                "LEFT JOIN archive_import_attachment_refs ref ON ref.id=c.imported_ref_id "
+                "LEFT JOIN attachments native_attachment ON native_attachment.id=c.native_attachment_id "
+                "LEFT JOIN attachment_blobs native_blob ON native_blob.digest=native_attachment.blob_digest "
+                "WHERE r.chat_id=? AND r.base_key=? AND (ref.availability='READY' OR native_blob.state='ready') "
+                "ORDER BY r.ordinal, CASE WHEN c.imported_ref_id=r.bound_imported_ref_id OR c.native_attachment_id=r.bound_native_attachment_id THEN 0 ELSE 1 END, c.candidate_attachment_id",
+                (chat_id, base_key),
+            ).mappings().all()
+        by_ordinal: dict[int, list[dict[str, object]]] = {}
+        for row in rows:
+            by_ordinal.setdefault(int(row["ordinal"]), []).append(dict(row))
+        materialized: list[str] = []
+        used: set[str] = set()
+        for requirement in readiness.requirements:
+            if requirement.ordinal in excluded_ordinals:
+                continue
+            candidates = by_ordinal.get(requirement.ordinal, [])
+            if requirement.binding_kind == "identity":
+                candidates = [row for row in candidates if (
+                    row["imported_ref_id"] == requirement.imported_ref_id
+                    or row["native_attachment_id"] == requirement.native_attachment_id
+                )]
+            chosen = next((row for row in candidates if str(row["attachment_id"]) not in used), None)
+            if chosen is None:
+                raise StateError("imported continuation lacks distinct READY attachment candidates")
+            attachment_id = str(chosen["attachment_id"])
+            used.add(attachment_id)
+            materialized.append(attachment_id)
+        return tuple(materialized)
+
+    def _inherit_continuation_anchor(
+        self, connection, *, chat_id: str, source_base_key: str, choice_revision: int,
+        assistant_message_id: str, attempt_id: str, attachment_ids: tuple[str, ...], created_at: str,
+    ) -> None:
+        """Append a native child anchor from one admitted branch choice.
+
+        The original anchor and its immutable source configuration remain
+        untouched.  The child owns a copied, append-only local choice and
+        native requirement projection, so later sends never need to mutate a
+        chat-global selection or reinterpret imported history.
+        """
+        inherited = connection.exec_driver_sql(
+            "SELECT a.source_configuration,c.local_connection_id,c.local_model_entry_id,"
+            "c.explicit_settings,c.degraded,c.excluded_refs,c.decision_kind,c.safe_target_descriptor "
+            "FROM archive_continuation_anchors a JOIN archive_continuation_choices c "
+            "ON c.chat_id=a.chat_id AND c.base_key=a.base_key AND c.choice_revision=? "
+            "WHERE a.chat_id=? AND a.base_key=?",
+            (choice_revision, chat_id, source_base_key),
+        ).mappings().one_or_none()
+        if inherited is None:
+            raise StateError("continuation child lacks its admitted source choice")
+        connection.exec_driver_sql(
+            "INSERT INTO archive_continuation_anchors(chat_id,base_key,base_message_id,revision,source_configuration,resolution,resolution_evidence) VALUES (?,?,?,?,?,'UNRESOLVED',?)",
+            (chat_id, assistant_message_id, assistant_message_id, 1,
+             inherited["source_configuration"],
+             json.dumps({"kind":"native-child","source_base_key":source_base_key,"source_choice_revision":choice_revision}, sort_keys=True, separators=(",", ":"))),
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO archive_continuation_choices(chat_id,base_key,choice_revision,local_connection_id,local_model_entry_id,explicit_settings,degraded,excluded_refs,decision_kind,safe_target_descriptor,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (chat_id, assistant_message_id, 1, inherited["local_connection_id"],
+             inherited["local_model_entry_id"], inherited["explicit_settings"], inherited["degraded"],
+             inherited["excluded_refs"], inherited["decision_kind"], inherited["safe_target_descriptor"], created_at),
+        )
+        for ordinal, attachment_id in enumerate(attachment_ids):
+            attachment = connection.exec_driver_sql(
+                "SELECT a.blob_digest,b.byte_size,a.text_digest FROM attachments a "
+                "JOIN attachment_blobs b ON b.digest=a.blob_digest AND b.state='ready' WHERE a.id=?",
+                (attachment_id,),
+            ).first()
+            if attachment is None or attachment[2] is None:
+                raise StateError("native continuation source attachment is not ready and text-eligible")
+            connection.exec_driver_sql(
+                "INSERT INTO archive_continuation_requirements(chat_id,base_key,ordinal,source_imported_attempt_id,source_native_attempt_id,expected_digest,expected_size,representation_digest,binding_kind,bound_native_attachment_id,bound_imported_ref_id) VALUES (?,?,?,NULL,?,?,?,?,'identity',?,NULL)",
+                (chat_id, assistant_message_id, ordinal, attempt_id, attachment[0], int(attachment[1]), attachment[2], attachment_id),
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO archive_continuation_requirement_candidates(chat_id,base_key,ordinal,candidate_attachment_id,native_attachment_id,imported_ref_id) VALUES (?,?,?,?,?,NULL)",
+                (chat_id, assistant_message_id, ordinal, attachment_id, attachment_id),
+            )
+
     # ------------------------------------------------------------------
     # Phase 6 attachment authority
     def ingest_attachment(self, source, *, filename: str | None = None) -> Attachment:
@@ -2477,6 +5316,9 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                                     raise StateError("attachment insertion did not affect one row")
                             finally:
                                 clear_phase6(connection)
+                            healed_ref_ids = self._heal_imported_attachment_references(
+                                connection, captured, created_at
+                            )
                             search_revision = self._require_phase7_source_consumed(connection)
                         finally:
                             clear_phase7_source_mutation(connection)
@@ -2508,7 +5350,10 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                         self._accept_search_receipt(
                             SearchReceipt(
                                 search_revision,
-                                frozenset({f"attachment:{attachment_id}"}),
+                                frozenset(
+                                    {f"attachment:{attachment_id}"}
+                                    | {f"attachment:{ref_id}" for ref_id in healed_ref_ids}
+                                ),
                             )
                         )
                         return self._attachment_from_authoritative_row(row)
@@ -2621,6 +5466,9 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                                 raise StateError("attachment insertion did not affect one row")
                         finally:
                             clear_phase6(connection)
+                        healed_ref_ids = self._heal_imported_attachment_references(
+                            connection, captured, created_at
+                        )
                         search_revision = self._require_phase7_source_consumed(connection)
                     finally:
                         clear_phase7_source_mutation(connection)
@@ -2656,7 +5504,10 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                 self._accept_search_receipt(
                     SearchReceipt(
                         search_revision,
-                        frozenset({f"attachment:{attachment_id}"}),
+                        frozenset(
+                            {f"attachment:{attachment_id}"}
+                            | {f"attachment:{ref_id}" for ref_id in healed_ref_ids}
+                        ),
                     )
                 )
             except BaseException as exc:
@@ -2666,6 +5517,85 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     "attachment publication failed; restart recovery is required"
                 ) from exc
         return self._attachment_from_authoritative_row(row)
+
+    def _heal_imported_attachment_references(
+        self, connection, captured, healed_at: str
+    ) -> frozenset[str]:
+        """Turn every exact missing external reservation into its reserved attachment.
+
+        A missing-external archive owns a stable local attachment identity before
+        bytes exist.  Once ordinary intake has independently captured and
+        verified matching bytes, healing must use that identity rather than
+        manufacture a replacement.  This runs in the same source mutation and
+        SQLite transaction as the verified intake, so observers cannot see a
+        ready reference without its native attachment row.
+        """
+        contradiction = connection.exec_driver_sql(
+            "SELECT 1 FROM archive_import_attachment_refs "
+            "WHERE expected_digest=? AND expected_size<>? LIMIT 1",
+            (bytes(captured.digest), captured.byte_size),
+        ).first()
+        if contradiction is not None:
+            raise StateError("imported references contradict a digest size identity")
+        rows = connection.exec_driver_sql(
+            "SELECT id,source_metadata FROM archive_import_attachment_refs "
+            "WHERE expected_digest=? AND expected_size=? "
+            "AND availability='MISSING_EXTERNAL' ORDER BY id",
+            (bytes(captured.digest), captured.byte_size),
+        ).fetchall()
+        prepared: list[tuple[str, str]] = []
+        for ref_id, source_metadata in rows:
+            try:
+                metadata = json.loads(str(source_metadata))
+            except (TypeError, ValueError) as exc:
+                raise StateError("imported attachment reservation metadata is corrupt") from exc
+            if not isinstance(metadata, dict):
+                raise StateError("imported attachment reservation metadata is corrupt")
+            filename = metadata.get("filename")
+            if (not isinstance(filename, str)
+                    or metadata.get("filename_status") not in {"available", "redacted"}):
+                filename = captured.filename
+            prepared.append((str(ref_id), filename))
+        if not prepared:
+            return frozenset()
+        arm_phase9_attachment_healing(
+            connection, tuple(ref_id for ref_id, _filename in prepared)
+        )
+        healed_ids: set[str] = set()
+        try:
+            for ref_id, filename in prepared:
+                arm_phase6_attachment_insert(connection, ref_id)
+                try:
+                    result = connection.execute(
+                        insert(attachments).values(
+                            id=ref_id,
+                            blob_digest=captured.digest,
+                            filename=filename,
+                            source_kind="imported",
+                            source_name=filename,
+                            text_representation_id=captured.representation_id,
+                            text_digest=captured.representation_id,
+                            ineligibility_reason=captured.ineligibility_reason,
+                            created_at=healed_at,
+                        )
+                    )
+                    require_phase6_consumed(connection)
+                    if result.rowcount != 1:
+                        raise StateError("imported attachment healing did not affect one row")
+                finally:
+                    clear_phase6(connection)
+                result = connection.exec_driver_sql(
+                    "UPDATE archive_import_attachment_refs "
+                    "SET attachment_id=id,availability='READY',healed_at=? "
+                    "WHERE id=? AND availability='MISSING_EXTERNAL' AND attachment_id IS NULL",
+                    (healed_at, ref_id),
+                )
+                if result.rowcount != 1:
+                    raise StateError("imported attachment reservation changed during healing")
+                healed_ids.add(ref_id)
+        finally:
+            clear_phase9_attachment_healing(connection)
+        return frozenset(healed_ids)
 
     def get_attachment(self, attachment_id: str) -> Attachment | None:
         self._ensure_open()
@@ -2711,7 +5641,11 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                 attempt_ref = connection.execute(
                     select(attempt_attachments.c.attempt_id).where(attempt_attachments.c.attachment_id == attachment_id)
                 ).first()
-                if refs is not None or attempt_ref is not None:
+                imported_ref = connection.exec_driver_sql(
+                    "SELECT 1 FROM archive_import_attachment_refs WHERE attachment_id=? LIMIT 1",
+                    (attachment_id,),
+                ).first()
+                if refs is not None or attempt_ref is not None or imported_ref is not None:
                     raise StateError("attachment has durable historical references")
                 search_revision = None
                 self._arm_phase7_source_mutation(connection, "delete attachment")
@@ -2785,46 +5719,64 @@ class SQLiteAppStateStore(Phase5StoreMixin):
     def list_message_attachments(self, message_id: str) -> tuple[Attachment, ...]:
         self._ensure_open()
         with self._authority.operation(), self._engine.connect() as connection:
+            links = connection.exec_driver_sql(
+                "SELECT attachment_id,ordinal FROM message_attachments WHERE message_id=? "
+                "UNION ALL "
+                "SELECT r.attachment_id,im.ordinal "
+                "FROM archive_import_message_attachment_refs im "
+                "JOIN archive_import_attachment_refs r ON r.id=im.attachment_ref_id "
+                "WHERE im.message_id=? AND r.availability='READY' "
+                "ORDER BY ordinal,attachment_id",
+                (message_id, message_id),
+            ).fetchall()
+            identifiers = tuple(str(row[0]) for row in links)
+            if not identifiers:
+                return ()
             rows = connection.execute(
                 select(attachments)
                 .add_columns(attachment_blobs.c.byte_size)
                 .select_from(
-                    message_attachments
-                    .join(
-                        attachments,
-                        message_attachments.c.attachment_id == attachments.c.id,
-                    )
+                    attachments
                     .join(
                         attachment_blobs,
                         attachments.c.blob_digest == attachment_blobs.c.digest,
                     )
                 )
-                .where(message_attachments.c.message_id == message_id)
-                .order_by(message_attachments.c.ordinal)
+                .where(attachments.c.id.in_(identifiers))
             ).fetchall()
-        return tuple(self._attachment_from_authoritative_row(row) for row in rows)
+        by_id = {str(row._mapping["id"]): self._attachment_from_authoritative_row(row) for row in rows}
+        return tuple(by_id[identifier] for identifier in identifiers)
 
     def list_attempt_attachments(self, attempt_id: str) -> tuple[Attachment, ...]:
         self._ensure_open()
         with self._authority.operation(), self._engine.connect() as connection:
+            links = connection.exec_driver_sql(
+                "SELECT attachment_id,ordinal FROM attempt_attachments WHERE attempt_id=? "
+                "UNION ALL "
+                "SELECT r.attachment_id,ia.ordinal "
+                "FROM archive_import_attempt_attachment_refs ia "
+                "JOIN archive_import_attachment_refs r ON r.id=ia.attachment_ref_id "
+                "WHERE ia.attempt_id=? AND r.availability='READY' "
+                "ORDER BY ordinal,attachment_id",
+                (attempt_id, attempt_id),
+            ).fetchall()
+            identifiers = tuple(str(row[0]) for row in links)
+            if not identifiers:
+                return ()
             rows = connection.execute(
                 select(attachments)
                 .add_columns(attachment_blobs.c.byte_size)
                 .select_from(
-                    attempt_attachments
-                    .join(
-                        attachments,
-                        attempt_attachments.c.attachment_id == attachments.c.id,
-                    )
+                    attachments
                     .join(
                         attachment_blobs,
                         attachments.c.blob_digest == attachment_blobs.c.digest,
                     )
                 )
-                .where(attempt_attachments.c.attempt_id == attempt_id)
-                .order_by(attempt_attachments.c.ordinal)
+                .where(attachments.c.id.in_(identifiers))
             ).fetchall()
-        return tuple(self._attachment_from_authoritative_row(row) for row in rows)
+        by_id = {str(row._mapping["id"]): self._attachment_from_authoritative_row(row) for row in rows}
+        return tuple(by_id[identifier] for identifier in identifiers)
 
     def list_message_attachment_metadata(self, message_id: str) -> tuple[Attachment, ...]:
         """Read only persisted attachment metadata for the Inspector.
@@ -2835,35 +5787,49 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         """
         self._ensure_open()
         with self._authority.operation(), self._engine.connect() as connection:
+            links = connection.exec_driver_sql(
+                "SELECT attachment_id,ordinal FROM message_attachments WHERE message_id=? "
+                "UNION ALL "
+                "SELECT r.attachment_id,im.ordinal "
+                "FROM archive_import_message_attachment_refs im "
+                "JOIN archive_import_attachment_refs r ON r.id=im.attachment_ref_id "
+                "WHERE im.message_id=? AND r.availability='READY' "
+                "ORDER BY ordinal,attachment_id",
+                (message_id, message_id),
+            ).fetchall()
+            identifiers = tuple(str(row[0]) for row in links)
+            if not identifiers:
+                return ()
             rows = connection.execute(
                 select(attachments)
-                .select_from(
-                    message_attachments.join(
-                        attachments,
-                        message_attachments.c.attachment_id == attachments.c.id,
-                    )
-                )
-                .where(message_attachments.c.message_id == message_id)
-                .order_by(message_attachments.c.ordinal)
+                .where(attachments.c.id.in_(identifiers))
             ).fetchall()
-        return tuple(_attachment(row) for row in rows)
+            by_id = {str(row._mapping["id"]): _attachment(row) for row in rows}
+        return tuple(by_id[identifier] for identifier in identifiers)
 
     def list_attempt_attachment_metadata(self, attempt_id: str) -> tuple[Attachment, ...]:
         """Read only persisted attempt-attachment metadata for the Inspector."""
         self._ensure_open()
         with self._authority.operation(), self._engine.connect() as connection:
+            links = connection.exec_driver_sql(
+                "SELECT attachment_id,ordinal FROM attempt_attachments WHERE attempt_id=? "
+                "UNION ALL "
+                "SELECT r.attachment_id,ia.ordinal "
+                "FROM archive_import_attempt_attachment_refs ia "
+                "JOIN archive_import_attachment_refs r ON r.id=ia.attachment_ref_id "
+                "WHERE ia.attempt_id=? AND r.availability='READY' "
+                "ORDER BY ordinal,attachment_id",
+                (attempt_id, attempt_id),
+            ).fetchall()
+            identifiers = tuple(str(row[0]) for row in links)
+            if not identifiers:
+                return ()
             rows = connection.execute(
                 select(attachments)
-                .select_from(
-                    attempt_attachments.join(
-                        attachments,
-                        attempt_attachments.c.attachment_id == attachments.c.id,
-                    )
-                )
-                .where(attempt_attachments.c.attempt_id == attempt_id)
-                .order_by(attempt_attachments.c.ordinal)
+                .where(attachments.c.id.in_(identifiers))
             ).fetchall()
-        return tuple(_attachment(row) for row in rows)
+            by_id = {str(row._mapping["id"]): _attachment(row) for row in rows}
+        return tuple(by_id[identifier] for identifier in identifiers)
 
     def gc_attachments(self) -> tuple[str, ...]:
         """Linearize deletion, durably mark deleting, then remove bytes."""
@@ -2884,6 +5850,11 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     ).first()
                     if current is None or current.state != "ready" or connection.execute(
                         select(attachments.c.id).where(attachments.c.blob_digest == row.digest)
+                    ).first() is not None or connection.exec_driver_sql(
+                        "SELECT 1 FROM archive_import_payload_reservations AS r "
+                        "JOIN archive_import_operations AS o ON o.id=r.operation_id "
+                        "WHERE r.digest=? AND r.size=? AND o.state IN ('STAGING','COMMITTING') LIMIT 1",
+                        (row.digest, int(row.byte_size)),
                     ).first() is not None:
                         self._rollback_attachment_transaction(
                             connection, "T7 GC authorization no-op K0"
@@ -2956,12 +5927,22 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                 select(attachment_blobs.c.digest, attachment_blobs.c.byte_size)
                 .where(attachment_blobs.c.state == "ready")
                 .where(~attachment_blobs.c.digest.in_(select(attachments.c.blob_digest)))
+                .where(text(
+                    "NOT EXISTS (SELECT 1 FROM archive_import_payload_reservations AS r "
+                    "JOIN archive_import_operations AS o ON o.id=r.operation_id "
+                    "WHERE r.digest=attachment_blobs.digest "
+                    "AND r.size=attachment_blobs.byte_size "
+                    "AND o.state IN ('STAGING','COMMITTING'))"
+                ))
             ).fetchall()
 
     def _reconcile_attachments_startup(self) -> tuple[str, ...]:
         """Private pre-READY recovery; never exposed as a second manager."""
         with self._authority._transition_gate:
-            return self._reconcile_attachments_locked()
+            receipts = self._reconcile_attachments_locked()
+        for receipt in receipts:
+            self._accept_search_receipt(receipt)
+        return ()
 
     def _reconcile_attachments_locked(self) -> tuple[str, ...]:
         with self._engine.connect() as connection:
@@ -2969,9 +5950,96 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         try:
             self._recover_attachment_rows(rows)
             self._validate_attachment_payload_rows()
-            return ()
+            receipt = self._heal_ready_imported_attachment_refs_startup()
+            return () if receipt is None else (receipt,)
         except AttachmentIntegrityError as exc:
             raise StateError(str(exc)) from exc
+
+    def _heal_ready_imported_attachment_refs_startup(self) -> SearchReceipt | None:
+        """Heal only durable ready identities already indexed in SQLite.
+
+        Startup never searches a resolver path.  It reads the exact ready
+        object once through its rooted descriptor, hash-verifies it, and derives
+        the existing Phase 6 text classification before reusing the ordinary
+        guarded healing transaction.
+        """
+        with self._engine.connect() as connection:
+            rows = connection.exec_driver_sql(
+                "SELECT r.id,r.expected_digest,r.expected_size,r.source_metadata "
+                "FROM archive_import_attachment_refs r JOIN attachment_blobs b "
+                "ON b.digest=r.expected_digest AND b.byte_size=r.expected_size "
+                "WHERE r.availability='MISSING_EXTERNAL' AND r.attachment_id IS NULL "
+                "AND b.state='ready' ORDER BY r.expected_digest,r.expected_size,r.id"
+            ).fetchall()
+        captures: list[CapturedAttachment] = []
+        seen: set[tuple[bytes, int]] = set()
+        for _ref_id, digest, size, source_metadata in rows:
+            identity = (bytes(digest), int(size))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            try:
+                metadata = json.loads(str(source_metadata))
+            except (TypeError, ValueError) as exc:
+                raise StateError("imported attachment reservation metadata is corrupt") from exc
+            if not isinstance(metadata, dict):
+                raise StateError("imported attachment reservation metadata is corrupt")
+            with self._engine.connect() as backing_connection:
+                backing = backing_connection.execute(
+                    select(attachments).where(attachments.c.blob_digest == identity[0])
+                    .order_by(attachments.c.id).limit(1)
+                ).first()
+            if backing is None:
+                classification = self._attachment_manager.classify_verified_object(
+                    identity[0], expected_size=identity[1]
+                )
+                fallback_filename = metadata.get("filename")
+                if (
+                    metadata.get("filename_status") != "available"
+                    or not isinstance(fallback_filename, str)
+                ):
+                    fallback_filename = "imported-attachment"
+                filename = fallback_filename
+                representation_id = classification.representation_id
+                ineligibility_reason = classification.ineligibility_reason
+            else:
+                self._attachment_manager.verify_object(
+                    identity[0], expected_size=identity[1]
+                )
+                filename = str(backing.filename)
+                representation_id = backing.text_representation_id
+                ineligibility_reason = backing.ineligibility_reason
+            captures.append(CapturedAttachment(
+                identity[0], identity[1], "startup-imported-healing", filename,
+                None, representation_id, ineligibility_reason,
+            ))
+        if not captures:
+            return None
+        connection = self._engine.connect()
+        committed = False
+        try:
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+            self._arm_phase7_source_mutation(connection, "startup imported attachment healing")
+            try:
+                healed_ids: set[str] = set()
+                for captured in captures:
+                    healed_ids.update(self._heal_imported_attachment_references(
+                        connection, captured, utc_iso(datetime.now(UTC)),
+                    ))
+                revision = self._require_phase7_source_consumed(connection)
+            finally:
+                clear_phase7_source_mutation(connection)
+            self._commit_attachment_transaction(connection, "startup imported attachment healing")
+            committed = True
+        except BaseException:
+            if not committed:
+                self._rollback_attachment_transaction(connection, "startup imported attachment healing")
+            raise
+        finally:
+            self._close_attachment_connection(connection, "startup imported attachment healing")
+        return SearchReceipt(
+            revision, frozenset(f"attachment:{ref_id}" for ref_id in healed_ids),
+        )
 
     def _recover_attachment_rows(self, rows) -> None:
         with self._engine.connect() as connection:
@@ -3290,13 +6358,51 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                             _attempt(row, mapping["_attempt_user_message_content"])
                         )
                     source_attempts = tuple(source_attempts)
+                    imported_attempt_rows = connection.exec_driver_sql(
+                        "SELECT id,chat_id,user_message_id,assistant_message_id,state,started_at,ended_at,source_attempt "
+                        "FROM archive_imported_attempts WHERE chat_id=? ORDER BY started_at,id",
+                        (chat_id,),
+                    ).mappings().all()
+                    imported_chat = connection.exec_driver_sql(
+                        "SELECT 1 FROM archive_import_chats WHERE chat_id=?", (chat_id,)
+                    ).first()
+                    imported_attempts = []
+                    archived_attempt_provenance: dict[str, dict[str, object]] = {}
+                    for imported in imported_attempt_rows:
+                        try:
+                            source_attempt = json.loads(str(imported["source_attempt"]))
+                        except (TypeError, ValueError) as exc:
+                            raise StateError("imported attempt evidence is malformed") from exc
+                        if not isinstance(source_attempt, dict):
+                            raise StateError("imported attempt evidence is malformed")
+                        provenance = source_attempt.get("request_time_provenance")
+                        if not isinstance(provenance, dict):
+                            raise StateError("imported attempt provenance is malformed")
+                        archived_attempt_provenance[str(imported["id"])] = provenance
+                        state = AttemptState(str(imported["state"]))
+                        imported_attempts.append(GenerationAttempt(
+                            str(imported["id"]), str(imported["chat_id"]),
+                            str(imported["user_message_id"]), str(imported["assistant_message_id"]),
+                            str(source_attempt.get("backend_id", "[unavailable]")),
+                            str(source_attempt.get("model", "[unavailable]")), state, "{}",
+                            parse_utc(str(imported["started_at"])),
+                            ended_at=parse_utc(str(imported["ended_at"])),
+                            provider_id=(None if source_attempt.get("provider_id") is None else str(source_attempt["provider_id"])),
+                            returned_model=(None if source_attempt.get("returned_model") is None else str(source_attempt["returned_model"])),
+                            finish_reason=(None if source_attempt.get("finish_reason") is None else str(source_attempt["finish_reason"])),
+                            remote_outcome_unknown=bool(source_attempt.get("remote_outcome_unknown", False)),
+                        ))
+                    source_attempts = tuple(sorted(
+                        (*source_attempts, *imported_attempts),
+                        key=lambda item: (item.started_at, item.id),
+                    ))
                     message_ids = tuple(item.id for item in source_messages)
                     attempt_ids = tuple(item.id for item in source_attempts)
 
                     def attachment_rows(relation, owner_column, owner_ids):
                         if not owner_ids:
-                            return ()
-                        return connection.execute(
+                            return []
+                        rows = connection.execute(
                             select(
                                 owner_column.label("_export_owner_id"),
                                 attachments, attachment_blobs.c.byte_size,
@@ -3307,15 +6413,81 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                             ).where(owner_column.in_(owner_ids))
                             .order_by(owner_column.asc(), relation.c.ordinal.asc(), attachments.c.id.asc())
                         ).fetchall()
+                        return [(str(row._mapping["_export_owner_id"]), row) for row in rows]
 
                     message_attachment_rows = attachment_rows(
                         message_attachments, message_attachments.c.message_id, message_ids
                     )
+                    imported_message_links = connection.exec_driver_sql(
+                        "SELECT im.message_id,im.ordinal,r.id AS ref_id,r.attachment_id,r.source_metadata "
+                        "FROM archive_import_message_attachment_refs im "
+                        "JOIN archive_import_attachment_refs r ON r.id=im.attachment_ref_id "
+                        "JOIN archive_import_messages m ON m.message_id=im.message_id "
+                        "WHERE m.chat_id=? AND r.availability='READY' ORDER BY im.message_id,im.ordinal",
+                        (chat_id,),
+                    ).mappings().all()
+                    missing_imported_message_links = connection.exec_driver_sql(
+                        "SELECT im.message_id,im.ordinal,r.id,r.expected_digest,r.expected_size,r.source_metadata,r.created_at "
+                        "FROM archive_import_message_attachment_refs im "
+                        "JOIN archive_import_attachment_refs r ON r.id=im.attachment_ref_id "
+                        "JOIN archive_import_messages m ON m.message_id=im.message_id "
+                        "WHERE m.chat_id=? AND r.availability='MISSING_EXTERNAL' "
+                        "ORDER BY im.message_id,im.ordinal",
+                        (chat_id,),
+                    ).mappings().all()
                     attempt_attachment_rows = attachment_rows(
                         attempt_attachments, attempt_attachments.c.attempt_id, attempt_ids
                     )
+                    imported_attempt_links = connection.exec_driver_sql(
+                        "SELECT ia.attempt_id,ia.ordinal,r.id AS ref_id,r.attachment_id,r.source_metadata "
+                        "FROM archive_import_attempt_attachment_refs ia "
+                        "JOIN archive_import_attachment_refs r ON r.id=ia.attachment_ref_id "
+                        "JOIN archive_imported_attempts a ON a.id=ia.attempt_id "
+                        "WHERE a.chat_id=? AND r.availability='READY' ORDER BY ia.attempt_id,ia.ordinal",
+                        (chat_id,),
+                    ).mappings().all()
+                    missing_imported_attempt_links = connection.exec_driver_sql(
+                        "SELECT ia.attempt_id,ia.ordinal,r.id,r.expected_digest,r.expected_size,r.source_metadata,r.created_at "
+                        "FROM archive_import_attempt_attachment_refs ia "
+                        "JOIN archive_import_attachment_refs r ON r.id=ia.attachment_ref_id "
+                        "JOIN archive_imported_attempts a ON a.id=ia.attempt_id "
+                        "WHERE a.chat_id=? AND r.availability='MISSING_EXTERNAL' "
+                        "ORDER BY ia.attempt_id,ia.ordinal",
+                        (chat_id,),
+                    ).mappings().all()
+                    imported_attachment_ids = tuple(str(row["attachment_id"]) for row in imported_attempt_links)
+                    if imported_attachment_ids:
+                        imported_attachment_rows = connection.execute(
+                            select(attachments, attachment_blobs.c.byte_size,
+                                   attachment_blobs.c.state.label("_export_blob_state"))
+                            .select_from(attachments.join(
+                                attachment_blobs, attachments.c.blob_digest == attachment_blobs.c.digest,
+                            )).where(attachments.c.id.in_(imported_attachment_ids))
+                        ).fetchall()
+                        by_imported_attachment = {
+                            str(row._mapping["id"]): row for row in imported_attachment_rows
+                        }
+                    imported_message_attachment_ids = tuple(str(row["attachment_id"]) for row in imported_message_links)
+                    if imported_message_attachment_ids:
+                        imported_message_attachment_rows = connection.execute(
+                            select(attachments, attachment_blobs.c.byte_size,
+                                   attachment_blobs.c.state.label("_export_blob_state"))
+                            .select_from(attachments.join(
+                                attachment_blobs, attachments.c.blob_digest == attachment_blobs.c.digest,
+                            )).where(attachments.c.id.in_(imported_message_attachment_ids))
+                        ).fetchall()
+                        by_imported_message_attachment = {
+                            str(row._mapping["id"]): row for row in imported_message_attachment_rows
+                        }
+                    imported_backing_rows = [
+                        by_imported_attachment[str(link["attachment_id"])]
+                        for link in imported_attempt_links
+                    ] + [
+                        by_imported_message_attachment[str(link["attachment_id"])]
+                        for link in imported_message_links
+                    ]
                     attachments_by_id = {}
-                    for row in (*message_attachment_rows, *attempt_attachment_rows):
+                    for _, row in (*message_attachment_rows, *attempt_attachment_rows, *((None, item) for item in imported_backing_rows)):
                         attachment_id = str(row._mapping["id"])
                         if attachment_id in attachments_by_id:
                             continue
@@ -3341,11 +6513,94 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                             payload=raw if attachment_policy.value == "embedded" else None,
                         )
 
+                    def sealed_attachment_metadata(row):
+                        try:
+                            metadata = json.loads(str(row["source_metadata"]))
+                        except (TypeError, ValueError) as exc:
+                            raise StateError("imported attachment reservation metadata is malformed") from exc
+                        if not isinstance(metadata, dict):
+                            raise StateError("imported attachment reservation metadata is malformed")
+                        return metadata
+
+                    def missing_external_attachment(row):
+                        """Project a reserved imported ref without inventing a backing.
+
+                        The reservation itself is the exporting graph identity.
+                        Its sealed safe source metadata supplies the only
+                        attachment facts that may cross another v2 hop.
+                        """
+                        metadata = sealed_attachment_metadata(row)
+                        try:
+                            created_at = parse_utc(str(metadata.get("created_at", row["created_at"])))
+                        except (TypeError, ValueError) as exc:
+                            raise StateError("imported attachment reservation timestamp is malformed") from exc
+                        digest = bytes(row["expected_digest"]).hex()
+                        attachment = Attachment(
+                            # These placeholders never cross the wire: the
+                            # ExportAttachment below writes `metadata` exactly.
+                            id=str(row["id"]), blob_digest=digest, filename="imported-attachment",
+                            source_kind="filesystem", source_name="imported-attachment",
+                            text_representation_id=(
+                                str(metadata["text_representation_id"])
+                                if isinstance(metadata.get("text_representation_id"), str) else None
+                            ),
+                            text_digest=(
+                                str(metadata["text_digest"])
+                                if isinstance(metadata.get("text_digest"), str) else None
+                            ),
+                            ineligibility_reason=(
+                                str(metadata["ineligibility_reason"])
+                                if isinstance(metadata.get("ineligibility_reason"), str) else None
+                            ),
+                            created_at=created_at,
+                        )
+                        return ExportAttachment(
+                            attachment=attachment, byte_size=int(row["expected_size"]),
+                            integrity_status="missing-external", payload=None, source_metadata=metadata,
+                        )
+
+                    for row in (*missing_imported_message_links, *missing_imported_attempt_links):
+                        ref_id = str(row["id"])
+                        if ref_id not in attachments_by_id:
+                            attachments_by_id[ref_id] = missing_external_attachment(row)
+                    for row in (*imported_message_links, *imported_attempt_links):
+                        ref_id = str(row["ref_id"])
+                        if ref_id in attachments_by_id:
+                            attachments_by_id[ref_id] = replace(
+                                attachments_by_id[ref_id], source_metadata=sealed_attachment_metadata(row),
+                            )
+                    used_imported_refs = connection.exec_driver_sql(
+                        "SELECT r.id,r.source_metadata FROM archive_import_attachment_refs r WHERE r.id IN ("
+                        "SELECT ma.attachment_id FROM message_attachments ma JOIN messages m ON m.id=ma.message_id WHERE m.chat_id=? "
+                        "UNION SELECT aa.attachment_id FROM attempt_attachments aa JOIN generation_attempts a ON a.id=aa.attempt_id WHERE a.chat_id=?"
+                        ")",
+                        (chat_id, chat_id),
+                    ).mappings().all()
+                    for row in used_imported_refs:
+                        ref_id = str(row["id"])
+                        if ref_id in attachments_by_id:
+                            attachments_by_id[ref_id] = replace(
+                                attachments_by_id[ref_id], source_metadata=sealed_attachment_metadata(row),
+                            )
+                    message_attachment_rows.extend(
+                        (str(row["message_id"]), attachments_by_id[str(row["ref_id"] if "ref_id" in row.keys() else row["id"])])
+                        for row in sorted(
+                            (*imported_message_links, *missing_imported_message_links),
+                            key=lambda item: (str(item["message_id"]), int(item["ordinal"])),
+                        )
+                    )
+                    attempt_attachment_rows.extend(
+                        (str(row["attempt_id"]), attachments_by_id[str(row["ref_id"] if "ref_id" in row.keys() else row["id"])])
+                        for row in sorted(
+                            (*imported_attempt_links, *missing_imported_attempt_links),
+                            key=lambda item: (str(item["attempt_id"]), int(item["ordinal"])),
+                        )
+                    )
+
                     def grouped(rows):
                         result = {}
-                        for row in rows:
-                            owner = str(row._mapping["_export_owner_id"])
-                            item = attachments_by_id[str(row._mapping["id"])]
+                        for owner, row in rows:
+                            item = row if isinstance(row, ExportAttachment) else attachments_by_id[str(row._mapping["id"])]
                             result.setdefault(owner, []).append(item)
                         return {key: tuple(value) for key, value in result.items()}
 
@@ -3366,6 +6621,21 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                         }
                         for row in context_rows
                     }
+                    imported_context_rows = connection.exec_driver_sql(
+                        "SELECT a.id,c.source_plan FROM archive_imported_context_plans c "
+                        "JOIN archive_imported_attempts a ON a.id=c.attempt_id WHERE a.chat_id=?",
+                        (chat_id,),
+                    ).mappings().all()
+                    for row in imported_context_rows:
+                        try:
+                            source_context = json.loads(str(row["source_plan"]))
+                        except (TypeError, ValueError) as exc:
+                            raise StateError("imported context evidence is malformed") from exc
+                        if not isinstance(source_context, dict):
+                            raise StateError("imported context evidence is malformed")
+                        source_context = dict(source_context)
+                        source_context["attempt_id"] = str(row["id"])
+                        context_source[str(row["id"])] = source_context
                     selection_row = connection.execute(
                         select(chat_model_selection).where(chat_model_selection.c.chat_id == chat_id)
                     ).first()
@@ -3436,6 +6706,273 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                             "selection_required": bool(mapping["selection_required"]),
                             "revision": int(mapping["revision"]),
                         }
+                    imported_nodes = connection.exec_driver_sql(
+                        "SELECT 'chat' AS kind,chat_id AS local_id,source_node_id FROM archive_import_chats WHERE chat_id=? "
+                        "UNION ALL SELECT 'message',message_id,source_node_id FROM archive_import_messages WHERE chat_id=? "
+                        "UNION ALL SELECT 'lineage',local_lineage_id,source_node_id FROM archive_import_lineages WHERE chat_id=? "
+                        "UNION ALL SELECT 'attachment',r.id,r.source_node_id FROM archive_import_attachment_refs r "
+                        "WHERE r.id IN ("
+                        "SELECT ml.attachment_ref_id FROM archive_import_message_attachment_refs ml "
+                        "JOIN archive_import_messages im ON im.message_id=ml.message_id WHERE im.chat_id=? "
+                        "UNION SELECT al.attachment_ref_id FROM archive_import_attempt_attachment_refs al "
+                        "JOIN archive_imported_attempts ia ON ia.id=al.attempt_id WHERE ia.chat_id=? "
+                        "UNION "
+                        "SELECT ma.attachment_id FROM message_attachments ma JOIN messages m ON m.id=ma.message_id WHERE m.chat_id=? "
+                        "UNION SELECT aa.attachment_id FROM attempt_attachments aa JOIN generation_attempts a ON a.id=aa.attempt_id WHERE a.chat_id=?"
+                        ") "
+                        "UNION ALL SELECT 'attempt',id,source_node_id FROM archive_imported_attempts WHERE chat_id=?",
+                        (chat_id, chat_id, chat_id, chat_id, chat_id, chat_id, chat_id, chat_id),
+                    ).mappings().all()
+                    node_by_identity = {
+                        (str(row["kind"]), str(row["local_id"])): str(row["source_node_id"])
+                        for row in imported_nodes
+                    }
+                    derivation_by_identity = {
+                        (str(row["object_kind"]), str(row["object_id"])): str(row["predecessor_message_id"])
+                        for row in connection.exec_driver_sql(
+                            "SELECT object_kind,object_id,predecessor_message_id "
+                            "FROM archive_object_derivations WHERE chat_id=?",
+                            (chat_id,),
+                        ).mappings().all()
+                    }
+                    node_cache = {}
+                    def source_chain(node_id):
+                        chain = []
+                        while node_id is not None:
+                            node = node_cache.get(node_id)
+                            if node is None:
+                                node = connection.exec_driver_sql(
+                                    "SELECT id,archive_id,logical_content_digest,source_object_id,imported_at,source_format,prior_node_id "
+                                    "FROM archive_lineage_nodes WHERE id=?", (node_id,),
+                                ).mappings().one_or_none()
+                                if node is None:
+                                    raise StateError("imported provenance node is missing")
+                                node_cache[node_id] = node
+                            chain.append(node)
+                            node_id = None if node["prior_node_id"] is None else str(node["prior_node_id"])
+                        return chain
+                    identities = [("chat", chat.id)]
+                    identities.extend(("message", item.id) for item in source_messages)
+                    identities.extend(("lineage", item.lineage_id) for item in source_messages)
+                    identities.extend(("attachment", item) for item in sorted(attachments_by_id))
+                    identities.extend(("attempt", item.id) for item in source_attempts)
+                    provenance_rows = []
+                    for kind, local_id in dict.fromkeys(identities):
+                        node_id = node_by_identity.get((kind, local_id))
+                        if node_id is None:
+                            source = {"kind": "native", "immediate": None, "prior_chain": []}
+                        else:
+                            chain = source_chain(node_id)
+                            def hop(node):
+                                return {"archive_id": str(node["archive_id"]), "archive_version": int(node["source_format"]), "logical_content_digest": str(node["logical_content_digest"]), "object_id": str(node["source_object_id"]), "imported_at": str(node["imported_at"])}
+                            source = {
+                                "kind": "v1-bootstrap" if len(chain) == 1 and int(chain[0]["source_format"]) == 1 else "imported",
+                                "immediate": hop(chain[0]), "prior_chain": [hop(item) for item in chain[1:]],
+                            }
+                        predecessor_id = derivation_by_identity.get((kind, local_id))
+                        derivation = (
+                            {"kind": "root", "predecessor": None}
+                            if predecessor_id is None else {
+                                "kind": "local-continuation",
+                                "predecessor": {"object_kind": "message", "object_id": predecessor_id},
+                            }
+                        )
+                        provenance_rows.append({"object_kind": kind, "object_id": local_id, "source": source, "derivation": derivation})
+                    anchor_rows = connection.exec_driver_sql(
+                        "SELECT base_key,base_message_id,source_configuration,resolution,resolution_evidence "
+                        "FROM archive_continuation_anchors WHERE chat_id=? ORDER BY base_key",
+                        (chat_id,),
+                    ).mappings().all()
+                    continuation_anchors = []
+                    for anchor in anchor_rows:
+                        try:
+                            configuration = json.loads(str(anchor["source_configuration"]))
+                            evidence = json.loads(str(anchor["resolution_evidence"]))
+                        except (TypeError, ValueError) as exc:
+                            raise StateError("continuation anchor evidence is malformed") from exc
+                        if not isinstance(configuration, dict) or not isinstance(evidence, dict):
+                            raise StateError("continuation anchor evidence is malformed")
+                        continuation_anchors.append({
+                            "anchor_key": str(anchor["base_key"]),
+                            "base_message_id": None if anchor["base_message_id"] is None else str(anchor["base_message_id"]),
+                            "source_configuration": configuration,
+                            "resolution": str(anchor["resolution"]).lower().replace("_", "-"),
+                            "resolution_reason": str(evidence.get("kind", "source")),
+                        })
+                    choice_rows = connection.exec_driver_sql(
+                        "SELECT base_key,choice_revision,decision_kind,safe_target_descriptor,explicit_settings,excluded_refs,created_at "
+                        "FROM archive_continuation_choices WHERE chat_id=? ORDER BY base_key,choice_revision",
+                        (chat_id,),
+                    ).mappings().all()
+                    continuation_choices = []
+                    for choice in choice_rows:
+                        try:
+                            descriptor = json.loads(str(choice["safe_target_descriptor"]))
+                            settings = json.loads(str(choice["explicit_settings"]))
+                            exclusions = json.loads(str(choice["excluded_refs"]))
+                        except (TypeError, ValueError) as exc:
+                            raise StateError("continuation choice evidence is malformed") from exc
+                        if not isinstance(descriptor, dict) or not isinstance(settings, dict) or not isinstance(exclusions, list):
+                            raise StateError("continuation choice evidence is malformed")
+                        continuation_choices.append({
+                            "anchor_key": str(choice["base_key"]), "choice_revision": int(choice["choice_revision"]),
+                            "decision_kind": str(choice["decision_kind"]).replace("_", "-"),
+                            "mapped_model": descriptor, "explicit_settings": settings,
+                            "excluded_context_refs": exclusions, "chosen_at": str(choice["created_at"]),
+                        })
+                    branch_rows = connection.exec_driver_sql(
+                        "SELECT base_key,choice_revision,first_message_id,attempt_id,created_at "
+                        "FROM archive_continuation_branches WHERE chat_id=? ORDER BY first_message_id",
+                        (chat_id,),
+                    ).mappings().all()
+                    imported_branch_rows = connection.exec_driver_sql(
+                        "SELECT base_key,first_message_id,attempt_id,choice_snapshot "
+                        "FROM archive_imported_branch_choices WHERE chat_id=? ORDER BY first_message_id",
+                        (chat_id,),
+                    ).mappings().all()
+                    imported_branches = []
+                    for branch in imported_branch_rows:
+                        try:
+                            snapshot = json.loads(str(branch["choice_snapshot"]))
+                        except (TypeError, ValueError) as exc:
+                            raise StateError("imported branch history is malformed") from exc
+                        if (
+                            not isinstance(snapshot, dict)
+                            or set(snapshot) != {"anchor_key", "choice_revision", "first_message_id", "attempt_id", "created_at"}
+                            or type(snapshot.get("choice_revision")) is not int
+                            or not isinstance(snapshot.get("created_at"), str)
+                        ):
+                            raise StateError("imported branch history is malformed")
+                        # An archive names this exporting graph's identities.
+                        # The persisted snapshot remains the prior source
+                        # record; it cannot be recast as a native branch.
+                        imported_branches.append({
+                            "anchor_key": str(branch["base_key"]),
+                            "choice_revision": int(snapshot["choice_revision"]),
+                            "first_message_id": str(branch["first_message_id"]),
+                            "attempt_id": str(branch["attempt_id"]),
+                            "created_at": snapshot["created_at"],
+                        })
+                    continuation_history = {
+                        "active_head_message_id": chat.head_message_id,
+                        "anchors": continuation_anchors,
+                        "choices": continuation_choices,
+                        "branches": [{
+                            "anchor_key": str(branch["base_key"]), "choice_revision": int(branch["choice_revision"]),
+                            "first_message_id": str(branch["first_message_id"]), "attempt_id": str(branch["attempt_id"]),
+                            "created_at": str(branch["created_at"]),
+                        } for branch in branch_rows] + imported_branches,
+                    }
+                    history_bindings = []
+                    imported_binding_map = {
+                        "attachment": {
+                            str(source_id): str(local_id)
+                            for source_id, local_id in connection.exec_driver_sql(
+                                "SELECT r.source_attachment_id,r.id FROM archive_import_attachment_refs r "
+                                "JOIN archive_import_chats c ON c.operation_id=r.operation_id WHERE c.chat_id=?",
+                                (chat_id,),
+                            ).fetchall()
+                        },
+                        "message": {
+                            str(source_id): str(local_id)
+                            for source_id, local_id in connection.exec_driver_sql(
+                                "SELECT source_message_id,message_id FROM archive_import_messages WHERE chat_id=?",
+                                (chat_id,),
+                            ).fetchall()
+                        },
+                    }
+                    for imported in imported_attempt_rows:
+                        try:
+                            bindings = json.loads(str(connection.exec_driver_sql(
+                                "SELECT source_evidence_binding FROM archive_imported_attempts WHERE id=?", (imported["id"],)
+                            ).scalar_one()))
+                        except (TypeError, ValueError) as exc:
+                            raise StateError("imported history bindings are malformed") from exc
+                        if not isinstance(bindings, list):
+                            raise StateError("imported history bindings are malformed")
+                        for binding in bindings:
+                            if not isinstance(binding, dict):
+                                raise StateError("imported history bindings are malformed")
+                            exported = json.loads(json.dumps(binding))
+                            current = exported.get("current_binding")
+                            if current is not None:
+                                if (
+                                    not isinstance(current, dict)
+                                    or set(current) != {"object_kind", "object_id"}
+                                    or not isinstance(current["object_kind"], str)
+                                    or not isinstance(current["object_id"], str)
+                                ):
+                                    raise StateError("imported history current binding is malformed")
+                                mapped = imported_binding_map.get(
+                                    current["object_kind"], {}
+                                ).get(current["object_id"])
+                                if mapped is None:
+                                    raise StateError("imported history current binding lacks a typed source map")
+                                exported["current_binding"] = {
+                                    "object_kind": current["object_kind"], "object_id": mapped,
+                                }
+                            exported["attempt_id"] = str(imported["id"])
+                            history_bindings.append(exported)
+                    native_binding_rows = connection.exec_driver_sql(
+                        "SELECT aa.attempt_id,aa.ordinal,aa.attachment_id,hex(a.text_digest) AS text_digest "
+                        "FROM attempt_attachments aa JOIN generation_attempts ga ON ga.id=aa.attempt_id "
+                        "JOIN attachments a ON a.id=aa.attachment_id WHERE ga.chat_id=? "
+                        "ORDER BY aa.attempt_id,aa.ordinal",
+                        (chat_id,),
+                    ).mappings().all()
+                    native_attachments = {
+                        (str(row["attempt_id"]), str(row["attachment_id"])): str(row["text_digest"]).lower()
+                        for row in native_binding_rows if row["text_digest"] is not None
+                    }
+                    messages_by_id = {message.id: message for message in source_messages}
+                    imported_attempt_ids = {str(row["id"]) for row in imported_attempt_rows}
+                    from bots5.core.export import _archive_snapshot
+                    for attempt in source_attempts:
+                        if attempt.id in imported_attempt_ids:
+                            continue
+                        provenance = _archive_snapshot(
+                            attempt, messages_by_id[attempt.user_message_id].content,
+                        )
+                        if provenance.get("status") != "available" or provenance.get("snapshot_version") != 3:
+                            continue
+                        context = provenance.get("context")
+                        sources = context.get("sources") if isinstance(context, dict) else None
+                        if not isinstance(sources, list):
+                            raise StateError("native safe context evidence is malformed")
+                        for ordinal, source in enumerate(sources):
+                            if not isinstance(source, dict):
+                                raise StateError("native safe context source is malformed")
+                            kind, source_id, status = source.get("kind"), source.get("source_id"), source.get("source_id_status")
+                            if not isinstance(kind, str) or not isinstance(source_id, str) or status not in {"available", "redacted"}:
+                                raise StateError("native safe context source is malformed")
+                            if kind == "attachment":
+                                digest = source.get("representation_digest"); digest_kind = "representation"
+                            else:
+                                digest = hashlib.sha256(canonical_json_bytes({key: source.get(key) for key in (
+                                    "kind", "role", "content", "state", "eligible", "selected",
+                                    "selection_reason", "representation_id", "representation_digest",
+                                )})).hexdigest(); digest_kind = "safe-source-record"
+                            if not isinstance(digest, str):
+                                raise StateError("native safe context digest is malformed")
+                            current = None
+                            if status == "available":
+                                if kind == "attachment" and (attempt.id, source_id) in native_attachments:
+                                    if native_attachments[(attempt.id, source_id)] != digest.lower():
+                                        raise StateError("native attachment contradicts frozen safe context")
+                                    current = {"object_kind": "attachment", "object_id": source_id}
+                                elif kind == "current_user" and source_id == attempt.user_message_id and source.get("content") == messages_by_id[source_id].content:
+                                    current = {"object_kind": "message", "object_id": source_id}
+                                elif kind == "history" and source_id in messages_by_id and source.get("role") == messages_by_id[source_id].role.value and source.get("content") == messages_by_id[source_id].content:
+                                    current = {"object_kind": "message", "object_id": source_id}
+                            history_bindings.append({
+                                "attempt_id": attempt.id, "binding_kind": "context-source", "ordinal": ordinal,
+                                "snapshot_source": {"kind": kind, "source_id": source_id,
+                                    "source_id_status": status, "evidence_digest": digest.lower(), "digest_kind": digest_kind},
+                                "current_binding": current,
+                                "binding_state": "bound" if current is not None else (
+                                    "historical-only" if kind == "bots_instruction" else "unavailable"),
+                            })
+                    history_bindings.sort(key=lambda item: (str(item["attempt_id"]), int(item["ordinal"])))
                     result = ChatExportSource(
                         chat=chat, messages=source_messages, attempts=source_attempts,
                         message_attachments=grouped(message_attachment_rows),
@@ -3446,6 +6983,11 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                             "selection": selection, "overrides": overrides,
                         },
                         captured_at=datetime.now(UTC),
+                        requires_v2=imported_chat is not None or bool(imported_nodes),
+                        object_provenance=tuple(provenance_rows),
+                        continuation_history=continuation_history,
+                        history_bindings=tuple(history_bindings),
+                        archived_attempt_provenance=archived_attempt_provenance,
                     )
                     connection.rollback()
                     return result
@@ -3464,6 +7006,37 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         with self._engine.connect() as connection:
             row = connection.execute(select(messages).where(messages.c.id == message_id)).first()
         return None if row is None else _message(row)
+
+    def inspection_import_provenance(
+        self, chat_id: str, message_id: str | None = None,
+    ) -> dict[str, str]:
+        """Read imported identity evidence only; Inspector never opens bytes."""
+        self._ensure_open()
+        with self._engine.connect() as connection:
+            row = connection.exec_driver_sql(
+                "SELECT o.archive_id,o.archive_version,o.logical_content_digest,"
+                "i.source_chat_id,i.source_chat_revision,i.imported_at "
+                "FROM archive_import_chats AS i JOIN archive_import_operations AS o ON o.id=i.operation_id "
+                "WHERE i.chat_id=?", (chat_id,),
+            ).mappings().one_or_none()
+            if row is None:
+                return {}
+            result = {
+                "Archive ID": str(row["archive_id"]),
+                "Archive version": str(row["archive_version"]),
+                "Archive digest": str(row["logical_content_digest"]),
+                "Source chat ID": str(row["source_chat_id"]),
+                "Source chat revision": str(row["source_chat_revision"]),
+                "Imported at": str(row["imported_at"]),
+            }
+            if message_id is not None:
+                message = connection.exec_driver_sql(
+                    "SELECT source_message_id FROM archive_import_messages WHERE message_id=? AND chat_id=?",
+                    (message_id, chat_id),
+                ).scalar_one_or_none()
+                if message is not None:
+                    result["Source message ID"] = str(message)
+            return result
 
     def list_messages(self, chat_id: str) -> tuple[Message, ...]:
         self._ensure_open()
@@ -3613,7 +7186,7 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         self,
         connection,
         messages_to_insert: tuple[Message, ...],
-        attempt: GenerationAttempt,
+        attempt: GenerationAttempt, branch_choice_context=None,
     ) -> None:
         if attempt.state is not AttemptState.RUNNING or attempt.ended_at is not None:
             raise StateError("generation start must use a running attempt without an end time")
@@ -3685,7 +7258,7 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         if assistant_message.parent_id != user_message.id:
             raise StateError("generation attempt assistant must belong to its user turn")
         _validate_request_snapshot(attempt, user_message.content)
-        _validate_phase6_attempt_authority(connection, attempt)
+        _validate_phase6_attempt_authority(connection, attempt, branch_choice_context)
         _validate_attempt_outcome(attempt)
 
         active_id = connection.execute(
@@ -3868,6 +7441,7 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         context_plan,
         attachment_ids: tuple[str, ...],
         reuse_message_attachments: bool = False,
+        imported_regeneration: bool = False,
     ) -> None:
         if context_plan is None and not attachment_ids:
             return
@@ -3949,7 +7523,7 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                             ordinal=ordinal,
                         )
                     )
-                else:
+                elif not imported_regeneration:
                     existing_message_refs = connection.execute(
                         select(message_attachments.c.attachment_id, message_attachments.c.ordinal)
                         .where(message_attachments.c.message_id == message_id)
@@ -3983,6 +7557,9 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         expected_chat_revision: int | None = None,
         context_plan=None,
         attachment_ids: tuple[str, ...] = (),
+        continuation_branch: tuple[str, int] | None = None,
+        continuation_first_message_id: str | None = None,
+        derivation_predecessor_message_id: str | None = None,
     ) -> None:
         self._ensure_open()
         # Acquire the attachment transition gate before opening the SQLite
@@ -4015,11 +7592,39 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     stack.callback(rollback_k0)
                 self._arm_phase7_source_mutation(connection, "generation start")
                 try:
+                    if continuation_branch is not None:
+                        base_key, choice_revision = continuation_branch
+                        source = connection.exec_driver_sql(
+                            "SELECT 1 FROM archive_continuation_choices WHERE chat_id=? AND base_key=? AND choice_revision=?",
+                            (chat.id, base_key, choice_revision),
+                        ).first()
+                        if source is None:
+                            raise StateError("continuation generation lacks its selected anchor and choice")
                     self._insert_messages_and_attempt(
                         connection,
                         (user_message, assistant_message),
-                        attempt,
+                        attempt, continuation_branch,
                     )
+                    if continuation_branch is not None:
+                        base_key, choice_revision = continuation_branch
+                        first_message_id = continuation_first_message_id or assistant_message.id
+                        if base_key == "empty":
+                            raise StateError("continuation derivation lacks an earlier message")
+                        predecessor_message_id = derivation_predecessor_message_id or base_key
+                        derivations = (
+                            (chat.id, "message", first_message_id, predecessor_message_id),
+                            (chat.id, "attempt", attempt.id, predecessor_message_id),
+                        )
+                        arm_phase9_object_derivations(connection, derivations)
+                        for derivation in derivations:
+                            connection.exec_driver_sql(
+                                "INSERT INTO archive_object_derivations(chat_id,object_kind,object_id,predecessor_message_id) VALUES (?,?,?,?)",
+                                derivation,
+                            )
+                        connection.exec_driver_sql(
+                            "INSERT INTO archive_continuation_branches(chat_id,base_key,choice_revision,first_message_id,attempt_id,created_at) VALUES (?,?,?,?,?,?)",
+                            (chat.id, base_key, choice_revision, first_message_id, attempt.id, utc_iso(assistant_message.created_at)),
+                        )
                     self._persist_phase6_evidence(
                         connection,
                         attempt_id=attempt.id,
@@ -4027,6 +7632,13 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                         context_plan=context_plan,
                         attachment_ids=attachment_ids,
                     )
+                    if continuation_branch is not None:
+                        self._inherit_continuation_anchor(
+                            connection, chat_id=chat.id, source_base_key=continuation_branch[0],
+                            choice_revision=continuation_branch[1], assistant_message_id=assistant_message.id,
+                            attempt_id=attempt.id, attachment_ids=attachment_ids,
+                            created_at=utc_iso(assistant_message.created_at),
+                        )
                     self._advance_chat(
                         connection,
                         chat,
@@ -4035,6 +7647,7 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     )
                     source_revision = self._require_phase7_source_consumed(connection)
                 finally:
+                    clear_phase9_object_derivations(connection)
                     clear_phase7_source_mutation(connection)
                 if explicit:
                     commit_attempted = True
@@ -4066,6 +7679,7 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         expected_chat_revision: int | None = None,
         context_plan=None,
         attachment_ids: tuple[str, ...] = (),
+        imported_regeneration: tuple[str, int] | None = None,
     ) -> None:
         self._ensure_open()
         source_revision: int | None = None
@@ -4095,9 +7709,38 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     stack.callback(rollback_k0)
                 self._arm_phase7_source_mutation(connection, "regeneration start")
                 try:
+                    if imported_regeneration is not None:
+                        base_key, choice_revision = imported_regeneration
+                        source = connection.exec_driver_sql(
+                            "SELECT ia.id FROM archive_imported_attempts ia "
+                            "JOIN archive_continuation_anchors a ON a.chat_id=ia.chat_id AND a.base_key=? "
+                            "JOIN archive_continuation_choices c ON c.chat_id=a.chat_id AND c.base_key=a.base_key AND c.choice_revision=? "
+                            "WHERE ia.chat_id=? AND ia.assistant_message_id=? AND ia.user_message_id=?",
+                            (base_key, choice_revision, chat.id, base_key, attempt.user_message_id),
+                        ).first()
+                        if source is None:
+                            raise StateError("imported regeneration lacks its selected source anchor and choice")
                     self._insert_messages_and_attempt(
-                        connection, (assistant_message,), attempt
+                        connection, (assistant_message,), attempt, imported_regeneration
                     )
+                    if imported_regeneration is not None:
+                        base_key, choice_revision = imported_regeneration
+                        if base_key == "empty":
+                            raise StateError("continuation derivation lacks an earlier message")
+                        derivations = (
+                            (chat.id, "message", assistant_message.id, base_key),
+                            (chat.id, "attempt", attempt.id, base_key),
+                        )
+                        arm_phase9_object_derivations(connection, derivations)
+                        for derivation in derivations:
+                            connection.exec_driver_sql(
+                                "INSERT INTO archive_object_derivations(chat_id,object_kind,object_id,predecessor_message_id) VALUES (?,?,?,?)",
+                                derivation,
+                            )
+                        connection.exec_driver_sql(
+                            "INSERT INTO archive_continuation_branches(chat_id,base_key,choice_revision,first_message_id,attempt_id,created_at) VALUES (?,?,?,?,?,?)",
+                            (chat.id, base_key, choice_revision, assistant_message.id, attempt.id, utc_iso(assistant_message.created_at)),
+                        )
                     self._persist_phase6_evidence(
                         connection,
                         attempt_id=attempt.id,
@@ -4105,7 +7748,15 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                         context_plan=context_plan,
                         attachment_ids=attachment_ids,
                         reuse_message_attachments=True,
+                        imported_regeneration=imported_regeneration is not None,
                     )
+                    if imported_regeneration is not None:
+                        self._inherit_continuation_anchor(
+                            connection, chat_id=chat.id, source_base_key=imported_regeneration[0],
+                            choice_revision=imported_regeneration[1], assistant_message_id=assistant_message.id,
+                            attempt_id=attempt.id, attachment_ids=attachment_ids,
+                            created_at=utc_iso(assistant_message.created_at),
+                        )
                     self._advance_chat(
                         connection,
                         chat,
@@ -4114,6 +7765,7 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     )
                     source_revision = self._require_phase7_source_consumed(connection)
                 finally:
+                    clear_phase9_object_derivations(connection)
                     clear_phase7_source_mutation(connection)
                 if explicit:
                     commit_attempted = True
@@ -5045,7 +8697,7 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         *,
         filters: SearchFilters,
     ) -> tuple[SearchLocation, ...]:
-        predicates = ["ma.attachment_id=?"]
+        predicates = ["location.attachment_id=?"]
         parameters: list[object] = [attachment_id]
         if filters.chat_id is not None:
             predicates.append("m.chat_id=?")
@@ -5053,8 +8705,13 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         if not filters.include_archived:
             predicates.append("c.archived_at IS NULL")
         sql = (
-            "SELECT m.chat_id, m.id, c.archived_at FROM message_attachments ma "
-            "JOIN messages m ON m.id=ma.message_id JOIN chats c ON c.id=m.chat_id "
+            "SELECT m.chat_id, m.id, c.archived_at FROM ("
+            "SELECT attachment_id,message_id FROM message_attachments "
+            "UNION ALL SELECT r.attachment_id,im.message_id "
+            "FROM archive_import_message_attachment_refs im "
+            "JOIN archive_import_attachment_refs r ON r.id=im.attachment_ref_id "
+            "WHERE r.availability='READY') location "
+            "JOIN messages m ON m.id=location.message_id JOIN chats c ON c.id=m.chat_id "
             "WHERE "
             + " AND ".join(predicates)
             + " "
@@ -5461,9 +9118,14 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     if chosen.message_id is None:
                         raise SearchResultGone("attachment search location is malformed")
                     exists = connection.exec_driver_sql(
-                        "SELECT 1 FROM attachments a JOIN message_attachments ma "
-                        "ON ma.attachment_id=a.id JOIN messages m ON m.id=ma.message_id "
-                        "WHERE a.id=? AND ma.message_id=? AND m.chat_id=?",
+                    "SELECT 1 FROM attachments a JOIN ("
+                    "SELECT attachment_id,message_id FROM message_attachments "
+                    "UNION ALL SELECT r.attachment_id,im.message_id "
+                    "FROM archive_import_message_attachment_refs im "
+                    "JOIN archive_import_attachment_refs r ON r.id=im.attachment_ref_id "
+                    "WHERE r.availability='READY') loc "
+                    "ON loc.attachment_id=a.id JOIN messages m ON m.id=loc.message_id "
+                    "WHERE a.id=? AND loc.message_id=? AND m.chat_id=?",
                         (result.document_id, chosen.message_id, chosen.chat_id),
                     ).first()
                     if exists is None:

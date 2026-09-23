@@ -8,7 +8,7 @@ import unicodedata
 import math
 from decimal import Decimal
 from html import escape as html_escape
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from types import MappingProxyType
@@ -31,6 +31,31 @@ class AttachmentPolicy(StrEnum):
 
 class ExportError(ValueError):
     pass
+
+
+class ArchiveVersionRequired(ExportError):
+    """A frozen v1 request would lose provenance or availability truth."""
+
+    def __init__(self, required: int = 2):
+        super().__init__(f"Archive version {required} is required for full-fidelity export")
+        self.required = required
+
+
+def select_archive_version(
+    *, requested: int | None, has_import_provenance: bool, has_missing_external_reference: bool,
+) -> int:
+    """Choose the only lossless format before any output publication.
+
+    V1 stays available for wholly native graphs.  The caller supplies facts
+    from its coherent store-owned export cut; this pure policy never guesses
+    from a migration version or source archive format.
+    """
+    if requested not in {None, 1, 2}:
+        raise ExportError("requested archive version is unsupported")
+    requires_v2 = has_import_provenance or has_missing_external_reference
+    if requested == 1 and requires_v2:
+        raise ArchiveVersionRequired(2)
+    return 2 if requires_v2 or requested == 2 else 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +91,14 @@ class ExportAttachment:
     byte_size: int
     integrity_status: str
     payload: bytes | None = None
+    # Imported references retain their sealed safe wire metadata.  A current
+    # local backing is only a representation; it must not recast the source
+    # filename/source-kind statuses on a later v2 hop.
+    source_metadata: Mapping[str, object] | None = None
+
+    def __post_init__(self) -> None:
+        if self.source_metadata is not None:
+            object.__setattr__(self, "source_metadata", _freeze(self.source_metadata))
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,12 +113,22 @@ class ChatExportSource:
     context_plans: Mapping[str, Mapping[str, object]]
     chat_configuration: Mapping[str, object]
     captured_at: datetime
+    requires_v2: bool = False
+    object_provenance: tuple[Mapping[str, object], ...] = ()
+    continuation_history: Mapping[str, object] | None = None
+    history_bindings: tuple[Mapping[str, object], ...] = ()
+    archived_attempt_provenance: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "message_attachments", _freeze(self.message_attachments))
         object.__setattr__(self, "attempt_attachments", _freeze(self.attempt_attachments))
         object.__setattr__(self, "context_plans", _freeze(self.context_plans))
         object.__setattr__(self, "chat_configuration", _freeze(self.chat_configuration))
+        object.__setattr__(self, "object_provenance", _freeze(self.object_provenance))
+        if self.continuation_history is not None:
+            object.__setattr__(self, "continuation_history", _freeze(self.continuation_history))
+        object.__setattr__(self, "history_bindings", _freeze(self.history_bindings))
+        object.__setattr__(self, "archived_attempt_provenance", _freeze(self.archived_attempt_provenance))
 
 
 def _freeze(value):
@@ -298,6 +341,22 @@ def _attachment_metadata(attachment: Attachment | ExportAttachment) -> str:
 
 def _attachment_row(value: Attachment | ExportAttachment) -> dict[str, object]:
     attachment = _export_attachment(value)
+    if isinstance(value, ExportAttachment) and value.source_metadata is not None:
+        metadata = value.source_metadata
+        try:
+            result = {
+                "source_id": attachment.id, "blob_digest": attachment.blob_digest,
+                "filename": metadata["filename"], "filename_status": metadata["filename_status"],
+                "source_kind": metadata["source_kind"], "source_kind_status": metadata["source_kind_status"],
+                "text_representation_id": metadata["text_representation_id"],
+                "text_digest": metadata["text_digest"], "text_eligibility": metadata["text_eligibility"],
+                "ineligibility_reason": metadata["ineligibility_reason"],
+                "created_at": metadata["created_at"], "byte_size": value.byte_size,
+                "integrity_status": value.integrity_status,
+            }
+        except KeyError as exc:
+            raise ExportError("imported attachment metadata is incomplete") from exc
+        return result
     filename, filename_status = _safe_attachment_filename(attachment.filename)
     source_kind, source_kind_status = _safe_closed_metadata(
         attachment.source_kind, frozenset({"filesystem"}),
@@ -629,9 +688,15 @@ def _message_row(message: Message) -> dict[str, object]:
     }
 
 
-def _attempt_row(attempt: GenerationAttempt, user_content: str | None = None) -> dict[str, object]:
+def _attempt_row(
+    attempt: GenerationAttempt, user_content: str | None = None,
+    archived_provenance: Mapping[str, object] | None = None,
+) -> dict[str, object]:
     failure = _failure_projection(attempt)
-    provenance = _archive_snapshot(attempt, user_content)
+    provenance = (
+        _archive_snapshot(attempt, user_content)
+        if archived_provenance is None else _json_value(archived_provenance)
+    )
     attribution = provenance.get("attribution")
     if not isinstance(attribution, Mapping):
         attribution = {}
@@ -852,6 +917,48 @@ def _safe_persisted_context(
     }
 
 
+def _safe_imported_context(
+    value: Mapping[str, object], attempt: GenerationAttempt,
+    archived_provenance: Mapping[str, object],
+) -> Mapping[str, object]:
+    """Project sealed imported v3 context without pretending it is native."""
+    if not isinstance(value, Mapping) or not isinstance(archived_provenance, Mapping):
+        raise ExportError("imported context evidence is malformed")
+    try:
+        from bots5.infrastructure.archive_package import _validate_safe_context
+        if archived_provenance.get("status") != "available" or archived_provenance.get("snapshot_version") != 3:
+            raise ValueError
+        safe = _validate_safe_context(_json_value(archived_provenance["context"]))
+        if value.get("attempt_id") != attempt.id:
+            raise ValueError
+        budget = safe["budget"]
+        comparisons = {
+            "plan_version": safe["version"], "canonical_digest": safe["canonical_digest"],
+            "wire_representation_digest": safe["wire_representation_sha256"],
+            "budget_limit": budget["limit"], "budget_semantics": budget["semantics"],
+            "adapter_id": budget["adapter_id"], "adapter_version": budget["adapter_version"],
+            "envelope_overhead": budget["envelope_overhead"], "output_reserve": budget["output_reserve"],
+            "input_units": budget["input_units"], "total_units": budget["total_units"],
+            "headroom": budget["headroom"],
+        }
+        if any(value.get(key) != expected or type(value.get(key)) is not type(expected) for key, expected in comparisons.items()):
+            raise ValueError
+        created_at = _canonical_persisted_timestamp(value["created_at"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ExportError("imported context row contradicts sealed request-time evidence") from exc
+    return {
+        "attempt_id": attempt.id, "plan_version": safe["version"],
+        "canonical_digest": safe["canonical_digest"],
+        "wire_representation_digest": safe["wire_representation_sha256"],
+        "budget_limit": budget["limit"], "budget_semantics": budget["semantics"],
+        "adapter_id": budget["adapter_id"], "adapter_version": budget["adapter_version"],
+        "input_counts": dict(safe["input_counts"]), "envelope_overhead": budget["envelope_overhead"],
+        "output_reserve": budget["output_reserve"], "input_units": budget["input_units"],
+        "total_units": budget["total_units"], "headroom": budget["headroom"],
+        "created_at": created_at,
+    }
+
+
 def build_archive_projection(
     *, archive_id: str, created_at: datetime, chat: Chat, messages: tuple[Message, ...],
     attempts: tuple[GenerationAttempt, ...], message_attachments: Mapping[str, tuple[Attachment | ExportAttachment, ...]],
@@ -859,6 +966,8 @@ def build_archive_projection(
     attachment_policy: AttachmentPolicy, chat_configuration: Mapping[str, object],
     application_version: str, migration_revision: str,
     context_plans: Mapping[str, Mapping[str, object]] | None = None,
+    archived_attempt_provenance: Mapping[str, Mapping[str, object]] | None = None,
+    allow_missing_external: bool = False,
 ) -> ArchiveProjection:
     if any(item.state is AttemptState.RUNNING for item in attempts) or any(
         item.state in {MessageState.SENDING, MessageState.STREAMING} for item in messages
@@ -908,7 +1017,11 @@ def build_archive_projection(
         for digest in digests:
             item = next(value for value in attachments.values() if _export_attachment(value).blob_digest == digest)
             size = item.byte_size if isinstance(item, ExportAttachment) else len(payloads.get(digest, b""))
-            if isinstance(item, ExportAttachment) and item.integrity_status != "verified":
+            if (
+                isinstance(item, ExportAttachment)
+                and item.integrity_status != "verified"
+                and not (allow_missing_external and item.integrity_status == "missing-external")
+            ):
                 raise ExportError("authoritative attachment payload is unavailable or mismatched")
             external.append({"digest": digest, "size": size, "logical_resource_id": f"sha256:{digest}", "required": True})
     provenance = {
@@ -917,8 +1030,11 @@ def build_archive_projection(
         "resources": [{"digest": item["digest"], "size": item["size"], "required": True} for item in external],
     }
     supplied_contexts = context_plans or {}
+    imported_provenance = archived_attempt_provenance or {}
     if not set(supplied_contexts) <= {item.id for item in attempts}:
         raise ExportError("persisted context row references an unknown attempt")
+    if not set(imported_provenance) <= {item.id for item in attempts}:
+        raise ExportError("archived attempt provenance references an unknown attempt")
     context_rows = []
     for attempt in attempts:
         try:
@@ -927,7 +1043,12 @@ def build_archive_projection(
             snapshot = None
         version = snapshot.get("snapshot_version") if isinstance(snapshot, Mapping) else None
         row = supplied_contexts.get(attempt.id)
-        if type(version) is int and version == 3:
+        archived = imported_provenance.get(attempt.id)
+        if isinstance(archived, Mapping) and archived.get("status") == "available" and archived.get("snapshot_version") == 3:
+            if row is None:
+                raise ExportError("sealed imported v3 request plan lacks context evidence")
+            context_rows.append(_safe_imported_context(row, attempt, archived))
+        elif type(version) is int and version == 3:
             if row is None:
                 raise ExportError("valid v3 request plan lacks persisted context evidence")
             context_rows.append(_safe_persisted_context(row, attempt, by_id[attempt.user_message_id].content))
@@ -941,7 +1062,7 @@ def build_archive_projection(
         })),
         ArchiveLogicalEntry("domain/messages.jsonl", "application/x-ndjson", True, canonical_jsonl_bytes(_message_row(item) for item in sorted(messages, key=lambda item: (item.sequence, item.id)))),
         ArchiveLogicalEntry("domain/attempts.jsonl", "application/x-ndjson", True, canonical_jsonl_bytes(
-            _attempt_row(item, by_id[item.user_message_id].content)
+            _attempt_row(item, by_id[item.user_message_id].content, imported_provenance.get(item.id))
             for item in sorted(attempts, key=lambda item: (utc_timestamp(item.started_at), item.id))
         )),
         ArchiveLogicalEntry("domain/context-plans.jsonl", "application/x-ndjson", True, canonical_jsonl_bytes(
@@ -964,4 +1085,119 @@ def build_archive_projection(
             "attachment_policy": attachment_policy.value, "self_contained": attachment_policy is AttachmentPolicy.EMBEDDED,
             "features": ["chat-lineage", "generation-outcomes", "request-time-provenance", "context-plans", "attachments"],
             "external_resources": external, "secret_exclusion": "credentials, endpoints, request identifiers, host paths, and raw secret-shaped fields are excluded"},
+    )
+
+
+def build_archive_v2_projection(
+    *, archive_id: str, created_at: datetime, chat: Chat, messages: tuple[Message, ...],
+    attempts: tuple[GenerationAttempt, ...], message_attachments: Mapping[str, tuple[Attachment | ExportAttachment, ...]],
+    attempt_attachments: Mapping[str, tuple[Attachment | ExportAttachment, ...]], payloads: Mapping[str, bytes],
+    attachment_policy: AttachmentPolicy, chat_configuration: Mapping[str, object],
+    application_version: str, migration_revision: str,
+    context_plans: Mapping[str, Mapping[str, object]] | None = None,
+    object_provenance: tuple[Mapping[str, object], ...] | None = None,
+    continuation_history: Mapping[str, object] | None = None,
+    history_bindings: tuple[Mapping[str, object], ...] = (),
+    archived_attempt_provenance: Mapping[str, Mapping[str, object]] | None = None,
+) -> ArchiveProjection:
+    """Build deterministic v2 bytes with complete identity provenance.
+
+    V2 preserves the validated v1 domain graph verbatim and appends a closed
+    provenance inventory.  Imported callers pass their persisted per-object
+    history; native callers receive a complete native inventory.
+    """
+    v1 = build_archive_projection(
+        archive_id=archive_id, created_at=created_at, chat=chat, messages=messages,
+        attempts=attempts, message_attachments=message_attachments,
+        attempt_attachments=attempt_attachments, payloads=payloads,
+        attachment_policy=attachment_policy, chat_configuration=chat_configuration,
+        application_version=application_version, migration_revision=migration_revision,
+        context_plans=context_plans,
+        archived_attempt_provenance=archived_attempt_provenance,
+        # Archive v1 remains frozen: only the v2 writer can carry an honest
+        # payload-absence conclusion for an externally referenced object.
+        allow_missing_external=True,
+    )
+    entries = {item.path: item.content for item in v1.entries}
+    # V2 makes the payload-presence conclusion explicit.  V1's attachment
+    # row is deliberately frozen, so add this field only on the evolved wire.
+    # Every attachment currently admitted to the v1 projection has a verified
+    # backing; unavailable imported references are projected separately by
+    # the store and must never be recast as verified here.
+    try:
+        v2_attachments = [json.loads(line) for line in entries["domain/attachments.jsonl"].splitlines() if line]
+    except (KeyError, ValueError) as exc:
+        raise ExportError("v1 attachment projection is malformed") from exc
+    if any(not isinstance(item, dict) for item in v2_attachments):
+        raise ExportError("v1 attachment projection is malformed")
+    for item in v2_attachments:
+        if item.get("integrity_status") == "verified":
+            item["payload_availability"] = "verified"
+        elif item.get("integrity_status") == "missing-external":
+            item["integrity_status"] = "not-present"
+            item["payload_availability"] = "missing-external"
+        else:
+            raise ExportError("v2 export requires verified attachment backing")
+    entries["domain/attachments.jsonl"] = canonical_jsonl_bytes(v2_attachments)
+    attachment_ids = {
+        _export_attachment(value).id
+        for values in (*message_attachments.values(), *attempt_attachments.values())
+        for value in values
+    }
+    if object_provenance is None:
+        identities = [("chat", chat.id)]
+        identities.extend(("message", item.id) for item in messages)
+        identities.extend(("lineage", item.lineage_id) for item in messages)
+        identities.extend(("attachment", item) for item in attachment_ids)
+        identities.extend(("attempt", item.id) for item in attempts)
+        object_provenance = tuple(
+            {"object_kind": kind, "object_id": identity,
+             "source": {"kind": "native", "immediate": None, "prior_chain": []},
+             "derivation": {"kind": "root", "predecessor": None}}
+            for kind, identity in dict.fromkeys(identities)
+        )
+    source_kinds = {
+        str(row.get("source", {}).get("kind"))
+        for row in object_provenance if isinstance(row, Mapping)
+    }
+    if not source_kinds <= {"native", "v1-bootstrap", "imported"} or not source_kinds:
+        raise ExportError("v2 object provenance is malformed")
+    entries["domain/object-provenance.jsonl"] = canonical_jsonl_bytes(
+        _json_value(item) for item in object_provenance
+    )
+    entries["domain/continuation-history.json"] = canonical_json_bytes(_json_value(
+        continuation_history if continuation_history is not None else {
+            "active_head_message_id": chat.head_message_id,
+            "anchors": [], "choices": [], "branches": [],
+        }
+    ))
+    entries["domain/history-bindings.jsonl"] = canonical_jsonl_bytes(
+        _json_value(item) for item in history_bindings
+    )
+    existing_provenance = strict_json_loads(entries["domain/provenance.json"])
+    entries["domain/provenance.json"] = canonical_json_bytes({
+        "source_origin": "native" if source_kinds == {"native"} else "imported",
+        "import_origin": "not-recorded" if source_kinds == {"native"} else "recorded",
+        "attachment_policy": attachment_policy.value,
+        "resources": existing_provenance["resources"],
+    })
+    manifest = dict(v1.manifest_base)
+    manifest["archive_version"] = 2
+    manifest["features"] = [
+        "attachments", "chat-lineage", "context-plans", "continuation-history-v1",
+        "generation-outcomes", "history-bindings-v1", "import-provenance-v1",
+        "request-time-provenance",
+    ]
+    return ArchiveProjection(
+        archive_id=archive_id, created_at=created_at, chat_id=chat.id, chat_title=chat.title,
+        attachment_policy=attachment_policy,
+        entries=tuple(
+            ArchiveLogicalEntry(
+                path, "application/octet-stream" if path.startswith("payloads/") else (
+                    "application/x-ndjson" if path.endswith(".jsonl") else "application/json"
+                ), True, content,
+            )
+            for path, content in sorted(entries.items())
+        ),
+        manifest_base=manifest,
     )

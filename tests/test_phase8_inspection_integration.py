@@ -20,6 +20,7 @@ from tests.test_phase6_context_attachments import (
 
 PHASE7_HEAD = "0010_phase7_search_navigation"
 PHASE8_HEAD = "0011_phase8_inspector_state"
+CURRENT_HEAD = "0012_phase9_archive_import"
 
 
 def _fields(projection) -> dict[str, str]:
@@ -65,7 +66,7 @@ def test_0010_upgrade_reopens_with_safe_inspector_defaults(tmp_path: Path):
         reopened.close()
     with sqlite3.connect(database) as connection:
         assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
-            PHASE8_HEAD,
+            CURRENT_HEAD,
         )
         assert connection.execute(
             "SELECT inspector_open, inspector_message_id, inspector_leaf_message_id "

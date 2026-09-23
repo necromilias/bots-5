@@ -506,11 +506,14 @@ class ProviderConfiguration:
         selected_attachments: tuple[ContextSource, ...] = (),
         parent_id: str | None = None,
         phase6: bool = False,
+        branch_model_entry_id: str | None = None,
+        branch_explicit_settings: dict[str, object] | None = None,
     ) -> tuple[PreparedGeneration, str]:
         selection = self.get_selection(chat_id)
-        if selection.selection_required or selection.model_entry_id is None:
+        selected_model_id = branch_model_entry_id or selection.model_entry_id
+        if selected_model_id is None or (branch_model_entry_id is None and selection.selection_required):
             raise StateError("chat requires an explicit model selection")
-        model = self.store.get_model_catalogue_entry(selection.model_entry_id)
+        model = self.store.get_model_catalogue_entry(selected_model_id)
         if model is None:
             raise StateError("selected model entry no longer exists")
         connection = self.store.get_provider_connection(model.connection_id)
@@ -518,6 +521,17 @@ class ProviderConfiguration:
             raise StateError("selected model connection no longer exists")
         self._ensure_model_usable(model, connection)
         settings = self._resolve_settings(chat_id, model.id)
+        if branch_explicit_settings is not None:
+            if set(branch_explicit_settings) != {"temperature", "max_output_tokens", "reasoning_effort", "timeout_seconds"}:
+                raise StateError("branch continuation settings are malformed")
+            values = settings.as_dict()
+            values.update({key: value for key, value in branch_explicit_settings.items() if value is not None})
+            _validate_settings(GenerationSettings(**values))
+            settings = ResolvedGenerationSettings(
+                float(values["temperature"]), int(values["max_output_tokens"]),
+                values["reasoning_effort"], values["timeout_seconds"],
+                {key: ("branch" if branch_explicit_settings[key] is not None else settings.provenance[key]) for key in values},
+            )
         capabilities = self.resolve_capabilities(model.id)
         by_key = {item.key: item for item in capabilities}
         streaming = by_key.get(CapabilityKey.STREAMING.value)

@@ -12,6 +12,7 @@ from bots5.domain.search import (
     SearchStatus,
 )
 from bots5.core.export import AttachmentPolicy, ChatExportSource
+from bots5.core.import_queue import QueueItem
 
 
 class AppStateStore(Protocol):
@@ -103,6 +104,12 @@ class AppStateStore(Protocol):
         """Return durable attempt-attachment metadata without opening payload bytes."""
         ...
 
+    def inspection_import_provenance(
+        self, chat_id: str, message_id: str | None = None,
+    ) -> dict[str, str]:
+        """Return display-safe imported provenance without opening payload bytes."""
+        ...
+
     def read_attachment_bytes(self, attachment_id: str) -> bytes:
         """Read and verify authoritative attachment bytes through root authority."""
         ...
@@ -119,6 +126,37 @@ class AppStateStore(Protocol):
 
     def get_chat_model_generation_config(self, chat_id: str, model_entry_id: str):
         """Return only the chat-scoped settings override and its revision."""
+        ...
+
+    def import_continuation_readiness(self, chat_id: str, base_key: str):
+        ...
+
+    def materialize_import_continuation_attachments(self, chat_id: str, base_key: str) -> tuple[str, ...]:
+        """Return the exact READY local attachments for one admitted imported branch."""
+        ...
+
+    def admit_import_continuation_choice(self, chat_id: str, base_key: str, **kwargs) -> int:
+        ...
+
+    def enqueue_archive_import(self, source, *, resolver_roots, now, queue_id=None, import_as_archived: bool = False) -> QueueItem:
+        ...
+
+    def cancel_archive_import(self, queue_id: str, *, expected_revision: int, now) -> QueueItem:
+        ...
+
+    def list_archive_imports(self, *, limit: int = 50, cursor=None):
+        ...
+
+    def reorder_archive_imports(self, expected_queue_revision: int, ordered_ids: tuple[str, ...], *, now) -> tuple[QueueItem, ...]:
+        ...
+
+    def remove_waiting_archive_import(self, queue_id: str, *, expected_revision: int, now) -> QueueItem:
+        ...
+
+    def retry_archive_import(self, queue_id: str, *, now) -> QueueItem:
+        ...
+
+    def clear_archive_import_history(self, ids: tuple[str, ...]) -> None:
         ...
 
     def next_message_sequence(self, chat_id: str) -> int:

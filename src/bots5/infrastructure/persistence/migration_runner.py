@@ -39,7 +39,8 @@ from bots5.infrastructure.rooted_sqlite_vfs import (
 
 _LEGACY_HEAD = "0009_phase6_context_attachments"
 _PHASE7_HEAD = "0010_phase7_search_navigation"
-_HEAD = "0011_phase8_inspector_state"
+_PHASE8_HEAD = "0011_phase8_inspector_state"
+_HEAD = "0012_phase9_archive_import"
 _PRIOR_REVISIONS = (
     "0001_desktop_state",
     "0002_conversation_lineage",
@@ -51,6 +52,7 @@ _PRIOR_REVISIONS = (
     "0008_catalogue_refresh_outcomes",
     _LEGACY_HEAD,
     _PHASE7_HEAD,
+    _PHASE8_HEAD,
 )
 _SUPPORTED_REVISIONS = frozenset((*_PRIOR_REVISIONS, _HEAD))
 _MIGRATION_CHAIN = (*_PRIOR_REVISIONS, _HEAD)
@@ -399,7 +401,7 @@ def _validate_record(
     target_revision = record.get("target_revision")
     if (
         record.get("journal_version") != 3
-        or target_revision not in {_LEGACY_HEAD, _PHASE7_HEAD, _HEAD}
+        or target_revision not in {_LEGACY_HEAD, _PHASE7_HEAD, _PHASE8_HEAD, _HEAD}
     ):
         raise RuntimeError("migration journal version or target is unsupported")
     source_kind = record.get("source_kind")

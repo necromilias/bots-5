@@ -36,6 +36,27 @@ def test_real_migration_creates_state_schema_and_enables_sqlite_safety(tmp_path:
                 "attachments",
                 "message_attachments",
                 "attempt_attachments",
+                "archive_continuation_anchors",
+                "archive_continuation_branches",
+                "archive_continuation_choices",
+                "archive_continuation_requirement_candidates",
+                "archive_continuation_requirements",
+                "archive_import_attachment_refs",
+                "archive_import_attempt_attachment_refs",
+                "archive_import_chats",
+                "archive_import_journal",
+                "archive_import_lineages",
+                "archive_import_message_attachment_refs",
+                "archive_import_messages",
+                "archive_import_operations",
+                "archive_import_payload_reservations",
+                "archive_import_queue",
+                "archive_import_queue_control",
+                "archive_imported_attempts",
+                "archive_imported_branch_choices",
+                "archive_imported_context_plans",
+                "archive_lineage_nodes",
+                "archive_object_derivations",
                 "context_plans",
                 "workspace_windows",
                 "search_source_state",
@@ -51,7 +72,7 @@ def test_real_migration_creates_state_schema_and_enables_sqlite_safety(tmp_path:
             with store.engine.connect() as connection:
                 assert connection.execute(text("PRAGMA foreign_keys")).scalar_one() == 1
                 assert connection.execute(text("PRAGMA journal_mode")).scalar_one().lower() == "delete"
-                assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0011_phase8_inspector_state"
+                assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0012_phase9_archive_import"
 
         now = datetime.now(timezone.utc)
         chat = Chat(str(uuid4()), "Test", now, now)

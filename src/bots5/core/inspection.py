@@ -205,15 +205,21 @@ def build_inspection_projection(
     user_content_by_attempt: Mapping[str, str | None],
     message_attachments: tuple[Attachment, ...],
     attempt_attachments: Mapping[str, tuple[Attachment, ...]],
+    import_provenance: Mapping[str, str] | None = None,
 ) -> InspectionProjection:
+    import_provenance = import_provenance or {}
     fields = [
         InspectionField("Chat", chat.title), InspectionField("Chat ID", chat.id),
         InspectionField("Chat revision", str(chat.revision)),
         InspectionField("Active head", chat.head_message_id or "none"),
         InspectionField("Historical leaf", historical_leaf_message_id or "active head"),
-        InspectionField("Import provenance", "unavailable (Phase 9 not implemented)"),
-        InspectionField("Export provenance", "not applicable (Phase 9 not implemented)"),
+        InspectionField("Import provenance", "recorded" if import_provenance else "native"),
+        InspectionField("Export provenance", "not recorded"),
     ]
+    fields.extend(
+        InspectionField(f"Import {name}", value)
+        for name, value in sorted(import_provenance.items())
+    )
     if message is None:
         fields.append(InspectionField("Message", "No message selected"))
         for attempt in attempts:

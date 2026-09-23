@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import codecs
 import errno
 import hashlib
 import os
@@ -57,6 +58,19 @@ class AttachmentTextClassification:
     representation_id: bytes | None
     ineligibility_reason: str | None
     decode_error: UnicodeDecodeError | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedAttachmentTextFacts:
+    """Streaming classification facts for a verified canonical object.
+
+    Unlike ``AttachmentTextClassification``, this intentionally never carries
+    decoded content.  Recovery only needs the durable representation identity
+    and ineligibility disposition to create its missing attachment row.
+    """
+
+    representation_id: bytes | None
+    ineligibility_reason: str | None
 
 
 def classify_attachment_text(raw: bytes) -> AttachmentTextClassification:
@@ -471,17 +485,25 @@ class _AttachmentFS:
         leaf: str,
         digest: bytes,
         byte_size: int,
-    ) -> bytes:
+        *,
+        materialize: bool = True,
+        retain_identity: bool = False,
+    ) -> bytes | None | tuple[bytes | None, object]:
         self._live()
         fd = self._open_owned(directory_fd, leaf)
         try:
             before = _identity(fd)
-            value = bytearray()
+            value = bytearray() if materialize else None
+            actual = hashlib.sha256()
+            count = 0
             while True:
                 chunk = os.read(fd, 1024 * 1024)
                 if not chunk:
                     break
-                value.extend(chunk)
+                actual.update(chunk)
+                count += len(chunk)
+                if value is not None:
+                    value.extend(chunk)
             after = _identity(fd)
             if before != after:
                 raise AttachmentIntegrityError(
@@ -489,15 +511,15 @@ class _AttachmentFS:
                 )
         finally:
             self._close_fd(fd)
-        result = bytes(value)
         if (
-            len(result) != byte_size
-            or hashlib.sha256(result).digest() != _digest(digest)
+            count != byte_size
+            or actual.digest() != _digest(digest)
         ):
             raise AttachmentIntegrityError(
                 "attachment payload does not match durable identity"
             )
-        return result
+        result = None if value is None else bytes(value)
+        return (result, before) if retain_identity else result
 
     def _present(self, directory_fd: int, leaf: str) -> bool:
         self._live()
@@ -552,6 +574,170 @@ class _AttachmentFS:
                 "required attachment payload integrity failure"
             )
             raise
+
+    def verify_object(self, digest: bytes, *, expected_size: int) -> None:
+        """Check a canonical blob with bounded reads without copying it to RAM."""
+        self._live()
+        leaf = digest_to_text(digest)
+        try:
+            self._read_verified(
+                self._objects_fd, leaf, digest, expected_size, materialize=False,
+            )
+        except AttachmentIntegrityError:
+            self._authority.poison("required attachment payload integrity failure")
+            raise
+
+    def classify_verified_object(
+        self, digest: bytes, *, expected_size: int
+    ) -> VerifiedAttachmentTextFacts:
+        """Hash and classify one canonical object through one owned descriptor.
+
+        This deliberately does not call ``read_verified``: startup reconciliation
+        needs the exact Phase 6 classification for a ready CAS object which has
+        not yet acquired an ``attachments`` backing row.  The bytes are streamed
+        through the same descriptor-relative identity and hash checks as every
+        other canonical-object proof.  Recovery needs no decoded content, so
+        every decoded chunk is discarded after UTF-8/NUL classification.
+        """
+        self._live()
+        digest = _digest(digest)
+        if type(expected_size) is not int or expected_size < 0:
+            raise AttachmentIntegrityError("attachment byte size is invalid")
+        fd = self._open_owned(self._objects_fd, digest_to_text(digest))
+        try:
+            before = _identity(fd)
+            actual = hashlib.sha256()
+            decoder = codecs.getincrementaldecoder("utf-8")("strict")
+            decode_error: UnicodeDecodeError | None = None
+            saw_nul = False
+            count = 0
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                actual.update(chunk)
+                count += len(chunk)
+                if decode_error is None:
+                    try:
+                        text = decoder.decode(chunk, final=False)
+                    except UnicodeDecodeError as exc:
+                        decode_error = exc
+                    else:
+                        saw_nul = saw_nul or "\x00" in text
+            if decode_error is None:
+                try:
+                    text = decoder.decode(b"", final=True)
+                except UnicodeDecodeError as exc:
+                    decode_error = exc
+                else:
+                    saw_nul = saw_nul or "\x00" in text
+            after = _identity(fd)
+            if before != after:
+                raise AttachmentIntegrityError("attachment artifact changed while read")
+        finally:
+            self._close_fd(fd)
+        if count != expected_size or actual.digest() != digest:
+            self._authority.poison("required attachment payload integrity failure")
+            raise AttachmentIntegrityError("attachment payload does not match durable identity")
+        if decode_error is not None:
+            return VerifiedAttachmentTextFacts(
+                representation_id=None,
+                ineligibility_reason="invalid_utf8",
+            )
+        if saw_nul:
+            return VerifiedAttachmentTextFacts(
+                representation_id=None,
+                ineligibility_reason="contains_nul",
+            )
+        return VerifiedAttachmentTextFacts(
+            representation_id=actual.digest(),
+            ineligibility_reason=None,
+        )
+
+    def verified_object_identity(self, digest: bytes, *, expected_size: int) -> object:
+        """Hash-verify a canonical object and retain its stable inode identity."""
+        try:
+            _value, identity = self._read_verified(
+                self._objects_fd, digest_to_text(digest), digest, expected_size,
+                materialize=False, retain_identity=True,
+            )
+            return identity
+        except AttachmentIntegrityError:
+            self._authority.poison("required attachment payload integrity failure")
+            raise
+
+    def object_identity(self, digest: bytes) -> object:
+        self._live()
+        fd = self._open_owned(self._objects_fd, digest_to_text(digest))
+        try:
+            return _identity(fd)
+        finally:
+            self._close_fd(fd)
+
+    def capture_verified_snapshot(
+        self, snapshot, digest: bytes, byte_size: int, *, filename: str = "imported-payload",
+    ) -> CapturedAttachment:
+        """Copy one sealed anonymous snapshot directly into the capture namespace."""
+        self._live()
+        digest = _digest(digest)
+        if type(byte_size) is not int or byte_size < 0:
+            raise AttachmentIntegrityError("attachment byte size is invalid")
+        operation_id = str(uuid7())
+        capture_fd = -1
+        try:
+            snapshot.seek(0)
+            capture_fd = os.open(
+                operation_id,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=self._captures_fd,
+            )
+            self._track_fd("capture", capture_fd)
+            os.fchmod(capture_fd, 0o600)
+            actual = hashlib.sha256()
+            remaining = byte_size
+            while remaining:
+                block = snapshot.read(min(1024 * 1024, remaining))
+                if not block:
+                    raise AttachmentIntegrityError("sealed attachment snapshot is truncated")
+                actual.update(block)
+                _write_all(capture_fd, block)
+                remaining -= len(block)
+            if snapshot.read(1):
+                raise AttachmentIntegrityError("sealed attachment snapshot length changed")
+            if actual.digest() != digest:
+                raise AttachmentIntegrityError("sealed attachment snapshot changed")
+            os.fsync(capture_fd)
+            _fault("after-capture-file-fsync")
+            os.fsync(self._captures_fd)
+            _fault("after-capture-directory-fsync")
+        except BaseException:
+            if capture_fd >= 0:
+                closing_fd = capture_fd
+                capture_fd = -1
+                self._close_fd(closing_fd)
+            try:
+                os.unlink(operation_id, dir_fd=self._captures_fd)
+                os.fsync(self._captures_fd)
+            except FileNotFoundError:
+                pass
+            except BaseException as exc:
+                raise AttachmentCleanupUncertain(
+                    "attachment capture cleanup durability is uncertain"
+                ) from exc
+            raise
+        finally:
+            if capture_fd >= 0:
+                self._close_fd(capture_fd)
+        return CapturedAttachment(
+            digest=digest,
+            byte_size=byte_size,
+            operation_id=operation_id,
+            filename=_safe_filename(filename),
+            text=None,
+            representation_id=None,
+            ineligibility_reason=None,
+        )
 
     def discard_capture(self, operation_id: str) -> None:
         self._live()
@@ -869,6 +1055,29 @@ class _AttachmentFS:
                 raise AttachmentIntegrityError(
                     "attachment inventory cannot be observed safely"
                 ) from exc
+
+    def namespace_capacity(self, area: str) -> tuple[int, int, int]:
+        """Return rooted namespace device, available bytes, and allocation unit."""
+        self._live()
+        descriptor = {
+            "objects": self._objects_fd,
+            "staging": self._staging_fd,
+            "captures": self._captures_fd,
+            "gc": self._gc_fd,
+        }.get(area)
+        if descriptor is None:
+            raise AttachmentIntegrityError("unknown attachment capacity namespace")
+        try:
+            status = os.fstatvfs(descriptor)
+            identity = os.fstat(descriptor)
+        except OSError as exc:
+            raise AttachmentIntegrityError(
+                "attachment namespace capacity cannot be observed safely"
+            ) from exc
+        unit = status.f_frsize or status.f_bsize
+        if unit <= 0:
+            raise AttachmentIntegrityError("attachment namespace allocation unit is invalid")
+        return identity.st_dev, status.f_bavail * unit, unit
 
 
 def _open_attachment_fs(authority: DataRootAuthority) -> _AttachmentFS:

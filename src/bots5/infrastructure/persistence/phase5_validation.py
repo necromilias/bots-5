@@ -117,6 +117,7 @@ def validate_phase5_snapshot(
     model: object,
     provider_id: object,
     user_message_content: object | None = None,
+    allow_branch_settings_provenance: bool = False,
 ) -> dict[str, object]:
     try:
         snapshot = json.loads(
@@ -209,7 +210,13 @@ def validate_phase5_snapshot(
         raise ValueError("Phase 5 effective settings are invalid")
     if not isinstance(provenance, dict) or set(provenance) != _SETTING_KEYS:
         raise ValueError("Phase 5 settings provenance is invalid")
-    if any(type(value) is not str or value not in {"application", "model", "chat_model"} for value in provenance.values()):
+    allowed_provenance = {"application", "model", "chat_model"}
+    # Archive continuation has an additive v3 admission path.  Its immutable,
+    # branch-owned override is validated by the current Phase 6 caller and
+    # persisted choice CAS; plain v2 validation never enables this vocabulary.
+    if allow_branch_settings_provenance:
+        allowed_provenance.add("branch")
+    if any(type(value) is not str or value not in allowed_provenance for value in provenance.values()):
         raise ValueError("Phase 5 settings provenance is invalid")
     temperature = settings["temperature"]
     if type(temperature) not in {int, float} or isinstance(temperature, bool) or not math.isfinite(temperature) or not 0 <= temperature <= 2:

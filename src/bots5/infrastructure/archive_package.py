@@ -30,6 +30,7 @@ from bots5.core.export import (
 )
 from bots5.core.interchange import InterchangeError, canonical_json_bytes, logical_content_digest, parse_jsonl, sha256_hex, strict_json_loads
 from bots5.domain.provider import CAPABILITY_KEYS, CapabilityState, validate_capability_value
+from bots5.infrastructure.archive_v2 import ArchiveV2Error, ArchiveV2Unsupported, validate_v2
 
 
 MAX_ENTRIES = 4096
@@ -210,6 +211,10 @@ class ArchivePackageError(ValueError):
     pass
 
 
+class ArchiveUnsupportedError(ArchivePackageError):
+    """The package declares a future semantic this build cannot interpret."""
+
+
 @dataclass(frozen=True, slots=True)
 class ArchiveValidationResult:
     archive_id: str
@@ -254,6 +259,12 @@ def _inventory(entries: tuple[ArchiveLogicalEntry, ...]) -> list[dict[str, objec
 
 
 def archive_bytes(projection: ArchiveProjection) -> bytes:
+    if projection.manifest_base.get("archive_version") == 2:
+        from .archive_v2 import archive_v2_bytes
+        return archive_v2_bytes(
+            projection.manifest_base,
+            {entry.path: entry.content for entry in projection.entries},
+        )
     import io
     stream = io.BytesIO()
     _write(projection, stream)
@@ -552,6 +563,27 @@ def validate_archive(source: Path | BinaryIO) -> ArchiveValidationResult:
                 raise ArchivePackageError("COMPLETED must be the final zero-length entry")
             manifest = _json_object(contents["manifest.json"], "manifest")
             _reject_secret_shaped_fields(manifest)
+            version = manifest.get("archive_version")
+            if type(version) is int and version not in {1, 2}:
+                raise ArchiveUnsupportedError("Archive version is unsupported")
+            if version == 1:
+                unknown_members = names - {"manifest.json", "COMPLETED"} - _REQUIRED
+                if any(not name.startswith("payloads/sha256/") for name in unknown_members):
+                    raise ArchiveUnsupportedError("Archive member is unsupported")
+            # The frozen v1 branch below remains exact.  V2 gets a separate
+            # closed validator so no v1 optionality or graph assumption is
+            # accidentally reinterpreted as an import-provenance language.
+            if manifest.get("archive_version") == 2:
+                try:
+                    result = validate_v2(manifest, names, contents, total_size=total)
+                except ArchiveV2Unsupported as exc:
+                    raise ArchiveUnsupportedError("Archive v2 semantic is unsupported") from exc
+                except ArchiveV2Error as exc:
+                    raise ArchivePackageError("Archive v2 is invalid") from exc
+                return ArchiveValidationResult(
+                    result.archive_id, result.logical_content_digest,
+                    result.entry_count, result.total_uncompressed_size,
+                )
             _validate_manifest(manifest, names, contents)
             for name in _JSON:
                 _reject_secret_shaped_fields(_json_object(contents[name], name))
@@ -789,7 +821,11 @@ def _validate_message(value: object, chat_id: str) -> Mapping[str, object]:
     return row
 
 
-def _validate_provenance(value: object) -> Mapping[str, object]:
+def _validate_provenance(
+    value: object,
+    *,
+    settings_provenance_values: frozenset[str] = _SETTINGS_PROVENANCE,
+) -> Mapping[str, object]:
     fields = {"status", "snapshot_version", "attribution"}
     if type(value) is not dict or type(value.get("status")) is not str:
         _fail("request-time provenance is malformed")
@@ -843,7 +879,7 @@ def _validate_provenance(value: object) -> Mapping[str, object]:
             _fail("request settings are invalid")
         provenance = _exact_mapping(row["settings_provenance"], {"temperature", "max_output_tokens", "reasoning_effort", "timeout_seconds"}, "request settings provenance")
         for item in provenance.values():
-            _member(item, _SETTINGS_PROVENANCE, "request settings provenance")
+            _member(item, settings_provenance_values, "request settings provenance")
         if type(row["capabilities"]) is not list or type(row["manual_overrides"]) is not dict or type(row["omitted_settings"]) is not dict:
             _fail("request-time provenance values are malformed")
         capabilities: dict[str, Mapping[str, object]] = {}
@@ -964,7 +1000,13 @@ def _validate_safe_context(value: object) -> Mapping[str, object]:
     return context
 
 
-def _validate_attempt(value: object, chat_id: str, messages: Mapping[str, Mapping[str, object]]) -> Mapping[str, object]:
+def _validate_attempt(
+    value: object,
+    chat_id: str,
+    messages: Mapping[str, Mapping[str, object]],
+    *,
+    settings_provenance_values: frozenset[str] = _SETTINGS_PROVENANCE,
+) -> Mapping[str, object]:
     fields = {"source_id", "chat_id", "user_message_id", "assistant_message_id", "backend_id", "provider_id", "model", "state", "started_at", "ended_at", "finish_reason", "failure", "returned_model", "prompt_tokens", "completion_tokens", "reasoning_tokens", "total_tokens", "known_cost_usd", "remote_outcome_unknown", "request_time_provenance"}
     row = _exact_mapping(value, fields, "attempt")
     attempt_id = _text(row["source_id"], "attempt ID")
@@ -1026,7 +1068,10 @@ def _validate_attempt(value: object, chat_id: str, messages: Mapping[str, Mappin
         _decimal(row["known_cost_usd"], "attempt known cost")
     if row["remote_outcome_unknown"] is not None:
         _boolean(row["remote_outcome_unknown"], "attempt remote outcome flag")
-    provenance = _validate_provenance(row["request_time_provenance"])
+    provenance = _validate_provenance(
+        row["request_time_provenance"],
+        settings_provenance_values=settings_provenance_values,
+    )
     _validate_remote_outcome(row, state, provenance)
     attribution = provenance.get("attribution")
     if attribution is None:

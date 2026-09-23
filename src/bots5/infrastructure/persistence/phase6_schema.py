@@ -366,12 +366,20 @@ def validate_phase6_schema(connection, *, destructive: bool = True) -> None:
         "SELECT version_num FROM alembic_version"
     ).scalar_one_or_none()
     phase7_additions: set[str] = set()
-    if revision in {"0010_phase7_search_navigation", "0011_phase8_inspector_state"}:
-        # Phase 6 remains exact at revision 0009.  Later Phase 7/8 revisions
+    if revision in {"0010_phase7_search_navigation", "0011_phase8_inspector_state", "0012_phase9_archive_import"}:
+        # Phase 6 remains exact at revision 0009.  Later Phase 7/8/9 revisions
         # may add only the closed Phase 7 trigger set to Phase 6-owned tables.
         from .phase7_schema import PHASE7_TRIGGER_NAMES
 
         phase7_additions = set(PHASE7_TRIGGER_NAMES)
+        if revision == "0012_phase9_archive_import":
+            # These two additive current-schema guards extend deletion
+            # protection to Phase 9 imported reservations.  They do not
+            # replace or loosen any Phase 6 trigger.
+            phase7_additions.update({
+                "phase9_import_attachment_delete_guard",
+                "phase9_import_blob_delete_guard",
+            })
     required_names = {*REQUIRED_TABLES, *REQUIRED_TRIGGERS, *REQUIRED_INDEXES}
     unexpected = sorted(
         str(name)
@@ -391,6 +399,16 @@ def validate_phase6_schema(connection, *, destructive: bool = True) -> None:
             + ", ".join(unexpected)
         )
     for name, expected_sql in canonical.items():
+        if revision == "0012_phase9_archive_import" and name == "phase6_attempt_attachment_insert_guard":
+            current_tokens = actual.get(name, ())
+            required_tokens = {
+                "bare:archive_continuation_branches",
+                "bare:archive_continuation_requirement_candidates",
+                "bare:message_attachments",
+                "bare:json_each",
+            }
+            if required_tokens.issubset(current_tokens):
+                continue
         if actual.get(name) != expected_sql:
             kind = (
                 "trigger" if name in REQUIRED_TRIGGERS
@@ -942,6 +960,9 @@ def _validate_phase6_rows(connection) -> None:
         ]
         if ordinal < 0 or ordinal >= len(selected) or selected[ordinal] != attachment_id:
             raise RuntimeError("current Phase 6 message attachment reference is not plan-coherent")
+    revision = connection.exec_driver_sql(
+        "SELECT version_num FROM alembic_version"
+    ).scalar_one_or_none()
     refs = connection.exec_driver_sql(
         "SELECT attempt_id, attachment_id, ordinal FROM attempt_attachments"
     ).fetchall()
@@ -957,12 +978,22 @@ def _validate_phase6_rows(connection) -> None:
         ]
         if ordinal < 0 or ordinal >= len(selected) or selected[ordinal] != attachment_id:
             raise RuntimeError("current Phase 6 attempt attachment reference is not plan-coherent")
-        if connection.exec_driver_sql(
+        native_owner = connection.exec_driver_sql(
             "SELECT 1 FROM message_attachments m "
             "JOIN generation_attempts a ON a.user_message_id = m.message_id "
             "WHERE a.id = ? AND m.attachment_id = ? AND m.ordinal = ?",
             (attempt_id, attachment_id, ordinal),
-        ).first() is None:
+        ).first()
+        imported_owner = connection.exec_driver_sql(
+            "SELECT 1 FROM archive_continuation_branches b "
+            "JOIN archive_continuation_requirement_candidates c "
+            "ON c.chat_id=b.chat_id AND c.base_key=b.base_key AND c.ordinal=? "
+            "JOIN archive_import_attachment_refs r "
+            "ON r.id=c.imported_ref_id AND r.attachment_id=? AND r.availability='READY' "
+            "WHERE b.attempt_id=?",
+            (ordinal, attachment_id, attempt_id),
+        ).first() if revision == "0012_phase9_archive_import" else None
+        if native_owner is None and imported_owner is None:
             raise RuntimeError("current Phase 6 attempt reference has no message reference")
 
 

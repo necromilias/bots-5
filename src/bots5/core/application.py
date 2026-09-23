@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from threading import Event
+from pathlib import Path
 from contextlib import asynccontextmanager, contextmanager, nullcontext
 from contextvars import Context
 from dataclasses import dataclass, replace
@@ -57,10 +59,15 @@ from .export import (
     TranscriptExport,
     TranscriptScope,
     build_archive_projection,
+    build_archive_v2_projection,
     build_transcript,
+    select_archive_version,
 )
 from .ports import AppStateStore
 from .provider_configuration import ProviderConfiguration
+from .import_queue import CutoffResult, ImportQueueState, OwnedImportWorkers, QueueItem
+from .archive_import import RESOLUTION_CANCELLED
+from .import_history import ContinuationReadiness
 from .secrets import SecretStoreError, reject_secret_material, sanitize_secret_error
 from bots5.providers.discovery import ModelDiscoveryError
 
@@ -101,9 +108,10 @@ class TerminalCloseResult:
 
 _CLOSE_PRECEDENCE = {
     "store": 0,
-    "execution": 1,
-    "reconciliation": 2,
-    "events": 3,
+    "imports": 1,
+    "execution": 2,
+    "reconciliation": 3,
+    "events": 4,
 }
 
 
@@ -150,6 +158,17 @@ def _abandon_task(task: asyncio.Task[object]) -> None:
     if not task.done():
         task.cancel()
 
+    def consume(completed: asyncio.Task[object]) -> None:
+        try:
+            completed.result()
+        except BaseException:
+            pass
+
+    task.add_done_callback(consume)
+
+
+def _observe_background_task(task: asyncio.Task[object]) -> None:
+    """Consume a private scheduler exception after the store has failed closed."""
     def consume(completed: asyncio.Task[object]) -> None:
         try:
             completed.result()
@@ -218,6 +237,7 @@ class BotsApplication:
         api_key_env: str | None = None,
         configuration: ProviderConfiguration | None = None,
         generation_mode: GenerationMode | str | None = None,
+        import_workers: OwnedImportWorkers | None = None,
     ) -> None:
         self._store = store
         self._events = events
@@ -225,6 +245,10 @@ class BotsApplication:
         self._ids = ids or Uuid7Factory()
         self._clock = clock or SystemClock()
         self._execution = execution or ExecutionManager()
+        # Import workers own a distinct cancellable-preflight/durable-settle
+        # lifecycle, but share this application's store authority.
+        self._import_workers = import_workers or OwnedImportWorkers(store)
+        self._import_scheduler: asyncio.Task[None] | None = None
         self._backend_id = backend_id
         self._model = model
         self._provider_id = provider_id
@@ -286,6 +310,15 @@ class BotsApplication:
             self._store.issued_event_effect,
         )
         self._store.reconcile_interrupted_generations(self._clock.now())
+        # Desktop construction normally happens inside its event loop.  A
+        # Synchronous bootstrap activates the same private drain when its
+        # event loop starts; command paths also ensure it for embedded users.
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            self._ensure_import_scheduler()
 
     @property
     def generation_mode(self) -> GenerationMode:
@@ -597,6 +630,10 @@ class BotsApplication:
                 attempt.id: self._store.list_attempt_attachment_metadata(attempt.id)
                 for attempt in attempts
             },
+            import_provenance=(
+                self._store.inspection_import_provenance(chat_id, message.id if message else None)
+                if hasattr(self._store, "inspection_import_provenance") else {}
+            ),
         )
 
     @_tracked_command
@@ -618,7 +655,8 @@ class BotsApplication:
 
     @_tracked_command
     async def prepare_archive_export(
-        self, chat_id: str, *, attachment_policy: AttachmentPolicy = AttachmentPolicy.EMBEDDED
+        self, chat_id: str, *, attachment_policy: AttachmentPolicy = AttachmentPolicy.EMBEDDED,
+        archive_version: int | None = None,
     ) -> ArchiveProjection:
         """Build an Archive v1 projection without writing or mutating domain state."""
         self._ensure_open()
@@ -632,7 +670,13 @@ class BotsApplication:
             for item in source.messages
         ):
             raise StateError("Archive v1 refuses chats with a running generation")
-        return build_archive_projection(
+        version = select_archive_version(
+            requested=archive_version,
+            has_import_provenance=source.requires_v2,
+            has_missing_external_reference=False,
+        )
+        builder = build_archive_v2_projection if version == 2 else build_archive_projection
+        return builder(
             archive_id=self._ids.new(), created_at=source.captured_at, chat=source.chat,
             messages=source.messages, attempts=source.attempts, message_attachments=source.message_attachments,
             attempt_attachments=source.attempt_attachments, payloads={
@@ -641,8 +685,14 @@ class BotsApplication:
                 for item in values if item.payload is not None
             },
             attachment_policy=attachment_policy, chat_configuration=source.chat_configuration,
-            application_version="0.1.0", migration_revision="0011_phase8_inspector_state",
+            application_version="0.1.0", migration_revision="0012_phase9_archive_import",
             context_plans=source.context_plans,
+            **({
+                "object_provenance": source.object_provenance,
+                "continuation_history": source.continuation_history,
+                "history_bindings": source.history_bindings,
+                "archived_attempt_provenance": source.archived_attempt_provenance,
+            } if version == 2 else {}),
         )
 
     @_tracked_command
@@ -967,6 +1017,7 @@ class BotsApplication:
         assistant_message: Message,
         attempt_id: str,
         now,
+        continuation=None,
     ) -> tuple[GenerationRequest, GenerationAttempt, ContextPlan | None]:
         context_plan: ContextPlan | None = None
         if self._generation_mode is GenerationMode.CONFIGURED:
@@ -993,6 +1044,8 @@ class BotsApplication:
                 selected_attachments=selected_attachments,
                 parent_id=user_message.parent_id,
                 phase6=phase6,
+                branch_model_entry_id=None if continuation is None else continuation.local_model_entry_id,
+                branch_explicit_settings=None if continuation is None else continuation.explicit_settings,
             )
             context_plan = prepared.context_plan
             request = prepared.request
@@ -1571,6 +1624,209 @@ class BotsApplication:
         return stored
 
     @_tracked_command
+    async def import_continuation_readiness(self, chat_id: str, base_key: str) -> ContinuationReadiness | None:
+        self._ensure_open()
+        return self._store.import_continuation_readiness(chat_id, base_key)
+
+    @_tracked_command
+    async def choose_import_continuation(
+        self, chat_id: str, base_key: str, *, expected_choice_revision: int,
+        connection_id: str, model_entry_id: str, explicit_settings: dict[str, object],
+        excluded_refs: tuple[dict[str, object], ...],
+    ) -> int:
+        self._ensure_open()
+        return self._store.admit_import_continuation_choice(
+            chat_id, base_key, expected_choice_revision=expected_choice_revision,
+            connection_id=connection_id, model_entry_id=model_entry_id,
+            explicit_settings=explicit_settings, excluded_refs=excluded_refs, now=self._clock.now(),
+        )
+
+    @_tracked_command
+    async def enqueue_archive_import(
+        self,
+        source: Path | str,
+        *,
+        resolver_roots: tuple[Path | str, ...] = (),
+        import_as_archived: bool = False,
+    ) -> QueueItem:
+        """Durably queue one import; the private scheduler owns execution."""
+        self._ensure_open()
+        queued = self._store.enqueue_archive_import(
+            source, resolver_roots=resolver_roots, now=self._clock.now(),
+            import_as_archived=import_as_archived,
+        )
+        self._ensure_import_scheduler()
+        return queued
+
+    @_tracked_command
+    async def cancel_archive_import(self, queue_id: str, *, expected_revision: int) -> QueueItem:
+        """Durably cancel only an import that has not crossed its journal cutoff."""
+        self._ensure_open()
+        # The cutoff worker can be holding the authority transition in its
+        # own thread.  The UI command must wait for that durable CAS without
+        # freezing the event loop that may release the worker's testable or
+        # shutdown barrier.  A fresh context lets the store take its explicit
+        # independent admission rather than copying this command's task grant.
+        cancelled = await asyncio.to_thread(
+            lambda: Context().run(
+                self._store.cancel_archive_import,
+                queue_id, expected_revision=expected_revision, now=self._clock.now(),
+            )
+        )
+        self._import_workers.cancel_preflight(queue_id)
+        return cancelled
+
+    @_tracked_command
+    async def list_archive_imports(self, *, limit: int = 50, cursor: tuple[int, str] | None = None):
+        self._ensure_open()
+        self._ensure_import_scheduler()
+        return self._store.list_archive_imports(limit=limit, cursor=cursor)
+
+    @_tracked_command
+    async def reorder_archive_imports(self, expected_queue_revision: int, ordered_ids: tuple[str, ...]) -> tuple[QueueItem, ...]:
+        self._ensure_open()
+        return self._store.reorder_archive_imports(expected_queue_revision, ordered_ids, now=self._clock.now())
+
+    @_tracked_command
+    async def remove_waiting_archive_import(self, queue_id: str, *, expected_revision: int) -> QueueItem:
+        self._ensure_open()
+        removed = self._store.remove_waiting_archive_import(queue_id, expected_revision=expected_revision, now=self._clock.now())
+        self._import_workers.cancel_preflight(queue_id)
+        return removed
+
+    @_tracked_command
+    async def retry_archive_import(self, queue_id: str) -> QueueItem:
+        self._ensure_open()
+        queued = self._store.retry_archive_import(queue_id, now=self._clock.now())
+        self._ensure_import_scheduler()
+        return queued
+
+    @_tracked_command
+    async def clear_archive_import_history(self, ids: tuple[str, ...]) -> None:
+        self._ensure_open()
+        self._store.clear_archive_import_history(ids)
+
+    def _ensure_import_scheduler(self) -> None:
+        """Start the one private queue consumer from an application command."""
+        scheduler = self._import_scheduler
+        if scheduler is None or scheduler.done():
+            self._import_scheduler = asyncio.create_task(
+                self._drain_archive_import_queue(), name="archive-import-scheduler",
+            )
+            _observe_background_task(self._import_scheduler)
+
+    async def _drain_archive_import_queue(self) -> None:
+        """Claim one durable waiting item at a time; never expose lifecycle control."""
+        cursor = None
+        while self._close_state is ApplicationCloseState.OPEN:
+            # Queue bookkeeping is a bounded, indexed page read; the accepted
+            # design keeps only heavy external scan/hash work in bounded
+            # executor threads.  Run the poll in this task's own turn so an
+            # idle scheduler can never hold a forward application grant (and
+            # its rooted-VFS database resource) alongside foreground commands
+            # and their poison ordering.
+            page = self._store.list_archive_imports(limit=1000, cursor=cursor)
+            waiting = next(
+                (item for item in page.items if item.state is ImportQueueState.QUEUED),
+                None,
+            )
+            if waiting is None:
+                if page.next_cursor is None:
+                    return
+                cursor = page.next_cursor
+                continue
+            cursor = None
+            task = self._start_archive_import_worker(waiting.id)
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and current.cancelled():
+                    raise
+                # A worker may report deferred cancellation after its owned
+                # settlement.  That is not a scheduler cancellation; continue
+                # with the next durable queue item.
+                continue
+            except StateError:
+                # Preflight records malformed/replaced intake as a durable
+                # terminal result.  Querying again selects the next request;
+                # any authority failure is still surfaced by that read.
+                continue
+
+    def _start_archive_import_worker(self, queue_id: str) -> asyncio.Task[object]:
+        """Private bridge from the scheduler to the owned worker lifetime."""
+        self._ensure_open()
+
+        async def preflight():
+            # Snapshot capture performs only bounded synchronous I/O in its
+            # own thread.  If caller cancellation wins, wait for that thread
+            # to observe the callback and release any completed sealed plan.
+            cancelled = Event()
+            task = asyncio.create_task(asyncio.to_thread(
+                lambda: Context().run(
+                    self._store.preflight_archive_import, queue_id,
+                    cancelled=cancelled.is_set,
+                ),
+            ))
+            deferred_cancellations = 0
+            while True:
+                try:
+                    prepared = await asyncio.shield(task)
+                    break
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    deferred_cancellations += 1
+                    current = asyncio.current_task()
+                    if current is not None:
+                        current.uncancel()
+                except BaseException:
+                    if deferred_cancellations:
+                        raise asyncio.CancelledError
+                    raise
+            if deferred_cancellations:
+                prepared.close()
+                raise asyncio.CancelledError
+            return prepared
+
+        async def cutoff(prepared) -> CutoffResult:
+            # This exact owned plan alone crosses the durable cutoff.
+            cancelled = Event()
+            task = asyncio.create_task(asyncio.to_thread(
+                lambda: Context().run(
+                    self._store.cross_archive_import_cutoff, prepared, now=self._clock.now(),
+                    cancelled=cancelled.is_set,
+                ),
+            ))
+            deferred_cancellations = 0
+            while True:
+                try:
+                    return CutoffResult(
+                        await asyncio.shield(task), deferred_cancellations,
+                    )
+                except asyncio.CancelledError:
+                    # The in-flight durable CAS must decide whether it crossed
+                    # the cutoff.  Retain the independent thread and report
+                    # cancellation only after its exact settlement drains.
+                    deferred_cancellations += 1
+                    cancelled.set()
+                    current = asyncio.current_task()
+                    if current is not None:
+                        current.uncancel()
+                except StateError as exc:
+                    if deferred_cancellations and str(exc) == RESOLUTION_CANCELLED:
+                        raise asyncio.CancelledError from exc
+                    raise
+
+        async def settle(cutoff_plan) -> str:
+            # Post-cutoff graph settlement uses the retained plan and is
+            # drained by the private worker before store/root release.
+            return await asyncio.to_thread(
+                lambda: Context().run(self._store.settle_archive_import, cutoff_plan),
+            )
+
+        return self._import_workers.start(preflight, cutoff, settle, queue_id=queue_id)
+
+    @_tracked_command
     async def send_message(self, chat_id: str, text: str) -> GenerationAttempt:
         self._ensure_open()
         if not text.strip():
@@ -1579,6 +1835,16 @@ class BotsApplication:
         if chat is None:
             raise StateError(f"chat not found: {chat_id}")
         self._ensure_chat_has_no_active_generation(chat_id)
+        continuation = (
+            None if chat.head_message_id is None
+            else self._store.import_continuation_readiness(chat_id, chat.head_message_id)
+        )
+        if continuation is not None:
+            if continuation.choice_revision < 1 or continuation.local_model_entry_id is None or continuation.resolution == "UNAVAILABLE":
+                raise StateError("imported continuation requires a ready explicit choice")
+            self._pending_attachment_ids[chat_id] = self._store.materialize_import_continuation_attachments(
+                chat_id, chat.head_message_id
+            )
 
         now = self._clock.now()
         user_message = Message(
@@ -1604,6 +1870,7 @@ class BotsApplication:
             assistant_message=assistant_message,
             attempt_id=self._ids.new(),
             now=now,
+            continuation=continuation,
         )
         self._store.persist_generation_start(
             replace(
@@ -1618,6 +1885,8 @@ class BotsApplication:
             expected_chat_revision=chat.revision,
             context_plan=context_plan,
             attachment_ids=self._pending_attachment_ids.get(chat_id, ()),
+            continuation_branch=None if continuation is None else (chat.head_message_id, continuation.choice_revision),
+            continuation_first_message_id=None if continuation is None else user_message.id,
         )
         self._pending_attachment_ids.pop(chat_id, None)
         self._track_generation(assistant_message, attempt)
@@ -1641,6 +1910,82 @@ class BotsApplication:
         return attempt
 
     @_tracked_command
+    async def branch_from_message(
+        self, chat_id: str, base_message_id: str, text: str, *, expected_chat_revision: int,
+    ) -> GenerationAttempt:
+        """Start one new native leaf from an intact historical assistant base."""
+        self._ensure_open()
+        if not text.strip():
+            raise StateError("message text must not be empty")
+        chat = self._store.get_chat(chat_id)
+        if chat is None:
+            raise StateError(f"chat not found: {chat_id}")
+        if expected_chat_revision != chat.revision:
+            raise RevisionConflict(f"chat revision changed: {chat_id}")
+        self._ensure_chat_has_no_active_generation(chat_id)
+        base = self._store.get_message(base_message_id)
+        if base is None or base.chat_id != chat_id or base.role is not MessageRole.ASSISTANT:
+            raise StateError("branch base must be an assistant message in the current chat")
+        continuation = self._store.import_continuation_readiness(chat_id, base_message_id)
+        if continuation is None or continuation.choice_revision < 1 or continuation.local_model_entry_id is None or continuation.resolution == "UNAVAILABLE":
+            raise StateError("historical branch requires a ready explicit choice")
+        self._pending_attachment_ids[chat_id] = self._store.materialize_import_continuation_attachments(
+            chat_id, base_message_id
+        )
+        now = self._clock.now()
+        user_message = Message(
+            id=self._ids.new(), chat_id=chat_id, role=MessageRole.USER,
+            state=MessageState.SENT, content=text,
+            sequence=self._store.next_message_sequence(chat_id), created_at=now,
+            parent_id=base_message_id, lineage_id=self._ids.new(),
+        )
+        assistant_message = self._new_assistant(
+            chat_id=chat_id, user_message=user_message,
+            sequence=user_message.sequence + 1, now=now,
+        )
+        request, attempt, context_plan = self._request_and_attempt(
+            chat_id=chat_id, user_message=user_message, assistant_message=assistant_message,
+            attempt_id=self._ids.new(), now=now, continuation=continuation,
+        )
+        self._store.persist_generation_start(
+            replace(chat, updated_at=now, head_message_id=assistant_message.id, revision=chat.revision + 1),
+            user_message, assistant_message, attempt, expected_chat_revision=expected_chat_revision,
+            context_plan=context_plan, attachment_ids=self._pending_attachment_ids.get(chat_id, ()),
+            continuation_branch=(base_message_id, continuation.choice_revision),
+            continuation_first_message_id=user_message.id,
+        )
+        self._pending_attachment_ids.pop(chat_id, None)
+        self._track_generation(assistant_message, attempt)
+        await self._events.publish("message_sent", chat_id=chat_id, message_id=user_message.id, attempt_id=attempt.id)
+        await self._events.publish("generation_started", chat_id=chat_id, message_id=assistant_message.id,
+            attempt_id=attempt.id, lineage_id=assistant_message.lineage_id, revision=assistant_message.revision)
+        self._ensure_open()
+        await self._start_generation(request, assistant_message, attempt)
+        self._ensure_open()
+        return attempt
+
+    def _imported_edit_continuation(
+        self, chat_id: str, target: Message, now,
+    ) -> tuple[ContinuationReadiness, str] | None:
+        """Resolve the imported turn anchor for one explicit local edit.
+
+        The imported user remains immutable source history.  This helper only
+        prepares a local continuation anchor on that user, appends the edit's
+        explicit choice, and materializes its READY attachment requirements.
+        """
+        readiness = self._store.prepare_imported_user_edit_continuation(
+            chat_id, target.id, now=now,
+        )
+        if readiness is None:
+            return None
+        if readiness.choice_revision < 1 or readiness.local_model_entry_id is None:
+            raise StateError("imported edit continuation choice was not admitted")
+        self._pending_attachment_ids[chat_id] = (
+            self._store.materialize_import_continuation_attachments(chat_id, target.id)
+        )
+        return readiness, target.id
+
+    @_tracked_command
     async def edit_message(self, chat_id: str, message_id: str, text: str) -> GenerationAttempt:
         self._ensure_open()
         if not text.strip():
@@ -1652,9 +1997,15 @@ class BotsApplication:
         target = self._active_branch_contains(chat_id, message_id)
         if target.role != MessageRole.USER or target.state != MessageState.SENT:
             raise StateError("only sent user messages can be edited")
+        now = self._clock.now()
+        imported_edit = self._imported_edit_continuation(chat_id, target, now)
+        continuation = None if imported_edit is None else imported_edit[0]
+        continuation_branch = (
+            None if imported_edit is None
+            else (imported_edit[1], continuation.choice_revision)
+        )
         lineage_id = target.lineage_id or target.id
         revision = len(self._store.list_revisions(chat_id, lineage_id)) + 1
-        now = self._clock.now()
         user_message = Message(
             id=self._ids.new(),
             chat_id=chat_id,
@@ -1680,6 +2031,7 @@ class BotsApplication:
             assistant_message=assistant_message,
             attempt_id=self._ids.new(),
             now=now,
+            continuation=continuation,
         )
         updated_chat = replace(
             chat,
@@ -1695,6 +2047,9 @@ class BotsApplication:
             expected_chat_revision=chat.revision,
             context_plan=context_plan,
             attachment_ids=self._pending_attachment_ids.get(chat_id, ()),
+            continuation_branch=continuation_branch,
+            continuation_first_message_id=None if continuation_branch is None else user_message.id,
+            derivation_predecessor_message_id=None if imported_edit is None else target.id,
         )
         self._pending_attachment_ids.pop(chat_id, None)
         self._track_generation(assistant_message, attempt)
@@ -1742,9 +2097,21 @@ class BotsApplication:
         user_message = self._store.get_message(target.parent_id)
         if user_message is None or user_message.role != MessageRole.USER:
             raise StateError("assistant message has an invalid user parent")
+        continuation = self._store.import_continuation_readiness(chat_id, target.id)
+        if continuation is not None:
+            if continuation.choice_revision < 1 or continuation.local_model_entry_id is None or continuation.resolution == "UNAVAILABLE":
+                raise StateError("imported continuation requires a ready explicit choice")
         if chat_id not in self._pending_attachment_ids:
             self._pending_attachment_ids[chat_id] = tuple(
                 attachment.id for attachment in self._store.list_message_attachments(user_message.id)
+            )
+        if continuation is not None:
+            # Imported source relations remain historical metadata.  Only the
+            # exact READY candidates admitted for this anchor become native
+            # v3 input; no message attachment is fabricated on the imported
+            # user turn.
+            self._pending_attachment_ids[chat_id] = self._store.materialize_import_continuation_attachments(
+                chat_id, target.id
             )
         lineage_id = target.lineage_id or target.id
         revision = len(self._store.list_revisions(chat_id, lineage_id)) + 1
@@ -1764,6 +2131,7 @@ class BotsApplication:
             assistant_message=assistant_message,
             attempt_id=self._ids.new(),
             now=now,
+            continuation=continuation,
         )
         updated_chat = replace(
             chat,
@@ -1778,6 +2146,7 @@ class BotsApplication:
             expected_chat_revision=chat.revision,
             context_plan=context_plan,
             attachment_ids=self._pending_attachment_ids.get(chat_id, ()),
+            imported_regeneration=None if continuation is None else (target.id, continuation.choice_revision),
         )
         self._pending_attachment_ids.pop(chat_id, None)
         self._track_generation(assistant_message, attempt)
@@ -2144,6 +2513,17 @@ class BotsApplication:
     ) -> TerminalCloseResult:
         """Run teardown exactly once and always complete with scalar-safe data."""
         errors = list(initial_errors)
+        try:
+            scheduler = self._import_scheduler
+            if scheduler is not None and not scheduler.done():
+                scheduler.cancel()
+                await asyncio.gather(scheduler, return_exceptions=True)
+            # This precedes execution shutdown: queued preflight is cancelled,
+            # while any cutoff-past import settlement remains authority-owned
+            # and is drained before store release.
+            await self._import_workers.shutdown()
+        except BaseException:
+            errors.append(_close_error("imports", authority=True))
         try:
             await self._execution.shutdown()
         except BaseException:

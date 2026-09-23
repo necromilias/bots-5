@@ -115,6 +115,7 @@ def validate_phase6_snapshot(
         attempt_id=attempt_id, chat_id=chat_id, user_message_id=user_message_id,
         backend_id=backend_id, model=model, provider_id=provider_id,
         user_message_content=user_message_content,
+        allow_branch_settings_provenance=True,
     )
     for key, expected in {
         "attempt_id": attempt_id, "chat_id": chat_id, "user_message_id": user_message_id,

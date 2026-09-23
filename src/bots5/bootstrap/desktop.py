@@ -338,6 +338,10 @@ def main(argv: list[str] | None = None) -> int:
 
         async def serve() -> None:
             workspace = runtime.workspace
+            # build_runtime runs before qasync enters this loop.  Resume any
+            # durable queue work before ordinary desktop admission without
+            # exposing a UI lifecycle control surface.
+            runtime.application._ensure_import_scheduler()
             states = tuple(
                 state for state in await workspace.load_workspace() if state.restore_open
             )

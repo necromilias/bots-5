@@ -366,7 +366,11 @@ def build_search_statement(
 
     predicates.append(
         "(k.document_kind<>'attachment' OR EXISTS ("
-        "SELECT 1 FROM message_attachments loc_ma "
+        "SELECT 1 FROM (SELECT attachment_id,message_id FROM message_attachments "
+        "UNION ALL SELECT r.attachment_id,im.message_id "
+        "FROM archive_import_message_attachment_refs im "
+        "JOIN archive_import_attachment_refs r ON r.id=im.attachment_ref_id "
+        "WHERE r.availability='READY') loc_ma "
         "JOIN messages loc_m ON loc_m.id=loc_ma.message_id "
         "JOIN chats loc_c ON loc_c.id=loc_m.chat_id WHERE "
         + " AND ".join(attachment_location_predicates)
