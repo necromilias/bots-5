@@ -349,7 +349,7 @@ class Phase5StoreMixin:
             raise StateError("new provider connections must start unretired")
         now = utc_iso(value.created_at or datetime.now(UTC))
         try:
-            with self._engine.begin() as db:
+            with self.mutation_transition(), self._authority.transition(), self._engine.begin() as db:
                 db.execute(insert(provider_connections).values(
                     id=value.id, name=value.name, name_key=value.name.casefold(),
                     backend_type=value.backend_type.value, profile=value.profile.value,
@@ -384,7 +384,7 @@ class Phase5StoreMixin:
         if catalogue_identity_changed:
             catalogue_revision = current.catalogue_revision + 1
         value = replace_provider(value, catalogue_revision=catalogue_revision)
-        with self._engine.begin() as db:
+        with self.mutation_transition(), self._authority.transition(), self._engine.begin() as db:
             if catalogue_identity_changed:
                 arm_phase5_connection_identity_update(
                     db,
@@ -451,7 +451,7 @@ class Phase5StoreMixin:
         if current.revision != expected_revision:
             raise RevisionConflict(f"provider connection revision changed: {connection_id}")
         now = datetime.now(UTC)
-        with self._engine.begin() as db:
+        with self.mutation_transition(), self._authority.transition(), self._engine.begin() as db:
             default_id = db.execute(
                 select(application_generation_config.c.default_model_entry_id).where(
                     application_generation_config.c.id == 1
@@ -551,7 +551,7 @@ class Phase5StoreMixin:
             _json_object(encoded, "model catalogue metadata is malformed")
         except (TypeError, ValueError) as exc:
             raise StateError("model catalogue metadata is malformed") from exc
-        with self._engine.begin() as db:
+        with self.mutation_transition(), self._authority.transition(), self._engine.begin() as db:
             if existing is None:
                 db.execute(insert(model_catalogue_entries).values(
                     id=model_entry_id, connection_id=connection_id, provider_model_id=provider_model_id,
@@ -589,7 +589,7 @@ class Phase5StoreMixin:
         now = _now()
         revision = current.catalogue_revision + 1
         seen: set[str] = set()
-        with self._engine.begin() as db:
+        with self.mutation_transition(), self._authority.transition(), self._engine.begin() as db:
             arm_phase5_catalogue_refresh(
                 db,
                 connection_id,
@@ -701,7 +701,7 @@ class Phase5StoreMixin:
             raise StateError("capability provenance is malformed") from exc
         values = dict(model_entry_id=fact.model_entry_id, capability_key=fact.key, state=fact.state.value, source=fact.source.value, source_revision=fact.source_revision, value=fact.value, provenance_json=provenance_json, observed_at=utc_iso(fact.observed_at or datetime.now(UTC)))
         fact_id = str(uuid7())
-        with self._engine.begin() as db:
+        with self.mutation_transition(), self._authority.transition(), self._engine.begin() as db:
             criteria = [
                 capability_facts.c.model_entry_id == fact.model_entry_id,
                 capability_facts.c.capability_key == fact.key,
@@ -752,7 +752,7 @@ class Phase5StoreMixin:
         except ValueError as exc:
             raise StateError("capability override is malformed") from exc
         now = utc_iso(value.updated_at or datetime.now(UTC))
-        with self._engine.begin() as db:
+        with self.mutation_transition(), self._authority.transition(), self._engine.begin() as db:
             row = db.execute(select(capability_overrides).where(capability_overrides.c.model_entry_id == value.model_entry_id, capability_overrides.c.capability_key == value.key)).first()
             current_revision = 0 if row is None else int(row._mapping["revision"])
             if expected_revision is not None and current_revision != expected_revision:
@@ -776,7 +776,7 @@ class Phase5StoreMixin:
 
     def add_capability_observation(self, observation: dict[str, object]) -> None:
         self._ensure_open()
-        with self._engine.begin() as db:
+        with self.mutation_transition(), self._authority.transition(), self._engine.begin() as db:
             db.execute(insert(capability_observations).values(id=observation["id"], model_entry_id=observation["model_entry_id"], capability_key=observation["key"], observed_state=observation["state"], detail=str(observation.get("detail", ""))[:500], observed_at=observation.get("observed_at", _now())))
 
     def get_application_generation_config(self) -> tuple[GenerationSettings, str | None, int]:
@@ -792,7 +792,7 @@ class Phase5StoreMixin:
 
     def set_application_generation_settings(self, value: GenerationSettings, *, expected_revision: int | None = None) -> int:
         _validate_settings_value(value)
-        with self._engine.begin() as db:
+        with self.mutation_transition(), self._authority.transition(), self._engine.begin() as db:
             row = db.execute(
                 select(application_generation_config).where(application_generation_config.c.id == 1)
             ).first()
@@ -815,7 +815,7 @@ class Phase5StoreMixin:
         return revision
 
     def set_application_default_model(self, model_entry_id: str, *, expected_revision: int | None = None) -> int:
-        with self._engine.begin() as db:
+        with self.mutation_transition(), self._authority.transition(), self._engine.begin() as db:
             model = db.execute(
                 select(
                     model_catalogue_entries.c.id,
@@ -886,7 +886,7 @@ class Phase5StoreMixin:
     def _set_generation_config(self, table, identity: dict[str, object], value: GenerationSettings, *, expected_revision: int | None = None) -> int:
         self._ensure_open()
         _validate_settings_value(value)
-        with self._engine.begin() as db:
+        with self.mutation_transition(), self._authority.transition(), self._engine.begin() as db:
             where = [getattr(table.c, key) == item for key, item in identity.items()]
             row = db.execute(select(table).where(*where)).first()
             current_revision = 0 if row is None else int(row._mapping["revision"])
@@ -919,7 +919,7 @@ class Phase5StoreMixin:
 
     def set_chat_model_selection(self, chat_id: str, model_entry_id: str | None, *, expected_revision: int | None = None) -> ModelSelection:
         self._ensure_open()
-        with self._engine.begin() as db:
+        with self.mutation_transition(), self._authority.transition(), self._engine.begin() as db:
             if model_entry_id is not None:
                 model_exists = db.execute(
                     select(model_catalogue_entries.c.id).where(

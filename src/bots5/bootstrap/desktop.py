@@ -20,6 +20,12 @@ from bots5.domain.clock import SystemClock
 from bots5.domain.ids import Uuid7Factory
 from bots5.infrastructure.app_paths import AppPaths, resolve_app_paths
 from bots5.infrastructure.authority_lock import AuthorityLock
+from bots5.infrastructure.backup_capture import RootedBackupCaptureAdapter
+from bots5.infrastructure.backup_package import (
+    BackupFilePublicationAdapter,
+    BackupZipPackageAdapter,
+)
+from bots5.core.backup import BackupService
 from bots5.infrastructure.generation.fake import FakeStreamingBackend
 from bots5.infrastructure.generation.openai_compatible import OpenAICompatibleStreamingBackend
 from bots5.infrastructure.generation.router import BuiltinProviderRouter
@@ -235,6 +241,18 @@ def build_runtime(
             if backend == "fake"
             else GenerationMode.LEGACY_PHASE3_LOCAL_OPENAI
         )
+        backup_service = BackupService(
+            RootedBackupCaptureAdapter(
+                authority,
+                store,
+                paths,
+                BackupZipPackageAdapter(),
+                data_root_is_override=data_root is not None,
+            ),
+            BackupZipPackageAdapter(),
+            BackupFilePublicationAdapter(),
+            ids,
+        )
         application = BotsApplication(
             store,
             events,
@@ -248,6 +266,7 @@ def build_runtime(
             api_key_env=selected_api_key_env,
             configuration=configuration,
             generation_mode=generation_mode,
+            backup_service=backup_service,
         )
         session = DesktopSessionInfo(
             backend_id=backend_id,

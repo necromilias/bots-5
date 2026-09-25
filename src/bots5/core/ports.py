@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from typing import ContextManager, Protocol
 
 from bots5.domain.models import Attachment, Chat, GenerationAttempt, Message, WorkspaceWindowState
@@ -13,6 +14,7 @@ from bots5.domain.search import (
 )
 from bots5.core.export import AttachmentPolicy, ChatExportSource
 from bots5.core.import_queue import QueueItem
+from bots5.core.backup import BackupResult, VerificationResult
 
 
 class AppStateStore(Protocol):
@@ -236,4 +238,28 @@ class AppStateStore(Protocol):
         ...
 
     def close(self) -> None:
+        ...
+
+
+class BackupPort(Protocol):
+    """Core-owned Backup v1 boundary; adapters remain behind authority."""
+
+    def create_backup(
+        self,
+        destination: Path | str,
+        *,
+        overwrite: bool = False,
+        cancellation: Callable[[], bool] | None = None,
+        receipt_sink: Path | str | None = None,
+        progress_callback: Callable[[object], object] | None = None,
+    ) -> BackupResult:
+        ...
+
+    def verify_backup(
+        self,
+        artifact: Path | str,
+        *,
+        expected_backup_id: str | None = None,
+        receipt_sink: Path | str | None = None,
+    ) -> VerificationResult:
         ...

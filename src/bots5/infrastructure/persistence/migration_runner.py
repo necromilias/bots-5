@@ -15,6 +15,7 @@ import re
 import sqlite3
 import stat
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from alembic import command
@@ -23,7 +24,7 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.pool import NullPool
 from uuid6 import uuid7
 
-from bots5.core.errors import AuthorityError
+from bots5.core.errors import AuthorityError, MigrationRecoveryStateError
 from bots5.infrastructure.data_root_authority import (
     DataRootAuthority,
     FileIdentity,
@@ -58,6 +59,7 @@ _SUPPORTED_REVISIONS = frozenset((*_PRIOR_REVISIONS, _HEAD))
 _MIGRATION_CHAIN = (*_PRIOR_REVISIONS, _HEAD)
 _JOURNAL = "phase6-journal-v3.json"
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+_RECOVERY_LEAF_RE = re.compile(rf"^bots5-backup-({_UUID})\.botsbackup\Z")
 _TEMP_RE = re.compile(rf"\.phase6-journal-v3-({_UUID})-([1-9][0-9]*)\.tmp")
 
 _PHASE_ORDER = {
@@ -318,6 +320,48 @@ def _valid_sha256(value: object) -> bool:
     return type(value) is str and re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
 
+def _validate_verification_receipt(value: object) -> None:
+    expected_fields = {
+        "format", "receipt_version", "verification_id", "verified_at",
+        "backup_id", "backup_logical_content_digest", "artifact_size",
+        "artifact_sha256", "source_db_migration_revision",
+        "verifier_application_version", "sqlite_runtime_version", "outcome",
+        "passed_checks", "failed_check_ids", "reason_code",
+    }
+    if not isinstance(value, dict) or set(value) != expected_fields:
+        raise RuntimeError("migration whole-backup receipt schema is malformed")
+    timestamp = value["verified_at"]
+    try:
+        parsed_timestamp = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("migration whole-backup receipt time is malformed") from exc
+    if parsed_timestamp.tzinfo is None:
+        raise RuntimeError("migration whole-backup receipt time is malformed")
+    if (
+        value["format"] != "org.necromilias.bots5.installation-backup"
+        or value["receipt_version"] != 1
+        or value["outcome"] != "VALID"
+        or type(value["source_db_migration_revision"]) is not str
+        or not value["source_db_migration_revision"]
+        or type(value["verifier_application_version"]) is not str
+        or not value["verifier_application_version"]
+        or type(value["sqlite_runtime_version"]) is not str
+        or not value["sqlite_runtime_version"]
+        or type(value["passed_checks"]) is not list
+        or not value["passed_checks"]
+        or any(type(item) is not str or not item for item in value["passed_checks"])
+        or value["failed_check_ids"] != []
+        or value["reason_code"] is not None
+        or not _uuid7_text(value["verification_id"])
+        or not _uuid7_text(value["backup_id"])
+        or not _valid_sha256(value["backup_logical_content_digest"])
+        or not _valid_sha256(value["artifact_sha256"])
+        or type(value["artifact_size"]) is not int
+        or value["artifact_size"] < 1
+    ):
+        raise RuntimeError("migration whole-backup receipt is malformed")
+
+
 def _validate_identity_record(value: object, *, expected_type: str) -> None:
     keys = {
         "device_major", "device_minor", "inode", "mount_id", "type", "uid",
@@ -427,7 +471,10 @@ def _validate_record(
     expected_temp = f".phase6-journal-v3-{transaction_id}-{sequence + 1}.tmp"
     if record.get("next_update_leaf") != expected_temp:
         raise RuntimeError("migration journal update leaf is invalid")
-    if set(record) != _phase_fields(str(source_kind), str(phase)):
+    expected_fields = _phase_fields(str(source_kind), str(phase))
+    if "whole_backup" in record:
+        expected_fields.add("whole_backup")
+    if set(record) != expected_fields:
         raise RuntimeError("migration journal fields are not the closed phase schema")
     if raw != _canonical_bytes(record):
         raise RuntimeError("migration journal is not canonical JSON")
@@ -443,6 +490,19 @@ def _validate_record(
         if record.get("backup_temp_leaf") != f"migrate-{transaction_id}.backup.tmp":
             raise RuntimeError("migration journal backup temporary leaf is invalid")
         _validate_identity_record(record.get("source_identity"), expected_type="regular")
+    whole_backup = record.get("whole_backup")
+    if source_kind == "EXISTING" and whole_backup is not None:
+        expected_whole_fields = {
+            "verification_receipt", "published_leaf",
+        }
+        if type(whole_backup) is not dict or set(whole_backup) != expected_whole_fields:
+            raise RuntimeError("migration whole-backup identity is malformed")
+        if (
+            whole_backup["published_leaf"]
+            != f"bots5-backup-{whole_backup['verification_receipt']['backup_id']}.botsbackup"
+        ):
+            raise RuntimeError("migration whole-backup leaf binding is invalid")
+        _validate_verification_receipt(whole_backup["verification_receipt"])
     for name in (
         "root_identity", "database_directory_identity",
         "migration_directory_identity", "recovery_directory_identity",
@@ -600,6 +660,9 @@ def _advance(
     sequence = _PHASE_SEQUENCE[source_kind][phase]
     allowed = _phase_fields(str(record["source_kind"]), phase)
     next_record = {key: value for key, value in record.items() if key in allowed}
+    if "whole_backup" in record:
+        allowed.add("whole_backup")
+        next_record["whole_backup"] = record["whole_backup"]
     next_record.update(facts)
     next_record.update(
         phase=phase,
@@ -689,8 +752,113 @@ def _clean_initial_temp(authority: DataRootAuthority) -> None:
         fd, _ = _safe_regular(authority, migration_fd, names[0])
         _release_fd(authority, fd)
         _remove_leaf(authority, migration_fd, names[0])
-    if authority.fresh_directory_inventory("recovery"):
+
+
+def _initial_prejournal_recovery_leaf(
+    authority: DataRootAuthority,
+) -> str | None:
+    """Recognize the exact operation-owned pre-journal recovery-point form."""
+    names = authority.fresh_directory_inventory("recovery")
+    if not names:
+        return None
+    candidates = sorted(
+        name for name in names if _RECOVERY_LEAF_RE.fullmatch(name) is not None
+    )
+    unknown = sorted(set(names) - set(candidates))
+    if candidates and (len(candidates) != 1 or unknown):
+        raise MigrationRecoveryStateError(
+            "pre-journal recovery state is ambiguous: "
+            + ", ".join(sorted((*candidates, *unknown)))
+        )
+    if not candidates:
         raise RuntimeError("unattributed recovery artifact exists without a journal")
+    leaf = candidates[0]
+    try:
+        _leaf_identity(authority, authority._directory_fd("recovery"), leaf)
+    except RuntimeError as exc:
+        raise MigrationRecoveryStateError(
+            f"pre-journal recovery point has unsafe identity: {leaf}"
+        ) from exc
+    return leaf
+
+
+def _comparison_snapshot_sha256(authority: DataRootAuthority) -> str:
+    """Hash one transient coherent source snapshot using accepted capture."""
+    from bots5.infrastructure.app_paths import resolve_app_paths
+    from bots5.infrastructure.backup_capture import RootedBackupCaptureAdapter
+    from bots5.infrastructure.backup_package import BackupZipPackageAdapter
+
+    adapter = RootedBackupCaptureAdapter(
+        authority,
+        None,
+        resolve_app_paths(Path(authority.root)),
+        BackupZipPackageAdapter(),
+        data_root_is_override=True,
+    )
+    leaf, stream, _ = adapter._snapshot_database()
+    try:
+        _, digest = _hash_fd(stream.descriptor)
+    finally:
+        stream.close()
+        adapter._cleanup_snapshot(leaf)
+    return digest
+
+
+def _packaged_database_sha256(artifact: Path) -> str:
+    import zipfile
+
+    with zipfile.ZipFile(artifact, "r") as package:
+        manifest = json.loads(package.read("manifest.json"))
+    rows = [
+        row
+        for row in manifest["entry_inventory"]
+        if str(row["path"]) == "database/state.sqlite3"
+    ]
+    if len(rows) != 1 or not _valid_sha256(rows[0].get("sha256")):
+        raise MigrationRecoveryStateError(
+            "pre-journal recovery point lacks one packaged database identity"
+        )
+    return str(rows[0]["sha256"])
+
+
+def _adopt_prejournal_recovery_point(
+    authority: DataRootAuthority, leaf: str, revision: str
+) -> dict[str, object]:
+    from bots5.infrastructure.backup_package import BackupZipPackageAdapter
+
+    match = _RECOVERY_LEAF_RE.fullmatch(leaf)
+    if match is None or not _uuid7_text(match.group(1)):
+        raise MigrationRecoveryStateError(
+            f"pre-journal recovery point leaf is not operation-owned: {leaf}"
+        )
+    if revision not in _MIGRATION_CHAIN[:-1]:
+        raise MigrationRecoveryStateError(
+            "pre-journal recovery point has no consequential migration to restart"
+        )
+    artifact = Path(authority.root) / "recovery" / leaf
+    try:
+        receipt = BackupZipPackageAdapter().verify(
+            artifact, expected_backup_id=match.group(1)
+        )
+    except Exception as exc:
+        raise MigrationRecoveryStateError(
+            f"pre-journal recovery point is not independently adoptable: {leaf}"
+        ) from exc
+    canonical_receipt = receipt.canonical_object()
+    if canonical_receipt["source_db_migration_revision"] != revision:
+        raise MigrationRecoveryStateError(
+            "pre-journal recovery point source revision is incompatible"
+        )
+    packaged_sha256 = _packaged_database_sha256(artifact)
+    comparison_sha256 = _comparison_snapshot_sha256(authority)
+    if packaged_sha256 != comparison_sha256:
+        raise MigrationRecoveryStateError(
+            "pre-journal recovery point does not represent current source state"
+        )
+    return {
+        "verification_receipt": canonical_receipt,
+        "published_leaf": leaf,
+    }
 
 
 def _clean_next_temp(
@@ -1101,6 +1269,9 @@ def _preflight_bundle(
         allowed_recovery = {
             str(record["backup_leaf"]), str(record["backup_temp_leaf"])
         }
+        whole_backup = record.get("whole_backup")
+        if whole_backup is not None:
+            allowed_recovery.add(str(whole_backup["published_leaf"]))
         unexpected_recovery = sorted(
             set(authority.fresh_directory_inventory("recovery"))
             - allowed_recovery
@@ -1562,6 +1733,25 @@ def _terminal_cleanup(
             ):
                 raise RuntimeError("terminal migration backup is not attributable")
             _remove_leaf(authority, recovery_fd, backup)
+        whole_backup = record.get("whole_backup")
+        if whole_backup is not None:
+            whole_leaf = str(whole_backup["published_leaf"])
+            if _leaf_identity(authority, recovery_fd, whole_leaf) is not None:
+                whole_fd, _ = _safe_regular(authority, recovery_fd, whole_leaf)
+                try:
+                    whole_identity, whole_hash = _hash_fd(whole_fd)
+                finally:
+                    _release_fd(authority, whole_fd)
+                if (
+                    whole_identity.size
+                    != whole_backup["verification_receipt"]["artifact_size"]
+                    or whole_hash
+                    != whole_backup["verification_receipt"]["artifact_sha256"]
+                ):
+                    raise RuntimeError(
+                        "terminal migration whole-backup is not attributable"
+                    )
+                _remove_leaf(authority, recovery_fd, whole_leaf)
     elif _leaf_identity(authority, migration_fd, candidate) is not None:
         raise RuntimeError("fresh migration candidate still exists after promotion")
     _clean_next_temp(authority, record)
@@ -1722,16 +1912,16 @@ def upgrade_database(*, authority: DataRootAuthority) -> None:
                 canonical = _leaf_identity(authority, database_fd, "state.sqlite3")
                 transaction_id = str(uuid7())
                 if canonical is None:
+                    if _initial_prejournal_recovery_leaf(authority) is not None:
+                        raise MigrationRecoveryStateError(
+                            "pre-journal recovery point cannot be adopted without a source database"
+                        )
                     base = _journal_base(authority, transaction_id, "ABSENT")
                     record = _advance(base, "ABSENT")
                     _write_journal(authority, record, initial=True)
                 else:
                     authority._claim_database()
                     revision = _discover_existing(authority)
-                    if revision == _HEAD:
-                        _quiesce_source(authority, _HEAD)
-                        success = True
-                        return
                     base = _journal_base(authority, transaction_id, "EXISTING")
                     base.update(
                         expected_start_revision=revision,
@@ -1739,8 +1929,37 @@ def upgrade_database(*, authority: DataRootAuthority) -> None:
                         backup_leaf=f"migrate-{transaction_id}.backup.sqlite3",
                         backup_temp_leaf=f"migrate-{transaction_id}.backup.tmp",
                     )
-                    record = _advance(base, "PREPARING")
-                    _write_journal(authority, record, initial=True)
+                    recovery_leaf = _initial_prejournal_recovery_leaf(authority)
+                    if recovery_leaf is not None:
+                        base["whole_backup"] = _adopt_prejournal_recovery_point(
+                            authority, recovery_leaf, revision
+                        )
+                        record = _advance(base, "PREPARING")
+                        _write_journal(authority, record, initial=True)
+                    else:
+                        if revision == _HEAD:
+                            _quiesce_source(authority, _HEAD)
+                            success = True
+                            return
+                        from bots5.infrastructure.backup_capture import (
+                            create_migration_recovery_point,
+                        )
+
+                        base["whole_backup"] = create_migration_recovery_point(
+                            authority, transaction_id
+                        )
+                        try:
+                            record = _advance(base, "PREPARING")
+                            _write_journal(authority, record, initial=True)
+                        except BaseException:
+                            if "whole_backup" in base:
+                                recovery_fd = authority._directory_fd("recovery")
+                                _remove_leaf(
+                                    authority,
+                                    recovery_fd,
+                                    str(base["whole_backup"]["published_leaf"]),
+                                )
+                            raise
             target_revision = str(record["target_revision"])
             _resume(authority, record)
             if target_revision == _HEAD:

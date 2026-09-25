@@ -2105,6 +2105,7 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         self._search_receipts = ReceiptCoordinator()
         self._search_generation_high_water = search_generation
         self._search_source_revision_lock = RLock()
+        self._mutation_transition_gate = RLock()
         self._search_source_revision_high_water = search_source_revision
         self._search_cursor_epoch = str(uuid7())
         authority.register_store(self)
@@ -2299,6 +2300,13 @@ class SQLiteAppStateStore(Phase5StoreMixin):
             raise StateError(
                 "state store is not admitting work; fresh-authority recovery is required"
             ) from exc
+
+    @contextmanager
+    def mutation_transition(self):
+        """Serialize mutations without blocking read-only snapshot transitions."""
+        self._ensure_open()
+        with self._mutation_transition_gate:
+            yield
 
     @contextmanager
     def event_admission(self, *, independent: bool = False):
@@ -4984,7 +4992,11 @@ class SQLiteAppStateStore(Phase5StoreMixin):
             raise StateError("application default model is not available")
 
         timestamp = utc_iso(now)
-        with self._authority.transition(), self._engine.begin() as connection:
+        with (
+            self.mutation_transition(),
+            self._authority.transition(),
+            self._engine.begin() as connection,
+        ):
             if existing_anchor is None:
                 connection.exec_driver_sql(
                     "INSERT INTO archive_continuation_anchors("
@@ -7791,7 +7803,7 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         self._ensure_open()
         if message.state != MessageState.STREAMING:
             raise StateError("streaming updates must retain the streaming state")
-        with self._engine.begin() as connection:
+        with self.mutation_transition(), self._engine.begin() as connection:
             result = connection.execute(
                 update(messages)
                 .where(messages.c.id == message.id)
@@ -7816,7 +7828,7 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         if message.state not in expected_message_states:
             raise StateError("message and attempt terminal states do not match")
         _validate_request_snapshot(attempt, phase3=persisted_phase3)
-        with self._search_source_transaction(
+        with self.mutation_transition(), self._search_source_transaction(
             "finalize generation",
             (f"chat:{message.chat_id}", f"message:{message.id}"),
         ) as connection:
@@ -7959,7 +7971,7 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         persisted_phase3 = _is_persisted_phase3_attempt(attempt)
         _validate_attempt_outcome(attempt, phase3=persisted_phase3)
         _validate_request_snapshot(attempt, phase3=persisted_phase3)
-        with self._engine.begin() as connection:
+        with self.mutation_transition(), self._engine.begin() as connection:
             stored_row = connection.execute(
                 select(generation_attempts).where(generation_attempts.c.id == attempt.id)
             ).first()
@@ -9188,7 +9200,7 @@ class SQLiteAppStateStore(Phase5StoreMixin):
     def save_workspace_window(self, state: WorkspaceWindowState) -> None:
         self._ensure_open()
         geometry_json = None if state.geometry is None else json.dumps(list(state.geometry))
-        with self._engine.begin() as connection:
+        with self.mutation_transition(), self._engine.begin() as connection:
             connection.execute(
                 delete(workspace_windows).where(
                     workspace_windows.c.window_id == state.window_id
@@ -9211,7 +9223,7 @@ class SQLiteAppStateStore(Phase5StoreMixin):
 
     def delete_workspace_window(self, window_id: str) -> None:
         self._ensure_open()
-        with self._engine.begin() as connection:
+        with self.mutation_transition(), self._engine.begin() as connection:
             connection.execute(
                 delete(workspace_windows).where(workspace_windows.c.window_id == window_id)
             )

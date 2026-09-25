@@ -67,6 +67,7 @@ from .ports import AppStateStore
 from .provider_configuration import ProviderConfiguration
 from .import_queue import CutoffResult, ImportQueueState, OwnedImportWorkers, QueueItem
 from .archive_import import RESOLUTION_CANCELLED
+from .backup import BackupPort, BackupResult, VerificationResult
 from .import_history import ContinuationReadiness
 from .secrets import SecretStoreError, reject_secret_material, sanitize_secret_error
 from bots5.providers.discovery import ModelDiscoveryError
@@ -238,6 +239,7 @@ class BotsApplication:
         configuration: ProviderConfiguration | None = None,
         generation_mode: GenerationMode | str | None = None,
         import_workers: OwnedImportWorkers | None = None,
+        backup_service: BackupPort | None = None,
     ) -> None:
         self._store = store
         self._events = events
@@ -248,6 +250,7 @@ class BotsApplication:
         # Import workers own a distinct cancellable-preflight/durable-settle
         # lifecycle, but share this application's store authority.
         self._import_workers = import_workers or OwnedImportWorkers(store)
+        self._backup_service = backup_service
         self._import_scheduler: asyncio.Task[None] | None = None
         self._backend_id = backend_id
         self._model = model
@@ -474,6 +477,42 @@ class BotsApplication:
     async def delete_workspace_window(self, window_id: str) -> None:
         self._ensure_open()
         self._store.delete_workspace_window(window_id)
+
+    @_tracked_command
+    async def create_backup(
+        self,
+        destination: Path | str,
+        *,
+        overwrite: bool = False,
+        cancellation=None,
+        receipt_sink: Path | str | None = None,
+        progress_callback=None,
+    ):
+        if self._backup_service is None:
+            raise StateError("backup service is not configured")
+        async with self._command_scope():
+            return await asyncio.to_thread(
+                self._backup_service.create_backup,
+                destination,
+                overwrite=overwrite,
+                cancellation=cancellation,
+                receipt_sink=receipt_sink,
+                progress_callback=progress_callback,
+            )
+
+    @_tracked_command
+    async def verify_backup(
+        self,
+        artifact: Path | str,
+        *,
+        expected_backup_id: str | None = None,
+    ):
+        if self._backup_service is None:
+            raise StateError("backup service is not configured")
+        async with self._command_scope():
+            return self._backup_service.verify_backup(
+                artifact, expected_backup_id=expected_backup_id
+            )
 
     @_tracked_command
     async def create_chat(self, title: str = "New chat") -> Chat:
