@@ -216,7 +216,20 @@ class RootedBackupCaptureAdapter:
             raise BackupError("internal backup destination must be in authority-owned recovery")
 
     def _reject_unclassified_roots(self) -> None:
-        allowed_top_level = {"database", "attachments", "recovery"}
+        allowed_top_level = {
+            "database",
+            "attachments",
+            "recovery",
+            # Phase 9 Slice D.  Classified-but-excluded recovery state: the
+            # authority-owned area holding indefinitely retained displaced
+            # installations (adjudicated D-A=A.2, authorized amendment
+            # LAYOUT-AMEND-001).  It is listed here only so that this closed
+            # top-level check does not fail closed on it.  It is deliberately
+            # NOT a backup-scope component and is never included in a Backup v1
+            # payload: retained installations must not be converted into a
+            # Backup v1 or claimed equivalent to one.
+            "retained-installations",
+        }
         for root in (self._paths.config_root, self._paths.state_root, self._paths.cache_root):
             try:
                 relative = root.relative_to(self._paths.data_root)

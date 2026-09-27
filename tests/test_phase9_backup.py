@@ -637,10 +637,10 @@ def test_backup_topology_classification_and_pinned_sources_are_closed():
     assert _FIXED_DESCENDANTS == (
         "database", "attachments", "attachments/objects", "attachments/staging",
         "attachments/captures", "attachments/gc", "database/migration",
-        "database/temp", "recovery",
+        "database/temp", "recovery", "retained-installations",
     )
     repo = _REPO_ROOT
-    assert hashlib.sha256((repo / "src/bots5/infrastructure/data_root_authority.py").read_bytes()).hexdigest() == "84f575ae9d4914e5a6a4740956d67564981d030ec1137cc701148413d2db1c01"
+    assert hashlib.sha256((repo / "src/bots5/infrastructure/data_root_authority.py").read_bytes()).hexdigest() == "d33cdb751fb2077462b173da81c762b417314943f038b46a365af00c5a8d1cc5"
     assert hashlib.sha256((repo / "src/bots5/infrastructure/app_paths.py").read_bytes()).hexdigest() == "234a3597e3575fabcc3da6cb8d16a2365c902c5e37f94c8db012573d8dce8916"
     assert hashlib.sha256((repo / "src/bots5/infrastructure/persistence/migrations/versions/0012_phase9_archive_import.py").read_bytes()).hexdigest() == "f92493f0b9751e7760bcfcd4142a8fb152622f854bef090ab4fb5af968b3422b"
     with pytest.raises(Exception):

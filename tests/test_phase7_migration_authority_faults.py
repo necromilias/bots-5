@@ -254,6 +254,31 @@ os._exit(80)
     assert completed.returncode == 79, (completed.stdout, completed.stderr)
     assert hashlib.sha256(database.read_bytes()).hexdigest() == before
     assert _revision(root) == "0009_phase6_context_attachments"
+    # D-B=B.1 (approved migration_runner fence expansion): the terminal
+    # cleanup after a rolled-back promoted validation failure is DEFERRED to
+    # the next startup, so the durable ROLLED_BACK journal and the rolled-back
+    # private leaves survive the failed run as the failure evidence that the
+    # restore receipt finaliser attributes on the next startup.
+    journal_path = root / "database/migration/phase6-journal-v3.json"
+    record = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert record["phase"] == "ROLLED_BACK"
+    assert record["restored"] is True
+
+    # The next startup's existing ROLLED_BACK convergence re-verifies the
+    # restored source, performs the deferred terminal cleanup, and requires a
+    # clean restart before the clean upgrade can proceed.
+    authority = _new_authority(root)
+    try:
+        with pytest.raises(RuntimeError, match="restart is required"):
+            authority.open_store()
+    finally:
+        try:
+            authority.close()
+        except BaseException:
+            pass
+    assert hashlib.sha256(database.read_bytes()).hexdigest() == before
+    assert _revision(root) == "0009_phase6_context_attachments"
+    assert not journal_path.exists()
     assert list((root / "database" / "migration").iterdir()) == []
     assert list((root / "recovery").iterdir()) == []
 

@@ -97,8 +97,16 @@ PRIOR_MIGRATION_SHA256 = {
     "0007_phase5_provider_model_configuration.py": "46bc12a9cd10b4c6a262b5bc5ca0a02ecc5d60201931a45dffe7fef3cf69eea6",
     "0008_catalogue_refresh_outcomes.py": "de23ea29c3c9749adb7ef01ce5d8a4ce34425798972524d743d2b5152aac47b9",
 }
-JOURNAL_EDGES = (
-    "before-journal",
+# D-B=B.1: the terminal-cleanup unlink fault points fire only once cleanup is
+# actually attempted.  The approved migration_runner change defers that cleanup
+# from the failed run to the next startup's ROLLED_BACK convergence, so these
+# points move with it.
+_DEFERRED_TERMINAL_CLEANUP_POINTS = (
+    "after-unlink-phase6-journal-v3.json",
+    "after-unlink-directory-fsync-phase6-journal-v3.json",
+)
+
+JOURNAL_EDGES = (    "before-journal",
     "after-journal-create",
     "after-journal-write",
     "after-journal-file-fsync",
@@ -1904,6 +1912,9 @@ TOPOLOGY_EDGE_LABELS = (
     "database/migration",
     "database/temp",
     "recovery",
+    # Phase 9 Slice D: the authorized retained-installations fixed descendant
+    # (LAYOUT-AMEND-001) adds exactly this one acquisition topology edge.
+    "retained-installations",
 )
 
 
@@ -2540,7 +2551,7 @@ os._exit(0)
     )
 
 
-def _restore_fault_process(root: Path, point: str) -> None:
+def _restore_fault_process(root: Path, point: str, *, expected: int = 91) -> None:
     source = """
 import os
 import sys
@@ -2564,6 +2575,56 @@ def die(name):
 migration_runner._verify_database = fail_second
 migration_runner._TEST_FAULT_HOOK = die
 DataRootAuthority(root).acquire().open_store()
+os._exit(0)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", source, os.fspath(root), point],
+        cwd=REPO,
+        env={**os.environ, "PYTHONPATH": os.fspath(REPO / "src")},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    # D-B=B.1: for after-unlink-* fault points the forced death no longer fires
+    # in the failed run -- terminal cleanup is deferred to the next startup's
+    # ROLLED_BACK convergence, so the failed run exits with the validation
+    # failure instead.  The caller passes expected=1 and then exercises the
+    # death at the unlink through _converge_restore_fault_process, so the fault
+    # point is still genuinely injected rather than silently skipped.
+    assert completed.returncode == expected, (
+        completed.returncode,
+        completed.stdout,
+        completed.stderr,
+    )
+
+
+def _converge_restore_fault_process(root: Path, point: str) -> None:
+    """Inject the forced death into the DEFERRED convergence startup.
+
+    D-B=B.1 (human-approved migration_runner fence expansion) defers the
+    terminal cleanup after a rolled-back promoted validation failure to the next
+    startup's ROLLED_BACK convergence.  The ``after-unlink-*`` fault points
+    therefore no longer fire during the failed run; they fire when the
+    convergence performs that deferred cleanup.  This drives the convergence in
+    a subprocess with the death hook installed, so the fault is still genuinely
+    exercised, and asserts that the death actually happened.
+    """
+    source = """
+import os
+import sys
+from bots5.infrastructure.data_root_authority import DataRootAuthority
+from bots5.infrastructure.persistence import migration_runner
+
+root, target = sys.argv[1], sys.argv[2]
+def die(name):
+    if name == target or (target.endswith('*') and name.startswith(target[:-1])):
+        os._exit(91)
+migration_runner._TEST_FAULT_HOOK = die
+try:
+    DataRootAuthority(root).acquire().open_store()
+except BaseException:
+    pass
 os._exit(0)
 """
     completed = subprocess.run(
@@ -6477,8 +6538,36 @@ def test_existing_promotion_validation_failure_restores_prior_source(tmp_path: P
     _fault_process(root, "unused", verify_error=True)
     assert _revision(database) == "0008_catalogue_refresh_outcomes"
     assert hashlib.sha256(database.read_bytes()).hexdigest() == before
-    assert list((root / "database" / "migration").iterdir()) == []
+    # D-B=B.1 (approved migration_runner fence expansion): the terminal cleanup
+    # after a rolled-back promoted validation failure is DEFERRED to the next
+    # startup, so the durable ROLLED_BACK journal survives the failed run as the
+    # failure evidence that the restore receipt finaliser attributes on the next
+    # startup.
+    journal_path = root / "database" / "migration" / "phase6-journal-v3.json"
+    record = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert record["phase"] == "ROLLED_BACK"
+    assert record["restored"] is True
+    # D-B=B.1: ROLLED_BACK convergence performs deferred terminal cleanup and
+    # raises "restart is required". Handle this then verify clean state.
+    for _ in range(2):
+        authority = _new_authority(root)
+        try:
+            try:
+                store = authority.open_store()
+            except RuntimeError:
+                continue
+            store.close()
+        finally:
+            if authority.state not in {
+                AuthorityState.CLOSED,
+                AuthorityState.FAILED_CLOSED,
+            }:
+                authority.close()
+        if _revision(root / "database" / "state.sqlite3") == CURRENT_HEAD:
+            break
     _restart_twice(root)
+    assert list((root / "database" / "migration").iterdir()) == []
+    assert list((root / "recovery").iterdir()) == []
 
 
 @pytest.mark.parametrize(
@@ -6504,7 +6593,15 @@ def test_existing_restore_forced_death_converges_without_ambiguous_authority(
 ):
     root = tmp_path / "root"
     _historical_root(root, "0008_catalogue_refresh_outcomes")
-    _restore_fault_process(root, point)
+    if point in _DEFERRED_TERMINAL_CLEANUP_POINTS:
+        # D-B=B.1: terminal cleanup is deferred to the next startup, so the
+        # failed run exits with the validation failure rather than the injected
+        # death.  The unlink death is then genuinely injected into the deferred
+        # convergence, so the fault point is still exercised, not skipped.
+        _restore_fault_process(root, point, expected=1)
+        _converge_restore_fault_process(root, point)
+    else:
+        _restore_fault_process(root, point)
     _converge_after_restore_fault(root)
 
 

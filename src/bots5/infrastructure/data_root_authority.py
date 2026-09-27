@@ -47,6 +47,13 @@ _FIXED_DESCENDANTS = (
     "database/migration",
     "database/temp",
     "recovery",
+    # Phase 9 Slice D.  Authorized amendment LAYOUT-AMEND-001: one dedicated
+    # fixed descendant for indefinitely retained displaced-installation state
+    # (adjudicated D-A=A.2).  It is created, flock-claimed, identity-baselined
+    # and topology-validated by this authority exactly like every other fixed
+    # descendant; it is not a general-purpose storage area and has no consumer
+    # other than Slice D restore preservation/recovery.
+    "retained-installations",
 )
 
 
@@ -605,6 +612,11 @@ class DataRootAuthority:
     @property
     def _attachments_dir_capability(self) -> int:
         return self._directory_fd("attachments")
+
+    @property
+    def _retained_installations_dir_capability(self) -> int:
+        """Slice D retained-installation area (amendment LAYOUT-AMEND-001)."""
+        return self._directory_fd("retained-installations")
 
     def _directory_fd(self, relative: str) -> int:
         self.assert_live()
@@ -1189,6 +1201,61 @@ class DataRootAuthority:
                     if current is not None and current() is self:
                         _DATABASE_IDENTITIES.pop(old_identity.key, None)
         return new_fd
+
+    def _restore_exchange_database_claim(self, candidate_leaf: str) -> FileIdentity:
+        """Slice D adoption-claim handoff for the whole-installation restore.
+
+        The restore service holds a fsynced ADOPT_INTENT journal when it calls
+        this.  The authority owns the structural transition (I3/I6): it first
+        proves the canonical database leaf still carries the claimed main
+        inode, then performs the one RENAME_EXCHANGE over the database leaf
+        inside the authority-held database directory descriptor, fsyncs the
+        promoted database data and the database directory (both results are
+        verified by raising), and re-derives the main claim from the canonical
+        leaf.  The returned identity is the promoted file identity.
+
+        ``attachments._rename_exchange`` raises ``OSError`` on a non-zero
+        renameat2 return, so a raised error means the exchange did **not**
+        occur; the caller must treat that as fail-closed and never as success.
+        The same method serves the symmetric rollback re-exchange, because the
+        exchange is direction-agnostic and the claimed main is re-proven from
+        the canonical leaf each time.
+        """
+        self.assert_live()
+        if not candidate_leaf or "/" in candidate_leaf or "\x00" in candidate_leaf:
+            raise AuthorityError("restore exchange leaf is not a safe component")
+        if (
+            self._main_claim is None
+            or self._main_claim.fd is None
+            or self._main_identity is None
+        ):
+            # The pre-exchange main must be claimed so the proof below is a
+            # real name-against-claim check (restart reconciliation callers
+            # arrive with no store and therefore no claimed main).
+            self._claim_database()
+        named_fd = _open_component(
+            self._database_dir_capability, _MAIN_LEAF, os.O_RDWR | os.O_CLOEXEC
+        )
+        proof = self._append_claim("provisional:restore-exchange-proof", named_fd)
+        try:
+            if _identity(named_fd).key != self._main_identity.key:
+                raise AuthorityError(
+                    "canonical database leaf does not match the claimed main"
+                )
+        finally:
+            self._close_claim(proof)
+        from bots5.infrastructure.attachments import _rename_exchange
+
+        _rename_exchange(
+            self._database_dir_capability,
+            _MAIN_LEAF,
+            self._database_dir_capability,
+            candidate_leaf,
+        )
+        main_fd = self._replace_database_claim_from_canonical()
+        os.fsync(main_fd)
+        os.fsync(self._database_dir_capability)
+        return _identity(main_fd)
 
     def _release_database_claim(self) -> None:
         """Release the current main claim during an exclusive migration handoff."""

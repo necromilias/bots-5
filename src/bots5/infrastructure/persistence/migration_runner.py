@@ -1813,7 +1813,18 @@ def _resume(authority: DataRootAuthority, record: dict[str, object]) -> None:
             _write_journal(authority, record)
             record = _restore_existing(authority, record)
             _write_journal(authority, record)
-            _terminal_cleanup(authority, record)
+            # Terminal cleanup is deliberately DEFERRED here (approved fence
+            # expansion, D-B=B.1): the durable ROLLED_BACK journal — plus the
+            # rolled-back private candidate and recovery leaves — must survive
+            # this run so the next startup can observe them.  The restore
+            # receipt finaliser attributes the failed post-adoption migration
+            # from exactly this journal, and the existing ROLLED_BACK
+            # convergence below then re-verifies the restored source, identity,
+            # and database before performing the same terminal cleanup and
+            # requiring a clean restart.  Removing the journal in this run
+            # would destroy the only durable failure evidence before any
+            # startup can attribute it.  Rollback semantics are unchanged:
+            # the source was already restored and fsynced above.
             raise RuntimeError(
                 "promoted migration candidate failed validation; prior source was restored"
             ) from exc

@@ -245,14 +245,83 @@ Backups carry a manifest and integrity information. Restore validates before rep
 preserves the current installation, stages/verifies restored state where practical, then adopts it.
 Independent backup verification must be possible without altering live state.
 
+### Whole-installation restore (Phase 9 Slice D)
+
+Restore is whole-installation recovery, not Archive import. It validates, preserves the current
+installation, stages and verifies the restored state, and only then adopts it. `DataRootAuthority`
+remains the sole coordinator; restore adds no second authority system and no automatic downgrade.
+
+Adoption is a durable journal state machine. Restored content is staged beside the live state, the
+intent to adopt is fsynced as a barrier, and adoption itself is a single `renameat2(RENAME_EXCHANGE)`
+over the database leaf followed by directory fsync. Because a restore can be interrupted at any
+point, a `RestoreStartupCoordinator` runs between authority acquisition and store opening: it
+reconciles any interrupted restore *before* normal startup can open or fabricate an installation.
+An unattributable journal fails closed rather than guessing.
+
+The displaced pre-restore installation is retained under a dedicated data-root descendant. It is
+recovery state, not garbage: retention is indefinite, is never triggered by time or storage
+pressure, and is never converted into a backup. Removing it is a separate, deliberate,
+operator-directed action that is refused while any restore is unresolved.
+
+If preservation is impossible, restore halts. Proceeding anyway requires a separate explicit
+destructive operator authorization that is refused unless the target authoritative installation
+identity is proven, the backup source is independently verified, B.O.T.S. can truthfully state the
+current installation will not remain rollback-capable, and the operator authorized that consequence.
+Authority or target-identity uncertainty always fails closed, with no override.
+
+Restore adopts the captured state exactly, then a normal later startup migrates it forward if the
+captured schema was older. A captured schema newer than the running application's supported chain is
+refused before any live mutation. GC tombstones carried by a restored installation are authoritative
+for the payloads they name only when the restored database state, `gc_id`, tombstone, digest,
+expected size and payload identity are mutually attributable; they then complete through the existing
+garbage-collection recovery semantics. Non-attributable evidence fails closed and deletes nothing.
+
 Exactly one B.O.T.S. core may own an authoritative data root at a time. Multiple windows/future clients
 share that authority. Startup locking must recover safely from stale crash state.
 
+### Non-UI restore initiation (Phase 9 Slice D operator entry point)
+
+A human-authorized minimal operator entry point initiates a whole-installation restore without running
+the Qt desktop:
+
+```
+bots5-desktop --restore-from PACKAGE.botsbackup [--data-root ROOT] [--expected-backup-id ID]
+```
+
+The path enters at the accepted bootstrap/composition boundary: it performs exactly the data-root
+preparation and `DataRootAuthority` acquisition of normal startup, then runs the accepted
+`RestoreStartupCoordinator` interception (reconciling any interrupted restore before anything can open a
+store), then initiates exactly one existing `RestoreService.restore` transaction. It never opens the
+store: the adopted installation is migrated forward and its receipt finalised by a later normal startup.
+It never imports PySide6/qasync and does not require the normal Qt UI to be running or even installed.
+Generation-backend options are not consulted on this path.
+
+Outcomes are the existing typed restore outcomes, reported truthfully:
+
+- exit `0` — the restore committed: the restore receipt is printed on stdout as canonical JSON,
+  byte-identical to the durable receipt file; the displaced pre-restore installation remains retained
+  under `retained-installations/`.
+- exit `2` — not committed, with the typed refusal or rollback on stderr as
+  `restore not committed: <qualified type>: <message>` (e.g. package verification refusal, unsupported
+  revision, quiescence/lock refusal, root already owned by the running desktop, or
+  `restore rolled back to the preserved installation; restart required`). A refused verification mutates
+  no live state; a rollback converges the live installation back to the preserved pre-restore state and
+  leaves the durable journal for the restart acknowledgment.
+- exit `3` — failed closed, `restore failed closed: ...` on stderr: unattributable evidence poisons the
+  authority and requires human inspection; ambiguous evidence is preserved, never rewritten.
+- exit `1` — the restore committed but the authority then failed to release cleanly, or an unexpected
+  non-B.O.T.S. error escaped (fail loud).
+
+The destructive override is deliberately not exposed on this path: it remains the existing explicit,
+default-off `build_runtime(destructive_restore_override=True)` operator authorization. A transaction
+halted at `PRESERVING` with no preservation record is reconciled as scratch here, and the entry point
+initiates a fresh preservation-capable restore.
+
 ## Lifecycle
 
-Startup order is: resolve paths, acquire authority lock, open/validate/migrate persistence, initialise
-durable services, reconcile interrupted state, start execution, restore clients/workspace, then become
-ready.
+Startup order is: resolve paths, acquire authority lock, reconcile any interrupted whole-installation
+restore, open/validate/migrate persistence, initialise durable services, reconcile remaining interrupted
+state, start execution, restore clients/workspace, then become ready.
 
 Closing one window does not kill the core if other windows remain.
 
