@@ -25,6 +25,8 @@ accepted. The build-facing contract is `docs/LINUX_V0_1_DESIGN.md`.
 ### Landed status
 
 Phases **1 through 8 and Phase 9 Slices A and B are implemented, validated, committed, and landed on `main`**.
+Phase 9 Slices C and D are likewise implemented, validated, and landed, and Phase 9 Slice E — native desktop
+integration and Phase 9 technical closure — is implemented in the current pre-commit candidate.
 
 - Phase 1: native walking skeleton, core, persistence, events, fake streaming backend.
 - Phase 2: conversation truth, immutable lineage/revisions, and deterministic fake generation.
@@ -69,14 +71,29 @@ historical checkpoints and do not override the current closure record.
 - Phase 9 Slice B current-byte T2: **1038 passed, 1 skipped**; final T4: **1238 passed, 1 skipped**,
   exit `0`, candidate unchanged. Independent adversarial review and final oracle both returned PASS;
   the authorized shared review-model substitution is retained as an evidence-diversity limitation.
+- Phase 9 Slice C: Backup v1 capture and independent closed-manifest verification, and migration
+  recovery points — closed and landed (`core/backup.py`, `infrastructure/backup_capture.py`,
+  `infrastructure/backup_package.py`).
+- Phase 9 Slice D: whole-installation staged restart restore, startup reconciliation of interrupted
+  restores, indefinite operator-directed retention, the non-UI `--restore-from` entry point, and
+  typed destructive-failure semantics — closed and landed (`infrastructure/restore_service.py`,
+  `bootstrap/desktop.py`); the restore semantics are documented in `docs/LINUX_V0_1_DESIGN.md`.
+- Phase 9 Slice E: native desktop integration for the accepted Phase 9 workflows and Phase 9
+  technical closure — **implemented in the current pre-commit candidate**; recorded in
+  `docs/LINUX_V0_1_PHASE9_SLICE_E_CLOSURE_REPORT.md`. The candidate records no commit identity of its
+  own.
 
 ### Current implementation phase
 
 **Phase 7 — search and exact navigation**, **Phase 8 — inspection/provenance UX**, **Phase 9 Slice A —
 Transcript v0.1 and strict Archive v1 export**, and **Phase 9 Slice B — validated archive import and
 durable import provenance** are closed and landed. Slice B is landed at
-`9a84d38b6ad2d3968db58f471d53bf85820656b1`. **Phase 9 Slice C — Backup v1 and independent
-verification** is the next bounded sequence boundary; it is not implicitly authorized by Slice B landing.
+`9a84d38b6ad2d3968db58f471d53bf85820656b1`. **Phase 9 Slices C and D — Backup v1 with independent
+verification, and staged restart restore — are also closed and landed** (see their bullets above and
+`docs/LINUX_V0_1_DESIGN.md`). **Phase 9 Slice E — native desktop integration and Phase 9 technical
+closure — is implemented in the current pre-commit candidate**; final Git/OrgMem landing identity is
+a later administrative fact. **Phase 10 — campaign desktop integration — is not started**, and Slice
+E landing does not authorize it.
 
 The accepted desktop sequence remains:
 
@@ -89,7 +106,7 @@ The accepted desktop sequence remains:
 7. Phase 6: context and attachments — **closed**;
 8. Phase 7: search and exact navigation — **closed and landed**;
 9. Phase 8: inspection/provenance UX — **closed and landed**;
-10. Phase 9: import/export, backup, verification, and restore — **Slices A and B landed; Slice C backup/verification next; Slices D–E later**;
+10. Phase 9: import/export, backup, verification, and restore — **Slices A through D landed; Slice E desktop integration and Phase 9 technical closure implemented in the current pre-commit candidate**;
 11. Phase 10: campaign desktop integration;
 12. Phase 11: product finishing and standalone packaging;
 13. Phase 12: Linux v0.1 torture run and separate closure adjudication.

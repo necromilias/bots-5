@@ -1741,3 +1741,77 @@ def test_mutation_gate_is_never_acquired_inside_authority_transition():
 
     for source in sources:
         visit(ast.parse(source.read_text()))
+
+
+# ---------------------------------------------------------------------------
+# Slice E (additive): workflow 7 drives verify from the desktop, so the
+# blocking verification must leave the qasync loop thread (body-only change:
+# signature, return value and error contract are unchanged).
+# ---------------------------------------------------------------------------
+
+def _backup_application(store, service) -> BotsApplication:
+    from bots5.core.events import EventBus
+    from bots5.domain.clock import SystemClock
+    from bots5.infrastructure.generation.fake import FakeStreamingBackend
+
+    ids = Uuid7Factory()
+    clock = SystemClock()
+    return BotsApplication(
+        store, EventBus(clock, ids, queue_size=64), FakeStreamingBackend(),
+        ids=ids, clock=clock, backup_service=service,
+    )
+
+
+def test_verify_backup_offloads_and_keeps_the_loop_responsive_thread(authority_store):
+    authority, store, paths, root = authority_store
+    service = _service(authority, store, paths, root)
+    artifact = root / "backup" / "recovery.botsbackup"
+    service.create_backup(artifact)
+
+    application = _backup_application(store, service)
+    loop_thread = threading.get_ident()
+    seen = {}
+    ticks = []
+    original = service.verify_backup
+
+    def spy(artifact_path, *, expected_backup_id=None):
+        seen["thread"] = threading.get_ident()
+        return original(artifact_path, expected_backup_id=expected_backup_id)
+
+    service.verify_backup = spy
+
+    async def scenario():
+        async def ticker():
+            for _ in range(50):
+                ticks.append(1)
+                await asyncio.sleep(0.001)
+
+        ticker_task = asyncio.create_task(ticker())
+        result = await application.verify_backup(artifact)
+        await ticker_task
+        return result
+
+    try:
+        result = asyncio.run(scenario())
+        assert seen["thread"] != loop_thread, "verify_backup ran on the event loop thread"
+        assert result is not None
+        assert len(ticks) == 50
+    finally:
+        service.verify_backup = original
+        asyncio.run(application.close())
+
+
+def test_verify_backup_keeps_its_truthful_error_contract_thread(authority_store):
+    authority, store, paths, root = authority_store
+    service = _service(authority, store, paths, root)
+    missing = root / "backup" / "absent.botsbackup"
+    application = _backup_application(store, service)
+
+    async def scenario():
+        with pytest.raises(BackupError):
+            await application.verify_backup(missing)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(application.close())

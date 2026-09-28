@@ -8,7 +8,9 @@ inspectable state, durable evidence, and human-controlled consequential actions.
 The original campaign harness baseline is closed and preserved. V0.2 adds the built-in
 `local_openai` provider while preserving the bounded manifest-driven execution model.
 
-Linux v0.1 is implemented and landed through **Phase 9 Slice B**:
+Linux v0.1 is implemented and independently validated through **Phase 9 Slice D**, and **Phase 9
+Slice E — native desktop integration and Phase 9 technical closure — is implemented in the
+current pre-commit candidate**:
 
 1. native walking skeleton;
 2. conversation truth, immutable lineage/revisions, and deterministic fake generation;
@@ -21,7 +23,15 @@ Linux v0.1 is implemented and landed through **Phase 9 Slice B**:
 8. core-owned inspection and provenance UX over durable request-time facts;
 9. Phase 9 Slice A readable Transcript v0.1 export and strict one-chat Archive v1 export;
 10. Phase 9 Slice B validated Archive v1 import, strict Archive v2 provenance-preserving interchange,
-    durable import provenance, queue/recovery semantics, and branch-aware continuation.
+    durable import provenance, queue/recovery semantics, and branch-aware continuation;
+11. Phase 9 Slice C Backup v1 capture with independent closed-manifest package verification;
+12. Phase 9 Slice D whole-installation restore: staged, verified adoption through a durable journal,
+    startup reconciliation of interrupted restores, indefinite operator-directed retention of the
+    displaced installation, a non-UI `--restore-from` entry point, and typed destructive-failure
+    semantics;
+13. Phase 9 Slice E native desktop integration for the landed Phase 9 workflows — export, import,
+    continuation resolution, backup creation/verification, and the whole-installation restore
+    handoff — plus the Phase 9 technical-closure record.
 
 The landed Phase 6 implementation is commit
 `20847c7a49e26679d0d3dfe99798a2c211bec436`. Its final reserved acceptance gates were
@@ -49,8 +59,12 @@ handling/healing, and branch-aware imported continuation. Final current-byte val
 **1038 passed, 1 skipped** on the accepted T2 preservation selection and **1238 passed, 1 skipped** on
 T4 with the candidate unchanged. See `docs/LINUX_V0_1_PHASE9_SLICE_B_CLOSURE_REPORT.md`.
 
-Phase 9 Slice C — Backup v1 and independent verification — is the next bounded Phase 9 boundary. Its
-existence in the accepted sequence does not itself authorize implementation.
+Phase 9 Slice C — Backup v1 and independent verification — and Phase 9 Slice D — whole-installation
+staged restart restore — are likewise accepted and landed. Phase 9 Slice E — native desktop
+integration and Phase 9 technical closure — is implemented in the current pre-commit candidate;
+`docs/LINUX_V0_1_PHASE9_SLICE_E_CLOSURE_REPORT.md` is its closure record. The candidate records no
+commit identity of its own: final Git/OrgMem landing identity is a later administrative fact.
+Phase 10 is not started and Slice E landing does not authorize it.
 
 The build-facing Linux v0.1 contract remains `docs/LINUX_V0_1_DESIGN.md`. The cumulative Phase 6
 implementation history remains in `docs/LINUX_V0_1_PHASE6_IMPLEMENTATION_REPORT.md` and the later

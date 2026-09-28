@@ -3354,3 +3354,429 @@ def test_desktop_no_argument_path_is_unchanged(tmp_path, restore_environment):
     assert "error: desktop-path sentinel" in completed.stderr
     # The desktop path created no restore artefacts.
     _assert_idle_database(env.root)
+
+
+# ---------------------------------------------------------------------------
+# Slice E M5 — the restore handoff (additive section; fixtures local to this
+# module).  The live desktop never calls whole-installation restore: the
+# handoff closes the production window set, runtime.close() releases the
+# authority LAST, and only then does the real serve() post-close consumer run
+# the pre-store bootstrap child (invariant I2).  All data roots here are the
+# mechanically disposable restore_environment roots — never the operator's
+# real data root.
+# ---------------------------------------------------------------------------
+
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import asyncio as _asyncio  # noqa: E402
+
+from PySide6.QtCore import QTimer as _QTimer  # noqa: E402
+from PySide6.QtWidgets import (  # noqa: E402
+    QApplication as _QApplication,
+    QDialog as _QDialog,
+    QMessageBox as _QMessageBox,
+)
+from qasync import QEventLoop  # noqa: E402
+
+from bots5.bootstrap import desktop as _bootstrap_desktop  # noqa: E402
+from bots5.bootstrap.desktop import (  # noqa: E402
+    DesktopRuntime as _DesktopRuntime,
+    RestoreHandoffRequest as _RestoreHandoffRequest,
+    serve as _serve,
+)
+from bots5.desktop import phase9_dialogs as _phase9_dialogs  # noqa: E402
+
+
+class _HandoffFakeChild:
+    """Stand-in for the waited pre-store bootstrap child process."""
+
+    def __init__(self, returncode: int = 0, stdout: bytes = b"", stderr: bytes = b""):
+        self.returncode = returncode
+        self._stdout = stdout
+        self._stderr = stderr
+
+    async def communicate(self):
+        return self._stdout, self._stderr
+
+
+def _handoff_patch_result_dialog(monkeypatch) -> list:
+    """Recording REAL S8 result dialog that dismisses itself headlessly."""
+
+    created: list = []
+    base = _phase9_dialogs.RestoreHandoffResultDialog
+
+    class _AutoDismissResultDialog(base):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+        def show(self):
+            super().show()
+            _QTimer.singleShot(
+                0, lambda: self.done(_QDialog.DialogCode.Accepted)
+            )
+
+    monkeypatch.setattr(
+        _phase9_dialogs, "RestoreHandoffResultDialog", _AutoDismissResultDialog
+    )
+    return created
+
+
+def _handoff_accept_consequence(monkeypatch) -> None:
+    def accepting_exec(box):
+        box.done(_QDialog.DialogCode.Accepted)
+
+    monkeypatch.setattr(_QMessageBox, "exec", accepting_exec)
+
+
+def _handoff_forbid_live_restore(monkeypatch) -> list:
+    """Proof 9 guards: any in-process restore call fails the test at once."""
+
+    calls: list = []
+
+    def forbidden_initiate(*args, **kwargs):
+        calls.append(("_initiate_restore", args, kwargs))
+        raise AssertionError("_initiate_restore ran in the live desktop process")
+
+    def forbidden_restore(self, package, **kwargs):
+        calls.append(("RestoreService.restore", package, kwargs))
+        raise AssertionError(
+            "RestoreService.restore ran in the live desktop process"
+        )
+
+    monkeypatch.setattr(
+        _bootstrap_desktop, "_initiate_restore", forbidden_initiate
+    )
+    monkeypatch.setattr(RestoreService, "restore", forbidden_restore)
+    return calls
+
+
+class _HandoffResultRecording:
+    """Pure-Python stand-in for the S8 result dialog (no Qt needed)."""
+
+    def __init__(self, record: list):
+        self._record = record
+        self._slots = []
+
+    class _Signal:
+        def __init__(self, owner):
+            self._owner = owner
+            self._slots = []
+
+        def connect(self, slot):
+            self._slots.append(slot)
+
+        def disconnect(self, slot):
+            self._slots.remove(slot)
+
+        def emit(self, *args):
+            for slot in tuple(self._slots):
+                slot(*args)
+
+    def __call__(self, *args, **kwargs):
+        return self._build(*args, **kwargs)
+
+    def _build(self, parent=None, *, data_root, argv, status, receipt_text="", refusal_text=""):
+        instance = SimpleNamespace(
+            data_root=data_root,
+            argv=tuple(argv),
+            status_code=int(status),
+            raw_receipt_text=receipt_text,
+            raw_refusal_text=refusal_text,
+        )
+        instance.finished = self._Signal(instance)
+
+        def _show():
+            self._record.append(instance)
+            instance.finished.emit(1)  # auto-dismiss
+
+        instance.show = _show
+        return instance
+
+
+def _handoff_run_qasync(qt_application, operation) -> None:
+    qt_application.setQuitOnLastWindowClosed(False)
+    event_loop = QEventLoop(qt_application)
+    _asyncio.set_event_loop(event_loop)
+    with event_loop:
+        event_loop.run_until_complete(operation)
+
+
+async def _handoff_wait_until(predicate, *, timeout: float = 30.0, what: str = "state") -> None:
+    deadline = _asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        if _asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(f"timed out waiting for {what}")
+        await _asyncio.sleep(0.01)
+
+
+async def _handoff_finish_serve(serve_task, *, timeout: float = 120.0) -> None:
+    if serve_task is not None and not serve_task.done():
+        await _asyncio.wait_for(serve_task, timeout=timeout)
+
+
+def _handoff_scenario(qt_application, scenario) -> None:
+    _handoff_run_qasync(qt_application, scenario())
+
+
+def test_restore_handoff_never_invokes_restore_while_live_authority_is_open(
+    tmp_path, restore_environment, monkeypatch
+):
+    """Proof 9: from the real Tools action through the orderly close, no
+    whole-installation restore is invoked while the live authority/store is
+    open; the post-close child can only run after runtime.close() returned
+    and authority.release() ran.  A mocked child keeps the root untouched."""
+    env = restore_environment
+    _prepare_desktop_root(env.root)
+    qt_application = _QApplication.instance() or _QApplication([])
+
+    async def scenario() -> None:
+        runtime = None
+        serve_task = None
+        try:
+            runtime = build_runtime(env.root)
+            live_restore_calls = _handoff_forbid_live_restore(monkeypatch)
+
+            released: list[bool] = []
+            original_release = runtime.authority.release
+
+            def spy_release():
+                released.append(True)
+                return original_release()
+
+            monkeypatch.setattr(runtime.authority, "release", spy_release)
+            close_returned: list[bool] = []
+            original_close = _DesktopRuntime.close
+
+            async def spy_close(self):
+                await original_close(self)
+                close_returned.append(True)
+
+            monkeypatch.setattr(_DesktopRuntime, "close", spy_close)
+
+            # While live, the authority owns the root and the store is open.
+            assert runtime.authority.acquired
+            assert not runtime.application._store.closed
+
+            observed: dict = {}
+
+            async def fake_child(argv):
+                observed["argv"] = list(argv)
+                observed["authority_released"] = bool(released)
+                observed["close_returned"] = bool(close_returned)
+                observed["store_closed"] = runtime.application._store.closed
+                return _HandoffFakeChild(0, b'{"outcome": "RESTORED"}', b"")
+
+            monkeypatch.setattr(
+                _bootstrap_desktop, "_create_restore_child", fake_child
+            )
+            result_dialogs = _handoff_patch_result_dialog(monkeypatch)
+            _handoff_accept_consequence(monkeypatch)
+
+            serve_task = _asyncio.create_task(_serve(runtime))
+            await _handoff_wait_until(
+                lambda: bool(runtime.windows), what="the composed window"
+            )
+            window = runtime.windows[0]
+            window.restore_from_backup_action.trigger()
+            dialog = window._phase9._dialogs["restore_handoff"]
+            assert dialog is not None and dialog.isVisible()
+            dialog.package_edit.setText(str(env.package))
+            dialog.confirm()
+
+            await _handoff_wait_until(
+                lambda: "argv" in observed,
+                what="the post-close consumer to spawn the child",
+            )
+            await _handoff_wait_until(
+                lambda: bool(result_dialogs) and not result_dialogs[0].isVisible(),
+                what="the result dialog to be presented and dismissed",
+            )
+            await _handoff_finish_serve(serve_task)
+
+            # The child ran only after the store was closed, the runtime had
+            # closed, and the authority had been released.
+            assert observed["store_closed"] is True
+            assert observed["close_returned"] is True
+            assert observed["authority_released"] is True
+            assert live_restore_calls == []
+            assert runtime.restore_exit_code == 0
+            # The mocked child means the disposable root is untouched: the
+            # handoff alone never mutated the live installation.
+            assert _stored_max_output_tokens(env.root) == 1024
+            _assert_idle_database(env.root)
+            _assert_no_receipt(env.root)
+        finally:
+            if serve_task is not None and not serve_task.done():
+                serve_task.cancel()
+                try:
+                    await serve_task
+                except BaseException:
+                    pass
+
+    _handoff_scenario(qt_application, scenario)
+
+
+def test_restore_handoff_real_child_commits_on_disposable_root(
+    tmp_path, restore_environment, monkeypatch
+):
+    """Proof 10 (real child): the full real route — Tools action, Proceed,
+    production window close, successful runtime.close()/authority release,
+    the real serve() post-close consumer, and the REAL pre-store bootstrap
+    child on a mechanically disposable data root — commits with the Slice D
+    semantics intact: exit 0, the raw canonical receipt, the adopted
+    installation and the retained pre-restore installation."""
+    env = restore_environment
+    _prepare_desktop_root(env.root)
+    qt_application = _QApplication.instance() or _QApplication([])
+
+    async def scenario() -> None:
+        runtime = None
+        serve_task = None
+        try:
+            runtime = build_runtime(env.root)
+            live_restore_calls = _handoff_forbid_live_restore(monkeypatch)
+            result_dialogs = _handoff_patch_result_dialog(monkeypatch)
+            _handoff_accept_consequence(monkeypatch)
+
+            released: list[bool] = []
+            original_release = runtime.authority.release
+
+            def spy_release():
+                released.append(True)
+                return original_release()
+
+            monkeypatch.setattr(runtime.authority, "release", spy_release)
+
+            serve_task = _asyncio.create_task(_serve(runtime))
+            await _handoff_wait_until(
+                lambda: bool(runtime.windows), what="the composed window"
+            )
+            window = runtime.windows[0]
+            window.restore_from_backup_action.trigger()
+            dialog = window._phase9._dialogs["restore_handoff"]
+            assert dialog is not None and dialog.isVisible()
+            dialog.package_edit.setText(str(env.package))
+            dialog.confirm()
+
+            await _handoff_wait_until(
+                lambda: bool(result_dialogs),
+                what="the real child to commit and the result to be presented",
+            )
+            await _handoff_wait_until(
+                lambda: not result_dialogs[0].isVisible(),
+                what="the result dialog to be dismissed",
+            )
+            await _handoff_finish_serve(serve_task)
+
+            # The real child's exact exit code is preserved (never collapsed).
+            assert runtime.restore_exit_code == 0
+            assert released, "the authority was not released before the child"
+            assert live_restore_calls == []
+
+            # The GUI-visible surface showed the RAW canonical receipt.
+            result_dialog = result_dialogs[0]
+            assert result_dialog.status_code == 0
+            receipt = json.loads(result_dialog.raw_receipt_text)
+            assert receipt["outcome"] == "RESTORED"
+            assert receipt["backup_id"] == env.backup_id
+            assert receipt["package_sha256"] == env.artifact_sha256
+            # stdout was byte-identical to the durable receipt (Slice D).
+            durable = env.root / "database" / _RESTORE_RECEIPT
+            assert durable.read_bytes() == result_dialog.raw_receipt_text.encode(
+                "utf-8"
+            )
+
+            # The restore really adopted on the disposable root.
+            assert _live_sha(env.root) != _live_sha_before[0]
+            assert _stored_max_output_tokens(env.root) == 2222
+            assert _store_settings(env.root) == 2222
+            _assert_idle_database(env.root)
+            preserved = list((env.root / "retained-installations").iterdir())
+            assert [artefact.name for artefact in preserved] == [
+                f"{receipt['transaction_id']}-{env.backup_id}.sqlite3"
+            ]
+        finally:
+            if serve_task is not None and not serve_task.done():
+                serve_task.cancel()
+                try:
+                    await serve_task
+                except BaseException:
+                    pass
+
+    _live_sha_before = [_live_sha(env.root)]
+    _handoff_scenario(qt_application, scenario)
+
+
+def test_restore_handoff_real_child_refusal_and_fail_closed_preserve_root(
+    tmp_path, restore_environment, monkeypatch
+):
+    """Proof 10 (real child, typed refusals): through the REAL post-close
+    consumer and the REAL bootstrap child, a pinned-identity mismatch keeps
+    exit status 2 and mutates nothing, and a torn journal keeps exit status 3
+    (fail closed) — the 0/1/2/3 statuses are never collapsed and the
+    disposable root is preserved."""
+    env = restore_environment
+    _prepare_desktop_root(env.root)
+    presented: list = []
+    patch = _HandoffResultRecording(presented)
+    monkeypatch.setattr(
+        _phase9_dialogs, "RestoreHandoffResultDialog", patch
+    )
+
+    async def commit_refusal() -> None:
+        runtime = build_runtime(env.root)
+        # Seam-level request injection: this proof targets the real child's
+        # typed outcomes, not the reachability route (the mismatch is
+        # refused earlier by the live verification, which the S2 abort test
+        # covers separately).
+        runtime.handoff.register(
+            _RestoreHandoffRequest(
+                package=env.package, expected_backup_id="deliberately-wrong"
+            )
+        )
+        await runtime.close()
+        await _bootstrap_desktop._run_restore_handoff_post_close(runtime)
+        assert runtime.restore_exit_code == 2
+
+    _asyncio.run(commit_refusal())
+
+    refusal = presented[0]
+    assert refusal.status_code == 2
+    assert "restore not committed" in refusal.raw_refusal_text
+    assert "BackupArchiveInvalid" in refusal.raw_refusal_text
+    # The disposable root is preserved: no adoption, no receipt.
+    assert _stored_max_output_tokens(env.root) == 1024
+    _assert_idle_database(env.root)
+    _assert_no_receipt(env.root)
+    assert list((env.root / "retained-installations").iterdir()) == []
+
+    async def commit_fail_closed() -> None:
+        runtime = build_runtime(env.root)
+        # A torn journal is unattributable evidence: the child must fail
+        # closed (exit 3) and preserve the bytes.  The journal is written
+        # with the same owner-only mode the landed restore machinery uses —
+        # an unsafe mode would be refused at authority acquisition instead.
+        journal = env.root / "database" / _RESTORE_JOURNAL
+        torn = b'{"journal_version": 1, "restore_tr'
+        journal.write_bytes(torn)
+        os.chmod(journal, 0o600)
+        runtime.handoff.register(
+            _RestoreHandoffRequest(package=env.package, expected_backup_id="pinned")
+        )
+        await runtime.close()
+        await _bootstrap_desktop._run_restore_handoff_post_close(runtime)
+        assert runtime.restore_exit_code == 3
+        assert journal.read_bytes() == torn
+
+    _asyncio.run(commit_fail_closed())
+
+    fail_closed = presented[1]
+    assert fail_closed.status_code == 3
+    assert "restore failed closed" in fail_closed.raw_refusal_text
+    assert "BackupUnclassifiedState" in fail_closed.raw_refusal_text
+    assert _stored_max_output_tokens(env.root) == 1024
+    # Fail-closed keeps the ambiguous journal bytes for human inspection
+    # (never rewritten or guessed away); no receipt was fabricated.
+    _assert_no_receipt(env.root)

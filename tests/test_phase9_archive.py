@@ -9,6 +9,7 @@ import zipfile
 import asyncio
 import threading
 import hashlib
+from pathlib import Path
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -17,6 +18,7 @@ import pytest
 from sqlalchemy import event
 
 from bots5.core.export import AttachmentPolicy, ExportAttachment, ExportError, TranscriptScope, _safe_chat_configuration, build_archive_projection
+from bots5.core.errors import StateError
 from bots5.core.generation import GenerationCompleted, GenerationDelta
 from bots5.core.interchange import canonical_json_bytes, canonical_jsonl_bytes, logical_content_digest, sha256_hex
 from bots5.infrastructure import archive_package
@@ -1092,4 +1094,126 @@ def test_running_cut_renders_transcript_and_refuses_archive_until_terminal(tmp_p
             await application.close()
             if not store.closed:
                 authority.close()
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# Slice E (additive): application-level export-to-file commands (workflows 1-2).
+#
+# The desktop triggers these; the projection stays on the application context
+# and only the crash-safe infrastructure writer is offloaded.
+# ---------------------------------------------------------------------------
+
+async def _exportable_chat(application, store):
+    chat = await application.create_chat("slice e export")
+    attempt = await application.send_message(chat.id, "hello export")
+    await _finish(application, attempt.id)
+    return chat
+
+
+def test_write_transcript_export_publishes_and_offloads_the_writer(tmp_path, monkeypatch):
+    async def scenario():
+        application, store, authority = phase6_application(tmp_path / "root")
+        try:
+            chat = await _exportable_chat(application, store)
+            destination = tmp_path / "chat.md"
+            loop_thread = threading.get_ident()
+            seen = {}
+            original = archive_package.write_transcript
+
+            def spy(projection, path):
+                seen["thread"] = threading.get_ident()
+                return original(projection, path)
+
+            monkeypatch.setattr(archive_package, "write_transcript", spy)
+            written = await application.write_transcript_export(chat.id, destination)
+            assert written == destination
+            assert seen["thread"] != loop_thread, "the transcript writer ran on the event loop thread"
+            raw = destination.read_bytes()
+            assert raw.endswith(b"\n") and b"\r" not in raw
+            assert "hello export" in raw.decode("utf-8")
+        finally:
+            await application.close()
+            if not store.closed:
+                authority.close()
+
+    asyncio.run(scenario())
+
+
+def test_write_transcript_export_returns_the_destination_and_respects_scope(tmp_path):
+    async def scenario():
+        application, store, authority = phase6_application(tmp_path / "root")
+        try:
+            chat = await _exportable_chat(application, store)
+            destination = tmp_path / "scoped.md"
+            written = await application.write_transcript_export(
+                chat.id, destination, scope=TranscriptScope.ACTIVE_PATH,
+            )
+            assert written == Path(destination)
+            assert destination.is_file()
+        finally:
+            await application.close()
+            if not store.closed:
+                authority.close()
+
+    asyncio.run(scenario())
+
+
+def test_write_transcript_export_unknown_chat_is_a_truthful_state_error(tmp_path):
+    async def scenario():
+        application, store, authority = phase6_application(tmp_path / "root")
+        try:
+            destination = tmp_path / "missing.md"
+            with pytest.raises(StateError):
+                await application.write_transcript_export("absent-chat", destination)
+            assert not destination.exists()
+        finally:
+            await application.close()
+            if not store.closed:
+                authority.close()
+
+    asyncio.run(scenario())
+
+
+def test_write_archive_export_publishes_a_verifiable_package(tmp_path, monkeypatch):
+    async def scenario():
+        application, store, authority = phase6_application(tmp_path / "root")
+        try:
+            chat = await _exportable_chat(application, store)
+            destination = tmp_path / "chat.botsarchive"
+            loop_thread = threading.get_ident()
+            seen = {}
+            original = archive_package.write_archive
+
+            def spy(projection, path):
+                seen["thread"] = threading.get_ident()
+                return original(projection, path)
+
+            monkeypatch.setattr(archive_package, "write_archive", spy)
+            result = await application.write_archive_export(chat.id, destination)
+            assert seen["thread"] != loop_thread, "the archive writer ran on the event loop thread"
+            assert destination.is_file()
+            assert result.archive_id
+            with destination.open("rb") as stream:
+                assert validate_archive(stream).archive_id == result.archive_id
+        finally:
+            await application.close()
+            if not store.closed:
+                authority.close()
+
+    asyncio.run(scenario())
+
+
+def test_write_archive_export_requires_the_archive_extension(tmp_path):
+    async def scenario():
+        application, store, authority = phase6_application(tmp_path / "root")
+        try:
+            chat = await _exportable_chat(application, store)
+            with pytest.raises(ArchivePackageError):
+                await application.write_archive_export(chat.id, tmp_path / "chat.zip")
+        finally:
+            await application.close()
+            if not store.closed:
+                authority.close()
+
     asyncio.run(scenario())

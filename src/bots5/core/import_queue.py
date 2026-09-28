@@ -78,6 +78,74 @@ class QueuePage:
             raise ImportQueueError("queue page revision is malformed")
 
 
+def source_label_for(source_path: object) -> str:
+    """Derive a basename-only operator label from a stored source path.
+
+    The full path is never returned, rendered or persisted: the projection
+    exists so the operator can distinguish rows, not to re-expose an intake
+    path as provenance.  A malformed or empty path yields a fixed placeholder
+    rather than leaking anything.
+    """
+    if not isinstance(source_path, str) or not source_path:
+        return "(unnamed source)"
+    label = source_path.rstrip("/").rsplit("/", 1)[-1]
+    return label or "(unnamed source)"
+
+
+@dataclass(frozen=True, slots=True)
+class QueuedImportDisplay:
+    """Operator-facing queue row projection.
+
+    Deliberately excludes ``source_path``, ``resolver_roots`` and raw
+    ``options``: ``source_label`` is a basename derived only to give the
+    operator a human label.  It is never written to provenance, never shown as
+    a path and never becomes a watched root.
+
+    ``revision`` is the persisted **row** compare-and-set token already carried
+    by :class:`QueueItem` and required as ``expected_revision`` by the landed
+    cancel/remove commands.  It is a read-only concurrency precondition, never
+    editable domain state.
+    """
+
+    id: str
+    ordinal: int
+    revision: int
+    state: ImportQueueState
+    source_label: str
+    failure_code: str | None
+    enqueued_at: str | None
+    started_at: str | None
+    finished_at: str | None
+
+    def __post_init__(self) -> None:
+        if not self.id or self.revision < 1 or self.ordinal < 0:
+            raise ImportQueueError("queue display row is malformed")
+        if not isinstance(self.state, ImportQueueState):
+            raise ImportQueueError("queue display row state is malformed")
+        if not isinstance(self.source_label, str):
+            raise ImportQueueError("queue display row label is malformed")
+        if self.state is ImportQueueState.FAILED:
+            if not self.failure_code:
+                raise ImportQueueError("failed queue display row lacks a code")
+        elif self.failure_code is not None:
+            raise ImportQueueError("nonfailed queue display row has a failure code")
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.state in _TERMINAL
+
+
+@dataclass(frozen=True, slots=True)
+class QueueDisplayPage:
+    items: tuple[QueuedImportDisplay, ...]
+    next_cursor: tuple[int, str] | None
+    queue_revision: int
+
+    def __post_init__(self) -> None:
+        if type(self.queue_revision) is not int or self.queue_revision < 0:
+            raise ImportQueueError("queue display page revision is malformed")
+
+
 def transition(item: QueueItem, expected_revision: int, target: ImportQueueState, *, failure_code: str | None = None, operation_id: str | None = None) -> QueueItem:
     """Apply one CAS transition; the caller must persist it atomically."""
     if item.revision != expected_revision:

@@ -46,12 +46,15 @@ from bots5.domain.provider import BackendType, CapabilityOverride, CapabilitySta
 from bots5.domain.search import SearchDocumentKind, SearchFilters, SearchResult
 from bots5.providers.discovery import discoverer_for_connection
 
+from .phase9 import Phase9DesktopController
+from .phase9_queue_dock import ImportQueueDockWidget
 from .profile import DesktopSessionInfo
 from .session import DesktopSessionController
 from .theme import apply_draft1_theme
 from .widgets import (
     AddConnectionDialog,
     ComposerEdit,
+    ContinuationBanner,
     InspectorPanel,
     LeftRail,
     MessageRow,
@@ -100,6 +103,8 @@ class MainWindow(QMainWindow):
         session: DesktopSessionInfo | None = None,
         workspace: DesktopSessionController | None = None,
         window_state: WorkspaceWindowState | None = None,
+        *,
+        handoff=None,
     ) -> None:
         super().__init__()
         self._application = application
@@ -108,6 +113,11 @@ class MainWindow(QMainWindow):
         self._owns_workspace = workspace is None
         self._bridge = self._workspace.bridge
         self._window_state = window_state
+        # Slice E (workflow 8, F-05): the runtime-owned restore handoff
+        # capability, injected keyword-only by DesktopRuntime.open_window.
+        # ``None`` (any existing construction without the argument) leaves
+        # the restore action inert; no module-level singleton exists.
+        self._restore_handoff = handoff
         self._window_id = window_state.window_id if window_state is not None else None
         self._window_ordinal = window_state.ordinal if window_state is not None else None
         self._closing = False
@@ -139,6 +149,13 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("B.O.T.S. 5")
         self.resize(1180, 760)
+        # Additive Phase 9 delegation controller (task orchestration only);
+        # created before _build_ui so the docks and menus can attach to it.
+        self._phase9 = Phase9DesktopController(
+            application,
+            parent=self,
+            notify=lambda message: self.statusBar().showMessage(message, 5000),
+        )
         application_instance = self._qt_application()
         if application_instance is not None:
             apply_draft1_theme(application_instance)
@@ -243,6 +260,12 @@ class MainWindow(QMainWindow):
         self.transcript = TranscriptView(workspace)
         workspace_layout.addWidget(self.transcript, 1)
 
+        # Additive Phase 9 workflow-5 seam: visible only while an imported
+        # continuation resolution is pending; it is presentation only and
+        # carries no commands (I1).
+        self.continuation_banner = ContinuationBanner(workspace)
+        workspace_layout.addWidget(self.continuation_banner)
+
         self.composer_frame = QFrame(workspace)
         self.composer_frame.setObjectName("composerFrame")
         composer_layout = QVBoxLayout(self.composer_frame)
@@ -337,7 +360,129 @@ class MainWindow(QMainWindow):
         self.search_dock.visibilityChanged.connect(self._sync_search_button)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.search_dock)
         self.search_dock.hide()
+
+        # Additive Phase 9 import-queue dock (hidden until the View entry or a
+        # workflow opens it; it never calls the application while hidden).
+        self.import_queue_dock = ImportQueueDockWidget(self)
+        self.import_queue_dock.setAllowedAreas(
+            Qt.DockWidgetArea.BottomDockWidgetArea
+            | Qt.DockWidgetArea.LeftDockWidgetArea
+            | Qt.DockWidgetArea.RightDockWidgetArea
+        )
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.import_queue_dock)
+        self.import_queue_dock.hide()
+        self._phase9.attach_queue_dock(self.import_queue_dock)
+
+        self._build_phase9_menus()
         self._update_controls()
+
+    def _build_phase9_menus(self) -> None:
+        """Additive Phase 9 wiring: File/View menu entries and rail context actions.
+
+        Everything here delegates to Phase9DesktopController; the window keeps
+        no product semantics and no existing action or shutdown path changes.
+        """
+
+        file_menu = self.menuBar().addMenu("File")
+        self.export_transcript_action = QAction("Export Transcript…", self)
+        self.export_transcript_action.setObjectName("actionExportTranscript")
+        self.export_transcript_action.triggered.connect(
+            self._on_export_transcript_requested
+        )
+        file_menu.addAction(self.export_transcript_action)
+        self.export_archive_action = QAction("Export Archive…", self)
+        self.export_archive_action.setObjectName("actionExportArchive")
+        self.export_archive_action.triggered.connect(
+            self._on_export_archive_requested
+        )
+        file_menu.addAction(self.export_archive_action)
+        self.import_archive_action = QAction("Import Archive…", self)
+        self.import_archive_action.setObjectName("actionImportArchive")
+        self.import_archive_action.triggered.connect(
+            self._on_import_archive_requested
+        )
+        file_menu.addAction(self.import_archive_action)
+
+        view_menu = self.menuBar().addMenu("View")
+        self.import_queue_action = QAction("Import Queue", self)
+        self.import_queue_action.setObjectName("actionShowImportQueue")
+        self.import_queue_action.triggered.connect(self._show_import_queue)
+        view_menu.addAction(self.import_queue_action)
+
+        # Additive workflows 6/7 (M4): backup creation and independent
+        # verification get their own Tools menu, deliberately separate from
+        # File/View and from each other.  No existing action changes.
+        tools_menu = self.menuBar().addMenu("Tools")
+        self.create_backup_action = QAction("Create Full Backup…", self)
+        self.create_backup_action.setObjectName("actionCreateFullBackup")
+        self.create_backup_action.setToolTip(
+            "Create a full Backup v1 package (*.botsbackup) of this workspace"
+        )
+        self.create_backup_action.triggered.connect(
+            self._on_create_backup_requested
+        )
+        tools_menu.addAction(self.create_backup_action)
+        self.verify_backup_action = QAction("Verify Backup Package…", self)
+        self.verify_backup_action.setObjectName("actionVerifyBackupPackage")
+        self.verify_backup_action.setToolTip(
+            "Independently verify a *.botsbackup package against its own manifest"
+        )
+        self.verify_backup_action.triggered.connect(
+            self._on_verify_backup_requested
+        )
+        tools_menu.addAction(self.verify_backup_action)
+        # Additive workflow 8 (M5): the whole-installation restore handoff.
+        # The action only opens the selection dialog; restore itself runs in
+        # the pre-store bootstrap child AFTER this application has fully
+        # closed and released authority (RESTORE_UI_HANDOFF.md §2) — never
+        # in this live session, and no destructive override is offered,
+        # mentioned as available, or inferred.
+        self.restore_from_backup_action = QAction("Restore From Backup…", self)
+        self.restore_from_backup_action.setObjectName("actionRestoreFromBackup")
+        self.restore_from_backup_action.setToolTip(
+            "Restore this whole installation from a *.botsbackup package: "
+            "the application closes cleanly first and the restore runs "
+            "before the desktop can be used again"
+        )
+        self.restore_from_backup_action.triggered.connect(
+            self._on_restore_from_backup_requested
+        )
+        tools_menu.addAction(self.restore_from_backup_action)
+
+        self.rail.export_transcript_requested.connect(
+            self._on_export_transcript_chat_requested
+        )
+        self.rail.export_archive_requested.connect(
+            self._on_export_archive_chat_requested
+        )
+
+    def _show_import_queue(self, _checked: bool = False) -> None:
+        self.import_queue_dock.show()
+        self.import_queue_dock.raise_()
+
+    def _on_export_transcript_requested(self, _checked: bool = False) -> None:
+        self._phase9.open_transcript_export(self, self._current_chat_id)
+
+    def _on_export_archive_requested(self, _checked: bool = False) -> None:
+        self._phase9.open_archive_export(self, self._current_chat_id)
+
+    def _on_import_archive_requested(self, _checked: bool = False) -> None:
+        self._phase9.open_archive_import(self)
+
+    def _on_create_backup_requested(self, _checked: bool = False) -> None:
+        self._phase9.open_backup_creation(self)
+
+    def _on_verify_backup_requested(self, _checked: bool = False) -> None:
+        self._phase9.open_backup_verification(self)
+
+    def _on_restore_from_backup_requested(self, _checked: bool = False) -> None:
+        self._phase9.open_restore_handoff(self, self._restore_handoff)
+
+    def _on_export_transcript_chat_requested(self, chat_id: str) -> None:
+        self._phase9.open_transcript_export(self, chat_id)
+
+    def _on_export_archive_chat_requested(self, chat_id: str) -> None:
+        self._phase9.open_archive_export(self, chat_id)
 
     @staticmethod
     def _disabled_composer_button(text: str, tooltip: str) -> QToolButton:
@@ -425,6 +570,7 @@ class MainWindow(QMainWindow):
             if chat_id != self._current_chat_id:
                 self._clear_editing()
                 self._set_historical_leaf(None)
+                self.continuation_banner.clear()
             self._current_chat_id = chat_id
             self._selected_message = None
             if self._window_id is not None:
@@ -1276,6 +1422,15 @@ class MainWindow(QMainWindow):
         self._set_generation_busy(True)
         try:
             if editing_message_id is None:
+                # Additive workflow-5 intercept (send only): an unresolved
+                # imported continuation opens the resolution dialog instead of
+                # surfacing the landed readiness StateError.  A user edit must
+                # never be intercepted and takes the direct landed path below.
+                if not await self._phase9.ensure_imported_continuation_ready(
+                    self, chat_id, None
+                ):
+                    self._set_generation_busy(False)
+                    return
                 attempt = await self._application.send_message(chat_id, text)
             else:
                 attempt = await self._application.edit_message(chat_id, editing_message_id, text)
@@ -1387,6 +1542,14 @@ class MainWindow(QMainWindow):
         chat_id = self._current_chat_id
         self._set_generation_busy(True)
         try:
+            # Additive workflow-5 intercept (regenerate only): the same
+            # readiness predicate as the send path, with the regenerated
+            # assistant message as the base key the core gate uses.
+            if not await self._phase9.ensure_imported_continuation_ready(
+                self, chat_id, message.id
+            ):
+                self._set_generation_busy(False)
+                return
             attempt = await self._application.regenerate_message(chat_id, message.id)
         except Exception as exc:
             self._set_generation_busy(False)
@@ -1651,6 +1814,9 @@ class MainWindow(QMainWindow):
             if not task.done():
                 task.cancel()
         self._refresh_tasks.clear()
+        phase9 = getattr(self, "_phase9", None)
+        if phase9 is not None:
+            phase9.close()
 
     def _detach_workspace(self) -> None:
         if not self._workspace_attached:

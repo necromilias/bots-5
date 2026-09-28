@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,6 +42,157 @@ from bots5.providers.base import ReasoningEffort
 from bots5.desktop.profile import DesktopSessionInfo
 
 
+@dataclass(frozen=True, slots=True)
+class RestoreHandoffRequest:
+    """The one immutable Slice E handoff request (RESTORE_UI_HANDOFF.md §2 S5).
+
+    Carries the verified ``*.botsbackup`` package and the backup id the live
+    verification bound, so the pre-store bootstrap child can independently
+    re-verify against that identity (defence in depth).  Whole-installation
+    restore is never initiated from this live process; this request only
+    names the child's ``--restore-from``/``--expected-backup-id`` arguments.
+    """
+
+    package: Path
+    expected_backup_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class HandoffCloseOutcome:
+    """The ``request_orderly_close`` result (RESTORE_UI_HANDOFF.md §2.1)."""
+
+    all_closed: bool  # True -> serve()'s wait_closed()/close path will proceed
+    remaining: int  # windows still open at timeout (0 when all_closed)
+
+
+class RestoreHandoffRegistry:
+    """Process-scoped, one-shot restore-handoff request. Owned by DesktopRuntime.
+
+    ``register`` raises :class:`StateError` when a request is already pending,
+    so a second restore can never be queued behind the first; ``take``
+    consumes atomically; ``clear`` aborts (idempotent).  The registry is
+    touched only from the qasync loop thread.
+    """
+
+    def __init__(self) -> None:
+        self._request: RestoreHandoffRequest | None = None
+
+    def register(self, request: RestoreHandoffRequest) -> None:
+        if self._request is not None:
+            raise StateError("a restore handoff request is already pending")
+        self._request = request
+
+    def take(self) -> RestoreHandoffRequest | None:
+        request = self._request
+        self._request = None
+        return request
+
+    def clear(self) -> None:
+        self._request = None
+
+    @property
+    def pending(self) -> bool:
+        return self._request is not None
+
+
+#: Bounded-poll cadence for ``request_orderly_close`` (step 3 of §2.1).
+_HANDOFF_CLOSE_POLL_SECONDS = 0.05
+
+
+class RestoreHandoffCapability:
+    """The single wired route from the restore dialog to the runtime close.
+
+    Owned by DesktopRuntime; handed to MainWindow at construction; read by
+    Phase9DesktopController.  The dialog never touches DesktopRuntime or the
+    Qt window lifecycle directly, and there is deliberately no module-level
+    singleton (rejected alternative F-05): every route runs through the
+    capability a runtime built for itself.
+
+    The request plane (``register``/``take``/``clear``/``pending``) delegates
+    to the runtime-owned :class:`RestoreHandoffRegistry`;
+    :meth:`request_orderly_close` is the wired close-all operation (F-05).
+    """
+
+    def __init__(self, runtime: "DesktopRuntime") -> None:
+        self._runtime = runtime
+
+    # ------------------------------------------------------------------
+    # Request plane (delegates to the runtime-owned registry)
+    # ------------------------------------------------------------------
+
+    def register(self, request: RestoreHandoffRequest) -> None:
+        self._runtime._handoff_registry.register(request)
+
+    def take(self) -> RestoreHandoffRequest | None:
+        return self._runtime._handoff_registry.take()
+
+    def clear(self) -> None:
+        self._runtime._handoff_registry.clear()
+
+    @property
+    def pending(self) -> bool:
+        return self._runtime._handoff_registry.pending
+
+    # ------------------------------------------------------------------
+    # Close plane
+    # ------------------------------------------------------------------
+
+    async def request_orderly_close(
+        self, *, timeout: float = 10.0
+    ) -> HandoffCloseOutcome:
+        """Close every open MainWindow and report the outcome (§2.1 verbatim).
+
+        1. snapshot runtime.windows; if empty -> HandoffCloseOutcome(True, 0)
+        2. call window.close() on each (GUI thread; this is the SAME close
+           path an operator click uses; MainWindow.closeEvent's
+           active-generation prompt applies only for the last registered
+           window, so it may refuse the LAST window)
+        3. bounded-poll (await asyncio.sleep) until runtime.windows is empty
+           or timeout
+        4. all closed -> HandoffCloseOutcome(True, 0); the existing serve()
+           path then resumes at workspace.wait_closed() and runs
+           runtime.close()
+        5. timeout/decline -> self.clear() (abort the handoff, launch
+           nothing) and return HandoffCloseOutcome(False, remaining) so the
+           controller can tell the operator that the restore was NOT
+           initiated
+
+        Oracle R-1: the awaiting coroutine is owned by the controller's
+        coordinator, never by ``MainWindow._schedule`` (whose tasks
+        ``stop_bridge()`` cancels as soon as any window's ``_finish_close``
+        begins).  If the awaiter is nevertheless cancelled at the polling
+        suspension, this coroutine propagates the cancellation WITHOUT
+        clearing the request: a close that has already begun may still
+        succeed, and the post-close step then consumes the still-pending
+        request.  Clearing happens only on the explicit timeout/decline
+        path, never on cancellation — the request can only remain pending
+        if the close actually succeeded or is still in flight.
+        """
+
+        runtime = self._runtime
+        windows = tuple(runtime.windows)
+        if not windows:
+            return HandoffCloseOutcome(all_closed=True, remaining=0)
+        for window in windows:
+            try:
+                window.close()
+            except Exception:
+                # A window that raises on close simply stays open; the
+                # bounded poll below turns that into the declined outcome.
+                continue
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while runtime.windows:
+            if loop.time() >= deadline:
+                remaining = len(runtime.windows)
+                # Decline/timeout (H7): abort the handoff so a later normal
+                # close never triggers an unexpected restore.
+                self.clear()
+                return HandoffCloseOutcome(all_closed=False, remaining=remaining)
+            await asyncio.sleep(_HANDOFF_CLOSE_POLL_SECONDS)
+        return HandoffCloseOutcome(all_closed=True, remaining=0)
+
+
 @dataclass(slots=True)
 class DesktopRuntime:
     paths: AppPaths
@@ -58,6 +210,19 @@ class DesktopRuntime:
         default=None, init=False
     )
     _close_result: TerminalCloseResult | None = field(default=None, init=False)
+    # Slice E (workflow 8): the restore handoff is owned by the runtime — the
+    # registry lives here and the capability is constructed with this runtime
+    # instance in __post_init__ (i.e. by every DesktopRuntime(...) build_runtime
+    # composition), never as a module-level singleton (F-05).
+    _handoff_registry: RestoreHandoffRegistry = field(
+        default=None, init=False, repr=False
+    )
+    handoff: RestoreHandoffCapability = field(default=None, init=False, repr=False)
+    restore_exit_code: int | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._handoff_registry = RestoreHandoffRegistry()
+        self.handoff = RestoreHandoffCapability(self)
 
     def _forget_window(self, window: object) -> None:
         if window in self.windows:
@@ -80,6 +245,9 @@ class DesktopRuntime:
             self.session,
             workspace=self.workspace,
             window_state=state,
+            # Slice E (workflow 8): the runtime-owned restore handoff is the
+            # one injected route from the restore dialog to the close step.
+            handoff=self.handoff,
         )
         self.windows.append(window)
         window.closed.connect(lambda window=window: self._forget_window(window))
@@ -535,6 +703,168 @@ def _initiate_restore(
     return _release_after_restore_initiation(authority, code)
 
 
+async def _create_restore_child(argv: list[str]) -> asyncio.subprocess.Process:
+    """Spawn the waited pre-store bootstrap child with CAPTURED streams (S7).
+
+    ``asyncio.create_subprocess_exec`` with piped stdout/stderr plus
+    ``await proc.communicate()`` drains both pipes concurrently, so a chatty
+    child can never fill a pipe and deadlock, and the raw canonical receipt
+    (stdout) or typed refusal (stderr) is captured for the GUI-visible result
+    surface instead of relying on an inherited terminal (F-06).
+    """
+
+    return await asyncio.create_subprocess_exec(
+        *argv,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+
+async def _present_restore_handoff_result(
+    runtime: "DesktopRuntime",
+    *,
+    argv: list[str],
+    status: int,
+    stdout_text: str,
+    stderr_text: str,
+) -> None:
+    """S8: show the GUI-visible post-close result and await its dismissal.
+
+    The qasync loop is still alive inside ``serve()``, so a parentless dialog
+    can be presented even though every window is closed.  The dialog shows
+    the raw canonical receipt or the typed refusal together with the EXACT
+    0/1/2/3 exit status — the outcome is never collapsed into success/failure
+    and never inferred from an optional terminal (F-06, invariant I6).
+    """
+
+    from bots5.desktop.phase9_dialogs import RestoreHandoffResultDialog
+
+    dialog = RestoreHandoffResultDialog(
+        data_root=runtime.paths.data_root,
+        argv=argv,
+        status=status,
+        receipt_text=stdout_text,
+        refusal_text=stderr_text,
+    )
+    loop = asyncio.get_running_loop()
+    dismissed: asyncio.Future[None] = loop.create_future()
+
+    def _on_finished(_result: int, future: asyncio.Future[None] = dismissed) -> None:
+        if not future.done():
+            future.set_result(None)
+
+    dialog.finished.connect(_on_finished)
+    dialog.show()
+    try:
+        await dismissed
+    finally:
+        try:
+            dialog.finished.disconnect(_on_finished)
+        except (RuntimeError, TypeError):
+            pass
+
+
+async def _run_restore_handoff_post_close(runtime: "DesktopRuntime") -> None:
+    """S7/S8: consume the one-shot request and run the waited bootstrap child.
+
+    Called from ``serve``'s ``finally`` strictly after ``runtime.close()``
+    has returned successfully and on the non-cancelled close path, while the
+    qasync loop is still alive because ``serve()`` has not returned.  The
+    invariant I2 ordering is structural: ``_close_driver`` releases the data
+    root authority LAST (desktop.py ``_close_driver``), so the child below
+    can only acquire a fresh authority after the live session has fully
+    closed and released everything.  The child reaches the ``--restore-from``
+    branch BEFORE any Qt import and runs the landed Slice D restore via
+    ``_initiate_restore`` — this parent process never restores in place.
+
+    The child runs WAITED with captured stdout/stderr; the exact child exit
+    code is stored on ``runtime.restore_exit_code`` for ``main()`` to return,
+    and the raw receipt/typed refusal plus the exact 0/1/2/3 status are
+    presented in a GUI-visible dialog before ``serve()`` returns.
+
+    Oracle R-7: the cancelled re-raise branch in ``serve`` re-raises before
+    reaching this step, so a cancelled close never launches the child.
+
+    Oracle R-8: a request whose close failed never reaches this step (the
+    close failure raises out of ``serve``) and is NOT tidily cleared — it is
+    abandoned by process termination, with no child launched.  Nothing here
+    implies a tidy drop: the pending request simply dies with the process.
+    """
+
+    handoff = runtime.handoff
+    if handoff is None:  # defensive; DesktopRuntime always builds one
+        return
+    request = handoff.take()
+    if request is None:
+        return
+    argv = [
+        sys.executable,
+        "-m",
+        "bots5.bootstrap.desktop",
+        "--data-root",
+        os.fspath(runtime.paths.data_root),
+        "--restore-from",
+        os.fspath(request.package),
+        "--expected-backup-id",
+        request.expected_backup_id,
+    ]
+    process = await _create_restore_child(argv)
+    stdout, stderr = await process.communicate()
+    runtime.restore_exit_code = process.returncode
+    await _present_restore_handoff_result(
+        runtime,
+        argv=argv,
+        status=process.returncode,
+        stdout_text=stdout.decode("utf-8", errors="replace"),
+        stderr_text=stderr.decode("utf-8", errors="replace"),
+    )
+
+
+async def serve(runtime: "DesktopRuntime") -> None:
+    """Run the composed desktop session, close the runtime, then (Slice E)
+    consume an accepted restore handoff after the close succeeded.
+
+    Landed behaviour is unchanged; the only addition is the inert-by-default
+    post-close step at the end of the ``finally`` block.
+    """
+
+    workspace = runtime.workspace
+    # build_runtime runs before qasync enters this loop.  Resume any
+    # durable queue work before ordinary desktop admission without
+    # exposing a UI lifecycle control surface.
+    runtime.application._ensure_import_scheduler()
+    states = tuple(
+        state for state in await workspace.load_workspace() if state.restore_open
+    )
+    if not states:
+        states = (None,)
+    try:
+        for state in states:
+            await runtime.open_window(state)
+        await workspace.wait_closed()
+    finally:
+        cancelled = False
+        try:
+            await runtime.close()
+        except asyncio.CancelledError:
+            cancelled = True
+            # The outer waiter may be cancelled, but qasync must not
+            # stop while the shared non-exceptional close driver owns
+            # live application or authority capabilities.
+            await runtime.close()
+        if cancelled:
+            # Oracle R-7: the cancelled re-raise branch must skip the
+            # post-close restore child entirely.
+            raise asyncio.CancelledError from None
+        # Slice E (workflow 8): runs only after a successful, non-cancelled
+        # close — the authority lease was released LAST inside
+        # runtime.close(), so the pre-store bootstrap child can only acquire
+        # a fresh authority afterwards.  A close failure raises above and
+        # abandons any pending request to process termination (R-8): no
+        # clear is pretended and no child is launched.
+        await _run_restore_handoff_post_close(runtime)
+
+
 def _release_after_restore_initiation(authority: AuthorityLock, code: int) -> int:
     """Release the authority after restore initiation without masking it.
 
@@ -657,40 +987,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 1
 
-        async def serve() -> None:
-            workspace = runtime.workspace
-            # build_runtime runs before qasync enters this loop.  Resume any
-            # durable queue work before ordinary desktop admission without
-            # exposing a UI lifecycle control surface.
-            runtime.application._ensure_import_scheduler()
-            states = tuple(
-                state for state in await workspace.load_workspace() if state.restore_open
-            )
-            if not states:
-                states = (None,)
-            try:
-                for state in states:
-                    await runtime.open_window(state)
-                await workspace.wait_closed()
-            finally:
-                cancelled = False
-                try:
-                    await runtime.close()
-                except asyncio.CancelledError:
-                    cancelled = True
-                    # The outer waiter may be cancelled, but qasync must not
-                    # stop while the shared non-exceptional close driver owns
-                    # live application or authority capabilities.
-                    await runtime.close()
-                if cancelled:
-                    raise asyncio.CancelledError from None
-
         try:
             with event_loop:
-                event_loop.run_until_complete(serve())
+                event_loop.run_until_complete(serve(runtime))
         except Exception as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
+        # Slice E (workflow 8): when the post-close step ran, the child's
+        # exact 0/1/2/3 exit code is the process exit code — never collapsed
+        # into success/failure.  Without a handoff the existing 0 stands.
+        if runtime.restore_exit_code is not None:
+            return runtime.restore_exit_code
         return 0
     finally:
         qt_application.setQuitOnLastWindowClosed(original_quit_on_last_window_closed)

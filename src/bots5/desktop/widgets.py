@@ -48,6 +48,62 @@ from bots5.domain.provider import (
 from .profile import DesktopSessionInfo
 
 
+def continuation_readiness_needs_resolution(readiness: object) -> bool:
+    """Workflow 5 intercept predicate: exactly the landed core gate mirrored.
+
+    The landed send/regenerate gate (``application.py:1954-1955`` and
+    ``:2213-2214``) refuses a continuation unless ``choice_revision >= 1``,
+    ``local_model_entry_id is not None`` and ``resolution != "UNAVAILABLE"``.
+    Readiness usable without a prompt is therefore only ``None`` (native
+    history or no anchor) or a readiness that passes that same predicate.
+    This is a presentation-side mirror only: the core gate stays the
+    authority and is never bypassed.
+    """
+
+    return readiness is not None and (
+        readiness.choice_revision < 1
+        or readiness.local_model_entry_id is None
+        or readiness.resolution == "UNAVAILABLE"
+    )
+
+
+class ContinuationBanner(QFrame):
+    """Read-only banner shown while an imported continuation is unresolved.
+
+    Presentation only (I1): the window shows it when the workflow-5 intercept
+    opens the resolution dialog and hides it again when the chat changes, the
+    choice is admitted, or the operator cancels.  It carries no commands.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("continuationBanner")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(9, 6, 9, 6)
+        self.label = QLabel("", self)
+        self.label.setObjectName("continuationBannerLabel")
+        self.label.setWordWrap(True)
+        layout.addWidget(self.label, 1)
+        self._chat_id: str | None = None
+        self.setVisible(False)
+
+    def show_for(self, chat_id: str, message: str) -> None:
+        self._chat_id = chat_id
+        self.label.setText(message)
+        self.setVisible(True)
+
+    def clear_for(self, chat_id: str) -> None:
+        if self._chat_id == chat_id:
+            self._chat_id = None
+            self.label.setText("")
+            self.setVisible(False)
+
+    def clear(self) -> None:
+        self._chat_id = None
+        self.label.setText("")
+        self.setVisible(False)
+
+
 class ComposerEdit(QPlainTextEdit):
     send_requested = Signal()
 
@@ -1419,6 +1475,10 @@ class SettingsDialog(QDialog):
 class LeftRail(QFrame):
     new_chat_requested = Signal()
     chat_indicator_requested = Signal(str)
+    # Additive Phase 9 chat-rail context actions (delegation only; the window
+    # forwards these to Phase9DesktopController).
+    export_transcript_requested = Signal(str)
+    export_archive_requested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1451,6 +1511,8 @@ class LeftRail(QFrame):
         self.chat_list = QListWidget(self)
         self.chat_list.setObjectName("chatList")
         self.chat_list.setAccessibleName("Chats")
+        self.chat_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.chat_list.customContextMenuRequested.connect(self._show_chat_context_menu)
         layout.addWidget(self.chat_list, 1)
 
         self.activity_column = QVBoxLayout()
@@ -1464,6 +1526,28 @@ class LeftRail(QFrame):
         if self._collapsed:
             self.set_collapsed(False)
         self.chat_list.setFocus()
+
+    def _show_chat_context_menu(self, pos) -> None:
+        """Additive Phase 9 context actions for one chat under the cursor.
+
+        Pure selection + presentation: the chosen entry is emitted and the
+        window delegates it to Phase9DesktopController.
+        """
+
+        item = self.chat_list.itemAt(pos)
+        if item is None:
+            return
+        chat_id = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(chat_id, str) or not chat_id:
+            return
+        menu = QMenu(self.chat_list)
+        export_transcript_action = menu.addAction("Export Transcript…")
+        export_archive_action = menu.addAction("Export Archive…")
+        chosen = menu.exec(self.chat_list.mapToGlobal(pos))
+        if chosen is export_transcript_action:
+            self.export_transcript_requested.emit(chat_id)
+        elif chosen is export_archive_action:
+            self.export_archive_requested.emit(chat_id)
 
     @staticmethod
     def _icon_button(text: str, tooltip: str, *, checked: bool = False) -> QToolButton:

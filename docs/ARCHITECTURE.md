@@ -5,8 +5,16 @@
 B.O.T.S. now contains two related execution surfaces:
 
 1. the closed V0/V0.2 manifest-driven campaign harness; and
-2. the native Linux v0.1 desktop product, landed through Phase 9 Slice B; Phase 9 Slice C
-   Backup v1 and independent verification is the next bounded sequence boundary.
+2. the native Linux v0.1 desktop product, landed through Phase 9 Slice D; Phase 9 Slice E
+   native desktop integration and Phase 9 technical closure is implemented in the current
+   pre-commit candidate.
+
+The accepted desktop contract is `LINUX_V0_1_DESIGN.md`. Phases 1 through 8 and Phase 9 Slices A
+through D are landed. Phase 9 Slice A — Transcript v0.1 and strict Archive v1 export — landed at
+`35b206a404d4cd3e2dd05a5c07ffdc6dd0e1ba40`. Phase 9 Slice B — validated Archive import and durable
+import provenance — landed at `9a84d38b6ad2d3968db58f471d53bf85820656b1`. Phase 9 Slices C
+(backup/verification) and D (staged restart restore) are likewise landed; see the Slice C/D
+subsections below. Slice E desktop integration is implemented in the current pre-commit candidate.
 
 The campaign harness remains a bounded deterministic worker orchestrator. The desktop adds durable
 conversation state, native UI, streaming generation, SQLite-backed application persistence,
@@ -40,11 +48,12 @@ non-secret endpoint/configuration material; resolved credentials are not persist
 
 ## Linux v0.1 landed architecture
 
-The accepted desktop contract is `LINUX_V0_1_DESIGN.md`. Phases 1 through 8 and Phase 9 Slices A and B
-are landed. Phase 9 Slice A — Transcript v0.1 and strict Archive v1 export — landed at
-`35b206a404d4cd3e2dd05a5c07ffdc6dd0e1ba40`. Phase 9 Slice B — validated Archive import and durable
-import provenance — landed at `9a84d38b6ad2d3968db58f471d53bf85820656b1`. Slice C backup/verification
-is next in the accepted sequence.
+The accepted desktop contract is `LINUX_V0_1_DESIGN.md`. Phases 1 through 8 and Phase 9 Slices A
+through D are landed. Phase 9 Slice E — native desktop integration for the landed Phase 9
+capabilities plus Phase 9 technical-closure documentation — is implemented in the current
+pre-commit candidate; final Git/OrgMem landing identity is a later administrative fact. Landed
+commit identities are recorded in the phase closure reports, and the current candidate boundary is
+recorded in `LINUX_V0_1_PHASE9_SLICE_E_CLOSURE_REPORT.md`.
 
 Linux v0.1 runs as one native Qt/PySide6 desktop process containing one authoritative, separable,
 headless-testable B.O.T.S. core. Multiple windows are clients/views over the same authority.
@@ -163,6 +172,46 @@ Import queue work is serialized per archive while unrelated native work may proc
 work stays outside the consequential authoritative write boundary where practical; after that boundary the
 operation settles to a known-safe terminal state. Search remains derived and may catch up after a valid
 authoritative import rather than becoming an import-success gate.
+
+### Phase 9 Slice C backup and independent verification
+
+Phase 9 Slice C lands Backup v1: one whole-installation backup boundary captured under the
+data-root authority fence, packaged as a strict closed-manifest stored-ZIP artifact
+(`infrastructure/backup_capture.py`, `infrastructure/backup_package.py`), and orchestrated by the
+core-owned `BackupService` (`core/backup.py`). Capture runs into a same-directory staging leaf,
+the staged artifact is re-verified before publication, and publication is a guarded replace that
+reports the typed `BackupUncertainPublication` outcome rather than guessing success. Progress
+states (acquiring fence, holding recovery-point fence, finalising, verifying, publishing,
+completed) and cooperative cancellation are part of the landed command contract.
+
+Independent verification is deliberately separate from creation: `BackupService.verify_backup`
+validates a package artifact in isolation — manifest, checksums, payload and contained SQLite
+state — without altering live store state, with an optional expected-backup-id binding and an
+optional receipt sink. Refusals are typed (`BackupArchiveInvalid`, `BackupPackageUnsupported`,
+`BackupPackageResourceLimit`, destination/exists errors) and are never collapsed into success.
+Migration recovery points use the same boundary, and schema-capability-aware handling covers
+pre-0009 databases.
+
+### Phase 9 Slice D whole-installation restore and recovery
+
+Phase 9 Slice D lands whole-installation restore as a distinct recovery domain, not Archive
+import. `infrastructure/restore_service.py` implements the durable journal state machine:
+validate, preserve the current installation into the retained-installations data-root descendant,
+stage and verify the restored state, fsync an adoption-intent barrier, adopt with a single atomic
+leaf exchange (`renameat2` `RENAME_EXCHANGE`), and reconcile any interrupted restore at the next
+startup. `DataRootAuthority` remains the sole coordinator; restore adds no second authority system
+and no automatic downgrade. Retention of the displaced installation is indefinite and never
+triggered by time or storage pressure; removing it is a separate, deliberate, operator-directed
+action that is refused while a restore is unresolved. The destructive override remains the
+explicit, default-off operator authorization with no UI surface of its own.
+
+The non-UI operator entry point (`bootstrap/desktop.py` `_initiate_restore`,
+`bots5-desktop --restore-from PACKAGE`) acquires exactly the normal data-root authority, runs the
+`RestoreStartupCoordinator` interception, then initiates one existing `RestoreService.restore`
+transaction without opening the store or importing Qt, and reports the typed outcomes with exit
+codes 0/1/2/3 as documented in `LINUX_V0_1_DESIGN.md`. The desktop restore handoff that reaches
+this bootstrap path from a running application is the Slice E candidate surface recorded in
+`LINUX_V0_1_PHASE9_SLICE_E_CLOSURE_REPORT.md`.
 
 ### Concurrency and events
 

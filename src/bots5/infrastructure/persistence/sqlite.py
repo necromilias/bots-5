@@ -189,7 +189,15 @@ from bots5.core.archive_import import (
     source_fingerprint,
     with_initial_receiver_continuation,
 )
-from bots5.core.import_queue import ImportQueueState, QueueItem, QueuePage, reorder as reorder_queue
+from bots5.core.import_queue import (
+    ImportQueueState,
+    QueueDisplayPage,
+    QueueItem,
+    QueuePage,
+    QueuedImportDisplay,
+    reorder as reorder_queue,
+    source_label_for,
+)
 from bots5.infrastructure.persistence.archive_import_store import (
     ArchiveImportStoreError,
     JournalIntent,
@@ -2417,6 +2425,49 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                 connection.exec_driver_sql("ROLLBACK")
         items = tuple(QueueItem(str(row[0]), int(row[1]), int(row[2]), ImportQueueState(str(row[3])), tuple(int(value) for value in row[4:9]), row[9], row[10]) for row in rows[:limit])
         return QueuePage(items, (items[-1].ordinal, items[-1].id) if len(rows) > limit else None, queue_revision)
+
+    def list_archive_import_display(self, *, limit: int = 50, cursor: tuple[int, str] | None = None) -> QueueDisplayPage:
+        """Read-only operator projection of the durable import queue.
+
+        Additive: no DDL, schema, migration or write path is touched.  The full
+        ``source_path`` is read only to derive a basename label and is never
+        returned in the projection.
+        """
+        self._ensure_open()
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise StateError("archive import page request is invalid")
+        args: tuple[object, ...] = ()
+        where = ""
+        if cursor is not None:
+            if type(cursor) is not tuple or len(cursor) != 2 or type(cursor[0]) is not int or type(cursor[1]) is not str:
+                raise StateError("archive import page request is invalid")
+            where = " WHERE ordinal>? OR (ordinal=? AND id>?)"
+            args = (cursor[0], cursor[0], cursor[1])
+        with self.command_admission(), self._engine.connect() as connection:
+            connection.exec_driver_sql("BEGIN")
+            try:
+                queue_revision, _, _ = queue_control(connection)
+                rows = connection.exec_driver_sql(
+                    "SELECT id,queue_revision,ordinal,state,source_path,failure_code,enqueued_at,started_at,finished_at FROM archive_import_queue" + where + " ORDER BY ordinal,id LIMIT ?",
+                    (*args, limit + 1),
+                ).fetchall()
+            finally:
+                connection.exec_driver_sql("ROLLBACK")
+        items = tuple(
+            QueuedImportDisplay(
+                id=str(row[0]),
+                ordinal=int(row[2]),
+                revision=int(row[1]),
+                state=ImportQueueState(str(row[3])),
+                source_label=source_label_for(row[4]),
+                failure_code=row[5],
+                enqueued_at=row[6],
+                started_at=row[7],
+                finished_at=row[8],
+            )
+            for row in rows[:limit]
+        )
+        return QueueDisplayPage(items, (items[-1].ordinal, items[-1].id) if len(rows) > limit else None, queue_revision)
 
     def reorder_archive_imports(self, expected_queue_revision: int, ordered_ids: tuple[str, ...], *, now) -> tuple[QueueItem, ...]:
         self._ensure_open()

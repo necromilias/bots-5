@@ -6,7 +6,12 @@ independently validated, committed, and landed on `main`; Slice B is
 recorded **1038 passed, 1 skipped** and full T4 recorded **1238 passed, 1 skipped**, exit `0`, with the
 sealed candidate unchanged. Independent adversarial review and final oracle both returned PASS; their
 authorized model substitution reduced reviewer diversity and remains a recorded evidence limitation.
-Phase 9 Slice C — Backup v1 and independent verification — is the current sequence boundary. See
+Phase 9 Slices C and D — Backup v1 with independent verification, and whole-installation staged
+restart restore — are likewise implemented, validated, and landed. **Phase 9 Slice E — native
+desktop integration for the landed Phase 9 capabilities and the Phase 9 technical-closure record —
+is implemented in the current pre-commit candidate; final Git/OrgMem landing identity is a later
+administrative fact.** See `LINUX_V0_1_PHASE9_SLICE_E_CLOSURE_REPORT.md` for the Phase 9 A-E
+technical contract and the current validation evidence, and
 `LINUX_V0_1_PHASE9_SLICE_B_CLOSURE_REPORT.md` for the Slice B administrative landing record.
 
 This document remains the build-facing technical contract for the first native Linux B.O.T.S. desktop
@@ -404,7 +409,7 @@ Build through validated vertical slices:
 7. Phase 6: deterministic context and content-addressed attachments — **closed and landed**;
 8. Phase 7: search and exact navigation — **closed and landed**;
 9. Phase 8: inspection/provenance UX — **closed and landed**;
-10. Phase 9: import/export, backup, verification, and restore — **Slices A and B landed; Slice C Backup v1 + independent verification next; Slices D–E later**;
+10. Phase 9: import/export, backup, verification, and restore — **Slices A through D landed; Slice E desktop integration and Phase 9 technical closure implemented in the current pre-commit candidate**;
 11. Phase 10: campaign desktop integration;
 12. Phase 11: product finishing and standalone packaging;
 13. Phase 12: Linux v0.1 torture run and separate closure adjudication.

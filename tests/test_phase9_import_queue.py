@@ -4005,3 +4005,152 @@ async def test_v2_automatic_equivalent_receiver_choice_round_trips_native_genera
             second_authority.close()
         await destination_app.close()
         await source_app.close()
+
+
+# ---------------------------------------------------------------------------
+# Slice E (additive): operator-facing queue display projection.
+#
+# The desktop must never read the queue through SQL or re-expose an intake
+# path.  These tests pin the additive read-only projection: basename-only
+# label, the read-only row CAS revision required by cancel/remove, and the
+# absence of source_path / resolver_roots.
+# ---------------------------------------------------------------------------
+
+def test_queued_import_display_exposes_only_a_basename_label_and_row_revision(tmp_path):
+    import dataclasses
+
+    from bots5.core.import_queue import QueuedImportDisplay, source_label_for
+
+    assert {field.name for field in dataclasses.fields(QueuedImportDisplay)} == {
+        "id", "ordinal", "revision", "state", "source_label",
+        "failure_code", "enqueued_at", "started_at", "finished_at",
+    }
+    # The label helper is basename-only and never returns a path.
+    assert source_label_for("/deep/private/place/secret.botsarchive") == "secret.botsarchive"
+    assert source_label_for("/deep/private/place/") == "place"
+    assert source_label_for("") == "(unnamed source)"
+    assert source_label_for(None) == "(unnamed source)"
+
+    intake = tmp_path / "private" / "nested" / "intake"
+    intake.mkdir(parents=True)
+    source = intake / "one.botsarchive"
+    source.write_bytes(_archive())
+    app, store, authority = _configured_application(tmp_path / "root")
+    try:
+        queued = store.enqueue_archive_import(source, resolver_roots=(intake,), now=datetime(2026, 9, 20, tzinfo=UTC))
+        page = store.list_archive_import_display(limit=50)
+        assert len(page.items) == 1
+        row = page.items[0]
+        assert row.id == queued.id
+        assert row.source_label == "one.botsarchive"
+        assert str(intake) not in row.source_label
+        assert row.revision == queued.revision
+        assert row.state is ImportQueueState.QUEUED
+        assert row.is_terminal is False
+        assert page.queue_revision == store.list_archive_imports(limit=50).queue_revision
+        assert not hasattr(row, "source_path")
+        assert not hasattr(row, "resolver_roots")
+        assert not hasattr(row, "options")
+    finally:
+        store.close()
+        authority.close()
+
+
+def test_queued_import_display_cursor_pages_without_reordering(tmp_path):
+    intake = tmp_path / "intake"
+    intake.mkdir()
+    sources = []
+    for index in range(3):
+        source = intake / f"item-{index}.botsarchive"
+        source.write_bytes(_archive())
+        sources.append(source)
+    app, store, authority = _configured_application(tmp_path / "root")
+    try:
+        for source in sources:
+            store.enqueue_archive_import(source, resolver_roots=(intake,), now=datetime(2026, 9, 20, tzinfo=UTC))
+        first = store.list_archive_import_display(limit=2)
+        assert [item.source_label for item in first.items] == ["item-0.botsarchive", "item-1.botsarchive"]
+        assert first.next_cursor is not None
+        second = store.list_archive_import_display(limit=2, cursor=first.next_cursor)
+        assert [item.source_label for item in second.items] == ["item-2.botsarchive"]
+        assert second.next_cursor is None
+        assert second.queue_revision == first.queue_revision
+    finally:
+        store.close()
+        authority.close()
+
+
+def test_queued_import_display_command_matches_the_store_projection(tmp_path):
+    intake = tmp_path / "intake"
+    intake.mkdir()
+    source = intake / "via-command.botsarchive"
+    source.write_bytes(_archive())
+
+    async def scenario():
+        app, store, authority = _configured_application(tmp_path / "root")
+        try:
+            await app.enqueue_archive_import(source, resolver_roots=(intake,))
+            page = await app.queued_import_display(limit=50)
+            assert len(page.items) == 1
+            assert page.items[0].source_label == "via-command.botsarchive"
+            assert page.items[0].revision >= 1
+        finally:
+            await app.close()
+            if not store.closed:
+                authority.close()
+
+    asyncio.run(scenario())
+
+
+def test_enqueue_archive_import_offloads_the_blocking_intake_fingerprint(tmp_path, monkeypatch):
+    """A slow/network intake path must not freeze the qasync loop (F-03)."""
+    intake = tmp_path / "intake"
+    intake.mkdir()
+    source = intake / "offloaded.botsarchive"
+    source.write_bytes(_archive())
+
+    async def scenario():
+        app, store, authority = _configured_application(tmp_path / "root")
+        try:
+            loop_thread = threading.get_ident()
+            seen = {}
+            original = store.enqueue_archive_import
+
+            def spy(*args, **kwargs):
+                seen["thread"] = threading.get_ident()
+                return original(*args, **kwargs)
+
+            monkeypatch.setattr(store, "enqueue_archive_import", spy)
+            queued = await app.enqueue_archive_import(source, resolver_roots=(intake,))
+            assert seen["thread"] != loop_thread, "intake fingerprint ran on the event loop thread"
+            assert queued.state is ImportQueueState.QUEUED
+        finally:
+            await app.close()
+            if not store.closed:
+                authority.close()
+
+    asyncio.run(scenario())
+
+
+def test_retry_archive_import_offloads_the_blocking_intake_fingerprint(tmp_path, monkeypatch):
+    """Retry re-reads the same fingerprint and must offload identically (F-03)."""
+    async def scenario():
+        app, store, authority = _configured_application(tmp_path / "root")
+        try:
+            loop_thread = threading.get_ident()
+            seen = {}
+
+            def spy(*args, **kwargs):
+                seen["thread"] = threading.get_ident()
+                raise StateError("retry probe")
+
+            monkeypatch.setattr(store, "retry_archive_import", spy)
+            with pytest.raises(StateError, match="retry probe"):
+                await app.retry_archive_import("queue-row")
+            assert seen["thread"] != loop_thread, "retry fingerprint ran on the event loop thread"
+        finally:
+            await app.close()
+            if not store.closed:
+                authority.close()
+
+    asyncio.run(scenario())

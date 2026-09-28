@@ -491,13 +491,25 @@ class BotsApplication:
         if self._backup_service is None:
             raise StateError("backup service is not configured")
         async with self._command_scope():
+            # Body-only repair of a pre-existing landed defect (recorded as
+            # R-M4-1).  The landed plain ``asyncio.to_thread`` copies this
+            # task's authority effect grant into the worker thread; the capture
+            # fence then refuses that grant ("effect grant belongs to another
+            # executor"), so this command could never complete against a real
+            # data-root authority.  Use the code base's own landed
+            # fresh-context offload pattern (``cancel_archive_import``) so the
+            # worker takes its own admission.  Signature, return type, error
+            # contract and the landed progress/cancellation semantics are
+            # unchanged.
             return await asyncio.to_thread(
-                self._backup_service.create_backup,
-                destination,
-                overwrite=overwrite,
-                cancellation=cancellation,
-                receipt_sink=receipt_sink,
-                progress_callback=progress_callback,
+                lambda: Context().run(
+                    self._backup_service.create_backup,
+                    destination,
+                    overwrite=overwrite,
+                    cancellation=cancellation,
+                    receipt_sink=receipt_sink,
+                    progress_callback=progress_callback,
+                )
             )
 
     @_tracked_command
@@ -510,8 +522,13 @@ class BotsApplication:
         if self._backup_service is None:
             raise StateError("backup service is not configured")
         async with self._command_scope():
-            return self._backup_service.verify_backup(
-                artifact, expected_backup_id=expected_backup_id
+            # Body-only change: the public signature, return type and error
+            # contract are unchanged.  Workflow 7 calls this from the desktop,
+            # so the blocking verification must not freeze the qasync loop.
+            return await asyncio.to_thread(
+                self._backup_service.verify_backup,
+                artifact,
+                expected_backup_id=expected_backup_id,
             )
 
     @_tracked_command
@@ -733,6 +750,39 @@ class BotsApplication:
                 "archived_attempt_provenance": source.archived_attempt_provenance,
             } if version == 2 else {}),
         )
+
+    @_tracked_command
+    async def write_transcript_export(
+        self, chat_id: str, destination: Path | str, *,
+        scope: TranscriptScope = TranscriptScope.ACTIVE_PATH,
+    ) -> Path:
+        """Render Transcript v0.1 and publish it without blocking the loop.
+
+        The projection is built on the application's own context (the landed
+        ``export_transcript`` command); only the crash-safe writer is offloaded,
+        mirroring the ``create_backup`` offload precedent.  Writer semantics
+        (crash-safe publish, extension enforcement, no-overwrite) are unchanged.
+        """
+        from bots5.infrastructure.archive_package import write_transcript
+
+        projection = await self.export_transcript(chat_id, scope=scope)
+        dest = Path(destination)
+        await asyncio.to_thread(write_transcript, projection, dest)
+        return dest
+
+    @_tracked_command
+    async def write_archive_export(
+        self, chat_id: str, destination: Path | str, *,
+        attachment_policy: AttachmentPolicy = AttachmentPolicy.EMBEDDED,
+        archive_version: int | None = None,
+    ):
+        """Render an Archive v1/v2 package and publish it without blocking the loop."""
+        from bots5.infrastructure.archive_package import write_archive
+
+        projection = await self.prepare_archive_export(
+            chat_id, attachment_policy=attachment_policy, archive_version=archive_version
+        )
+        return await asyncio.to_thread(write_archive, projection, Path(destination))
 
     @_tracked_command
     async def search_status(self) -> SearchStatus:
@@ -1690,9 +1740,17 @@ class BotsApplication:
     ) -> QueueItem:
         """Durably queue one import; the private scheduler owns execution."""
         self._ensure_open()
-        queued = self._store.enqueue_archive_import(
-            source, resolver_roots=resolver_roots, now=self._clock.now(),
-            import_as_archived=import_as_archived,
+        # The store fingerprints the one-shot intake source with Path.stat, which
+        # may sit on a slow or network-mounted path (Decision 0010 §11).  Offload
+        # with a fresh context exactly like cancel_archive_import so the qasync
+        # loop keeps ticking; fingerprint, durable row, admission and typed
+        # SOURCE_UNAVAILABLE errors are unchanged.
+        queued = await asyncio.to_thread(
+            lambda: Context().run(
+                self._store.enqueue_archive_import,
+                source, resolver_roots=resolver_roots, now=self._clock.now(),
+                import_as_archived=import_as_archived,
+            )
         )
         self._ensure_import_scheduler()
         return queued
@@ -1722,6 +1780,16 @@ class BotsApplication:
         return self._store.list_archive_imports(limit=limit, cursor=cursor)
 
     @_tracked_command
+    async def queued_import_display(self, *, limit: int = 50, cursor: tuple[int, str] | None = None):
+        """Read-only operator projection of the durable import queue.
+
+        Exposes a basename-only ``source_label`` and the read-only row CAS
+        ``revision``; never ``source_path``, ``resolver_roots`` or raw options.
+        """
+        self._ensure_open()
+        return self._store.list_archive_import_display(limit=limit, cursor=cursor)
+
+    @_tracked_command
     async def reorder_archive_imports(self, expected_queue_revision: int, ordered_ids: tuple[str, ...]) -> tuple[QueueItem, ...]:
         self._ensure_open()
         return self._store.reorder_archive_imports(expected_queue_revision, ordered_ids, now=self._clock.now())
@@ -1736,7 +1804,12 @@ class BotsApplication:
     @_tracked_command
     async def retry_archive_import(self, queue_id: str) -> QueueItem:
         self._ensure_open()
-        queued = self._store.retry_archive_import(queue_id, now=self._clock.now())
+        # Same intake fingerprint hazard as enqueue; same fresh-context offload.
+        queued = await asyncio.to_thread(
+            lambda: Context().run(
+                self._store.retry_archive_import, queue_id, now=self._clock.now(),
+            )
+        )
         self._ensure_import_scheduler()
         return queued
 
@@ -1749,8 +1822,19 @@ class BotsApplication:
         """Start the one private queue consumer from an application command."""
         scheduler = self._import_scheduler
         if scheduler is None or scheduler.done():
+            # The drain owns its own admission turn.  Creating it with a fresh,
+            # empty context prevents it from inheriting a caller command's
+            # application effect grant: an inherited grant belongs to the
+            # calling task, and the drain's first store read would then be
+            # refused with "application effect grant belongs to another
+            # executor".  Enqueue/retry now await an offloaded store call
+            # (F-03), which lets an idle scheduler retire and be recreated from
+            # inside that command, so this isolation is required for the sealed
+            # offload to be correct.  No command result or error semantics
+            # change.
             self._import_scheduler = asyncio.create_task(
                 self._drain_archive_import_queue(), name="archive-import-scheduler",
+                context=Context(),
             )
             _observe_background_task(self._import_scheduler)
 
