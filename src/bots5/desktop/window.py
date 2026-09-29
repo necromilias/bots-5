@@ -64,6 +64,7 @@ from .widgets import (
     TranscriptView,
     TuneDialog,
 )
+from .campaign_dock import CampaignDockWidget
 
 
 _TERMINAL_EVENT_KINDS = frozenset(
@@ -105,6 +106,7 @@ class MainWindow(QMainWindow):
         window_state: WorkspaceWindowState | None = None,
         *,
         handoff=None,
+        campaign_bridge_factory=None,
     ) -> None:
         super().__init__()
         self._application = application
@@ -146,6 +148,9 @@ class MainWindow(QMainWindow):
         self._last_search_filters: SearchFilters | None = None
         self._next_search_cursor: str | None = None
         self._search_busy = False
+        # Phase 10 M2.0b: optional campaign dock
+        self._campaign_bridge_factory = campaign_bridge_factory
+        self._campaign_dock: CampaignDockWidget | None = None
 
         self.setWindowTitle("B.O.T.S. 5")
         self.resize(1180, 760)
@@ -373,8 +378,29 @@ class MainWindow(QMainWindow):
         self.import_queue_dock.hide()
         self._phase9.attach_queue_dock(self.import_queue_dock)
 
+        # Phase 10 M2.0b: optional campaign dock
+        if self._campaign_bridge_factory is not None:
+            self._campaign_dock = CampaignDockWidget(
+                self, bridge_factory=self._campaign_bridge_factory
+            )
+            self._campaign_dock.setAllowedAreas(
+                Qt.DockWidgetArea.BottomDockWidgetArea
+                | Qt.DockWidgetArea.LeftDockWidgetArea
+                | Qt.DockWidgetArea.RightDockWidgetArea
+            )
+            self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._campaign_dock)
+            self._campaign_dock.hide()
+            self._campaign_dock.visibilityChanged.connect(self._sync_campaign_dock_button)
+
         self._build_phase9_menus()
         self._update_controls()
+
+    def _sync_campaign_dock_button(self, visible: bool) -> None:
+        if self.top_bar is not None and hasattr(self, "campaign_dock_action"):
+            if self.campaign_dock_action.isChecked() != visible:
+                self.campaign_dock_action.blockSignals(True)
+                self.campaign_dock_action.setChecked(visible)
+                self.campaign_dock_action.blockSignals(False)
 
     def _build_phase9_menus(self) -> None:
         """Additive Phase 9 wiring: File/View menu entries and rail context actions.
@@ -408,6 +434,16 @@ class MainWindow(QMainWindow):
         self.import_queue_action.setObjectName("actionShowImportQueue")
         self.import_queue_action.triggered.connect(self._show_import_queue)
         view_menu.addAction(self.import_queue_action)
+
+        # Phase 10 M2.0b: campaign dock toggle.  Only present when a campaign
+        # bridge factory was supplied; without one the window keeps exactly its
+        # pre-Phase-10 View menu (no inert entry is added).
+        if self._campaign_dock is not None:
+            self.campaign_dock_action = QAction("Campaign", self)
+            self.campaign_dock_action.setObjectName("actionShowCampaignDock")
+            self.campaign_dock_action.setCheckable(True)
+            self.campaign_dock_action.triggered.connect(self._show_campaign_dock)
+            view_menu.addAction(self.campaign_dock_action)
 
         # Additive workflows 6/7 (M4): backup creation and independent
         # verification get their own Tools menu, deliberately separate from
@@ -455,6 +491,14 @@ class MainWindow(QMainWindow):
         self.rail.export_archive_requested.connect(
             self._on_export_archive_chat_requested
         )
+
+    def _show_campaign_dock(self, checked: bool = False) -> None:
+        if self._campaign_dock is not None:
+            if checked:
+                self._campaign_dock.show()
+                self._campaign_dock.raise_()
+            else:
+                self._campaign_dock.hide()
 
     def _show_import_queue(self, _checked: bool = False) -> None:
         self.import_queue_dock.show()
@@ -1836,6 +1880,9 @@ class MainWindow(QMainWindow):
         self.stop_bridge()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        # Phase 10 M2.0b: drain the campaign dock if present
+        if self._campaign_dock is not None:
+            await self._campaign_dock.drain()
         if self._owns_workspace:
             if self._window_id is not None:
                 await self._workspace.unregister_window(
@@ -1899,6 +1946,9 @@ class MainWindow(QMainWindow):
         tasks = tuple(self._refresh_tasks)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        # Phase 10 M2.0b: drain the campaign dock if present
+        if self._campaign_dock is not None:
+            await self._campaign_dock.drain()
         if self._window_id is not None and not self._owns_workspace:
             final_window = self._workspace.is_last_window(self._window_id)
             await self._workspace.unregister_window(

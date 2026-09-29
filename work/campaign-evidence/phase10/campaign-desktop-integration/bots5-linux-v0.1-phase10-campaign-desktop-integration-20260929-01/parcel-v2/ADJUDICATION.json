@@ -1,0 +1,88 @@
+{
+  "template": "phase10-mick-adjudication",
+  "campaign_id": "bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01",
+  "parcel_version": 2,
+  "recorded_at": "2026-09-29",
+  "verbatim_file": "parcel-v2/ADJUDICATION.md",
+  "design_acceptance": {
+    "accepted": true,
+    "design_seal_file": "seals/design/DESIGN_SEAL_v4.json",
+    "design_seal_id": "9739e87cd42459973a600e2d1b2b19408671f93e82fbff2d13c71b11e57ed9c1",
+    "seal_must_not_be_mutated_or_replaced": true,
+    "implementation_authority": "granted inside the unchanged sealed mutation fence"
+  },
+  "forks": {
+    "HSF-1": {
+      "decision": "A",
+      "rule": "operator-supplied currently advertised input/output rates with recorded source, observation time, route and the accepted fixed conservative upper-bound basis",
+      "preserve": "OPv1 section 4",
+      "forbidden": [
+        "pricing registry",
+        "automatic network lookup",
+        "OPv1 waiver"
+      ]
+    },
+    "HSF-2": {
+      "decision": "2a",
+      "rule": "filesystem-only restart persistence",
+      "forbidden": [
+        "application-database campaign pointer",
+        "migration",
+        "associated fence expansion"
+      ]
+    },
+    "HSF-3": {
+      "decision": "3a",
+      "rule": "explicit campaign/run path or run ID",
+      "forbidden": [
+        "run-directory enumeration/browsing infrastructure"
+      ]
+    },
+    "HSF-4": {
+      "decision": "4a",
+      "rule": "add RunState.CANCELLED for explicit operator cancellation; stage-level cancellation uses error_type=\"cancelled\"",
+      "run_level_only": true,
+      "generic_failure": "run remains FAILED with internal_error",
+      "sibling": "retains its own cancelled cause rather than inheriting the run failure",
+      "hard_kill": "durable cancelled_pending remains interrupted/uncertain, never success, never automatically retried"
+    },
+    "HSF-5": {
+      "decision": "5a",
+      "rule": "provider route remains locked",
+      "note": "explicit model changes do not authorize provider-route switching"
+    }
+  },
+  "errata": {
+    "O-1": "a non-dispatched terminal synthesis is classified NOT_APPLICABLE before the staleness predicate is evaluated; update task-facing wording accordingly",
+    "O-2": "validation must explicitly prove that a sibling cancelled during generic run failure has error_type == \"cancelled\" while the run remains FAILED with internal_error",
+    "O-3": "the stage-level cancellation label is cancelled; HSF-4 changes the run-level state only",
+    "O-4": "standardize the new serialized field name as api_key_source",
+    "status": "accepted as non-blocking design errata; mechanical task-facing clarifications only"
+  },
+  "budget": {
+    "mimo_v2_6_flash_max_launches_from": 3,
+    "mimo_v2_6_flash_max_launches_to": 4,
+    "fourth_launch_reserved_for": "fresh final implementation oracle against the final frozen/resealed implementation candidate",
+    "fourth_launch_may_not_be_used_for": [
+      "design",
+      "implementation",
+      "repair",
+      "diagnosis",
+      "intermediate review",
+      "substitution"
+    ],
+    "other_caps_reset": false
+  },
+  "authorization": {
+    "implementation": true,
+    "staging": false,
+    "commit": false,
+    "push": false,
+    "ref_mutation": false,
+    "orgmem_mutation": false,
+    "dependency_changes": false,
+    "phase_11_12": false,
+    "outside_accepted_fence": false
+  },
+  "stop_rule": "if a concrete defect is fixable inside the accepted fence, fix it; if the fence itself, accepted product semantics, dependency boundary, or one of these adjudications must change, STOP FOR MICK"
+}

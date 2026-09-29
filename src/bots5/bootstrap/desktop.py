@@ -14,6 +14,7 @@ from bots5.core.application import (
     TerminalCloseError,
     TerminalCloseResult,
 )
+from bots5.core.campaign import CampaignBridge
 from bots5.core.errors import AuthorityError, BackupError, BackupUnclassifiedState, CoreError, StateError
 from bots5.core.events import EventBus
 from bots5.core.provider_configuration import ProviderConfiguration
@@ -193,6 +194,12 @@ class RestoreHandoffCapability:
         return HandoffCloseOutcome(all_closed=True, remaining=0)
 
 
+#: Phase 10 bounded campaign close budget.  Each hosted campaign is given this
+#: long to reach a durable terminal record during shutdown; on expiry the stage
+#: is recorded as a close error and never retried.
+_CAMPAIGN_CLOSE_TIMEOUT_SECONDS = 30.0
+
+
 @dataclass(slots=True)
 class DesktopRuntime:
     paths: AppPaths
@@ -219,10 +226,42 @@ class DesktopRuntime:
     )
     handoff: RestoreHandoffCapability = field(default=None, init=False, repr=False)
     restore_exit_code: int | None = field(default=None, init=False, repr=False)
+    # Phase 10: every CampaignBridge the runtime hands to a window is tracked
+    # here so the bounded close stage can cancel and drain hosted campaign work
+    # before the application and the data-root authority are released.
+    _campaign_bridges: set[object] = field(
+        default_factory=set, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         self._handoff_registry = RestoreHandoffRegistry()
         self.handoff = RestoreHandoffCapability(self)
+
+    def _campaign_bridge_factory(self, runs_dir):
+        """Compose and track a bridge for a window's campaign dock."""
+        bridge = CampaignBridge(runs_dir)
+        self._campaign_bridges.add(bridge)
+        return bridge
+
+    async def _close_campaigns(self) -> None:
+        """Bounded Phase 10 close stage.
+
+        Cancels and drains hosted campaign work, awaiting a durable terminal
+        record.  It never retries provider work and never converts an uncertain
+        outcome into success.  Runs before ``application.close()`` and before
+        the data-root authority is released.
+        """
+        for bridge in tuple(self._campaign_bridges):
+            try:
+                if bridge.is_busy:
+                    await asyncio.wait_for(
+                        bridge.cancel(), _CAMPAIGN_CLOSE_TIMEOUT_SECONDS
+                    )
+                await asyncio.wait_for(
+                    bridge.close(), _CAMPAIGN_CLOSE_TIMEOUT_SECONDS
+                )
+            finally:
+                self._campaign_bridges.discard(bridge)
 
     def _forget_window(self, window: object) -> None:
         if window in self.windows:
@@ -248,6 +287,11 @@ class DesktopRuntime:
             # Slice E (workflow 8): the runtime-owned restore handoff is the
             # one injected route from the restore dialog to the close step.
             handoff=self.handoff,
+            # Phase 10 M2.0b: campaign bridge factory for the campaign dock.
+            # The runtime tracks every bridge it composes so the bounded close
+            # stage below can drain hosted campaign work before authority
+            # release.
+            campaign_bridge_factory=self._campaign_bridge_factory,
         )
         self.windows.append(window)
         window.closed.connect(lambda window=window: self._forget_window(window))
@@ -296,6 +340,14 @@ class DesktopRuntime:
         except BaseException:
             errors.append(self._runtime_error("workspace"))
 
+        # Phase 10: bounded campaign close stage.  Hosted campaign work is
+        # cancelled and drained to a durable terminal record BEFORE the
+        # application closes and BEFORE the data-root authority is released.
+        try:
+            await self._close_campaigns()
+        except BaseException:
+            errors.append(self._runtime_error("campaign"))
+
         try:
             await self.application.close()
         except BaseException:
@@ -310,11 +362,14 @@ class DesktopRuntime:
         except BaseException:
             errors.append(self._runtime_error("outer_authority", authority=True))
 
+        # Phase 10 adds one key at the existing workspace rank; every
+        # pre-existing stage keeps its original precedence.
         precedence = {
             "store": 0,
             "outer_authority": 1,
             "application": 1,
             "workspace": 2,
+            "campaign": 2,
             "opening_windows": 2,
             "execution": 3,
             "reconciliation": 4,

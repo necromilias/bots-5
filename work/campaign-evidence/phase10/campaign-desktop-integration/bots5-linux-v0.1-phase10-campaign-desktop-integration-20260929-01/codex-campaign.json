@@ -1,0 +1,358 @@
+{
+  "template": "codex-campaign",
+  "template_version": "0.3",
+  "record_status": "resolved_prelaunch",
+  "campaign_id": "bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01",
+  "policy": {
+    "id": "procedure.codex-job-governance",
+    "version": "0.3",
+    "path": "procedures/candidates/CODEX_PROMPT_GENERATION_POLICY.md"
+  },
+  "identity": {
+    "campaign_name": "B.O.T.S. Linux v0.1 Phase 10 Campaign Desktop Integration",
+    "phase": "Linux v0.1 Phase 10",
+    "purpose": "Design, then after an exact Mick continuation implement and technically close the thin native desktop operational surface over the existing campaign engine."
+  },
+  "target": {
+    "repository": "necromilias/bots-5",
+    "branch": "main",
+    "expected_head": "0756904481ae884bb9e864e8e1e11fc4a27a72ff",
+    "candidate_manifest": null,
+    "candidate_scope": [],
+    "immutable_target": true
+  },
+  "objective": {
+    "desired_outcome": "Phase 10 operator-reachable campaign desktop integration preserving the headless engine and append-only filesystem evidence, with explicit spend authority, sibling regeneration, stale synthesis/rerun semantics, and truthful live/durable outcomes.",
+    "technical_completion_definition": "An exact sealed tracked candidate implements only the accepted Phase 10 design, focused validation passes, the final complete repository T4 passes on the exact final seal, fresh independent implementation review and final MiMo oracle are reconciled, filesystem evidence remains authoritative/backward-readable, and the campaign stops at the pre-commit boundary with nothing staged/committed/pushed unless later separately authorized."
+  },
+  "authority": {
+    "provenance": [
+      {
+        "source": "current_user_request",
+        "meaning": "Mick requested a Phase 10 Codex Campaign v0.3 pack using OrgMem design, thorough Git inspection, and model assignment based on observed campaign evidence plus creator claims/benchmarks."
+      },
+      {
+        "source": "OrgMem Decision 0007",
+        "ref": "cc0c3c80348b1d798def65988102e0d8ad966730",
+        "meaning": "Phase 10 is thin campaign desktop integration: load, zero-spend validate, preflight, explicit spend approval, live progress/cost, result inspection, sibling worker regeneration, stale synthesis and explicit rerun; do not replace campaign engine/evidence."
+      },
+      {
+        "source": "OrgMem Decisions 0004/0005",
+        "ref": "cc0c3c80348b1d798def65988102e0d8ad966730",
+        "meaning": "Product and architecture semantics for operational campaign UI, append-only regeneration, stale synthesis, durable filesystem evidence, and headless usability."
+      },
+      {
+        "source": "OrgMem Decision 0012",
+        "ref": "cc0c3c80348b1d798def65988102e0d8ad966730",
+        "meaning": "Phase 9 is closed and landed; Phase 10 is the next separate boundary."
+      }
+    ],
+    "allowed_scope": [
+      "design/discovery against exact Phase 10 authority and live repository",
+      "retained design/review/evidence files outside tracked product during parcel-v1",
+      "after a later exact Mick continuation: tracked implementation/tests/docs only inside the accepted mutation fence",
+      "bounded repairs, resealing, validation and evidence reconciliation inside the accepted fence",
+      "refresh stale current-state documentation only if included in the accepted Phase 10 fence and without fabricating future landing facts"
+    ],
+    "forbidden_scope": [
+      "tracked product/test/doc mutation before Mick accepts the exact sealed design",
+      "campaign authoring/editor system",
+      "generic stage retry/resume/reuse",
+      "automatic paid provider retry",
+      "provider streaming redesign solely for UI",
+      "dependency changes without separate Mick authority",
+      "external product provider canaries without separate Mick authority",
+      "Phase 11 packaging/finishing",
+      "Phase 12 torture run",
+      "daemon/remote-client, MCP/plugins/tools, RAG, Code/Git, Work/Research/Swarm/Audio modes",
+      "retained-installation cleanup",
+      "OrgMem mutation",
+      "staging, commit, push or ref mutation without later separate authority"
+    ],
+    "locked_decisions": [
+      "existing campaign engine remains independently headless-usable",
+      "filesystem run evidence remains authoritative and reconstructable",
+      "zero-spend validation makes no provider call and creates no run directory",
+      "provider spend requires explicit preflight/approval",
+      "regenerated worker output is a preserved sibling attempt, never overwrite",
+      "explicit model change on regeneration is allowed; provider change is not silently implied",
+      "dependent synthesis becomes stale after changed worker selection and rerun is explicit/new attempt",
+      "no automatic retry after uncertain external acceptance/spend",
+      "New Job does not delete historical evidence",
+      "Solar Pro 4 is excluded from Phase 10 routing by observed campaign behavior",
+      "Jamba is optional final implementation reviewer only, at most one launch",
+      "implementation candidate seal must exist before independent implementation review",
+      "launched context parcels are immutable"
+    ],
+    "unresolved_human_decisions": [
+      "only if design cannot mechanically settle it: authoritative source/mechanism for conservative paid preflight pricing",
+      "only if design cannot mechanically settle it: whether selected loaded/result campaign must persist across desktop restart until New Job",
+      "any proposal to permit provider-route change during worker regeneration"
+    ],
+    "human_stop_conditions": [
+      "a genuine product/authority semantic fork not mechanically settled by current authority",
+      "exact mutation fence proves materially broader than accepted Phase 10",
+      "a dependency change is required",
+      "provider-route/model-change semantics for regeneration require broader authority",
+      "preflight pricing authority cannot be resolved without a product choice",
+      "durable result/New Job behavior across application restart requires an unrecorded product choice",
+      "the existing campaign engine would need to be replaced rather than extended",
+      "budget exhausted before required evidence can be completed",
+      "a required critical model role is unavailable and no already-authorized independent route can satisfy it",
+      "candidate repair requires work outside the accepted implementation fence"
+    ]
+  },
+  "supervisor": {
+    "requested": {
+      "model": "deepseek/deepseek-v4.1-flash",
+      "effort": "provider_maximum_if_exposed"
+    },
+    "ceilings": {
+      "model": "deepseek/deepseek-v4.1-flash",
+      "effort": "provider_maximum_if_exposed"
+    },
+    "routing_rationale": "Proven retained long-horizon campaign orchestration in Slice D/E; creator reports very strong terminal/repo/software-agent performance. Supervisor is not an independent reviewer.",
+    "configured": {
+      "model": null,
+      "effort": null,
+      "verification": "not_assessed"
+    },
+    "effective": {
+      "model": null,
+      "effort": null,
+      "verification": "not_assessed"
+    }
+  },
+  "delegation": {
+    "may_spawn_workers": true,
+    "total_worker_launch_limit": 32,
+    "max_parallel_workers": 4,
+    "children_inherit_scope_ceiling": true,
+    "children_inherit_permission_ceiling": true,
+    "children_inherit_model": false,
+    "children_inherit_effort": false,
+    "children_inherit_test_scope": false,
+    "explicit_child_settings_required": true,
+    "delegation_value_required": true,
+    "children_receive_parcel": true,
+    "children_receive_full_supervisor_history": false,
+    "child_role_prompt_required": true
+  },
+  "routing_policy": {
+    "least_expensive_reliable_route": true,
+    "model_and_effort_independent": true,
+    "importance_is_not_escalation_reason": true,
+    "xhigh_requires_justification": true,
+    "max_requires_justification": true,
+    "astra_selected_for_horizon": true,
+    "escalation_allowed": true,
+    "escalation_conditions": [
+      "same semantic defect class recurs after a bounded repair",
+      "conflicting implementation evidence requires independent diagnosis",
+      "assigned family returns abnormal/null/incomplete result and the role remains materially necessary",
+      "oracle finds a concrete in-fence defect"
+    ],
+    "prohibited_escalation_reasons": [
+      "task_is_important",
+      "task_is_final",
+      "more_confidence_would_be_nice"
+    ]
+  },
+  "premium_budget": {
+    "supervisor_counts": true,
+    "astra_assignments": 0,
+    "sol_assignments": 0,
+    "xhigh_assignments": 0,
+    "max_assignments": 0,
+    "may_exceed_without_mick": false
+  },
+  "repair_budget": {
+    "bounded_repair_waves": 8,
+    "wave_definition": "one authorized repair dispatch against one classified finding set followed by its required validation checkpoint",
+    "same_writer_preferred_for_bounded_repairs": true,
+    "budget_resets_on_resume": false,
+    "budget_resets_on_restart": false,
+    "stop_new_forward_work_when_exhausted": true
+  },
+  "permissions": {
+    "authorized": {
+      "inspect_repo": true,
+      "edit_production": false,
+      "edit_tests": false,
+      "edit_docs": false,
+      "run_commands": true,
+      "run_tests": true,
+      "network": true,
+      "providers": true,
+      "credentials": false,
+      "orgmem": false,
+      "stage": false,
+      "commit": false,
+      "push": false,
+      "modify_refs": false
+    },
+    "configured": {
+      "status": "not_assessed",
+      "evidence": null
+    },
+    "effective": {
+      "status": "not_assessed",
+      "evidence": null
+    }
+  },
+  "impact": {
+    "target_paths": [
+      "exact tracked mutation paths are intentionally deferred to the design/oracle mutation fence"
+    ],
+    "changed_contracts": [
+      "campaign attempt/evidence representation",
+      "preflight/approval execution binding",
+      "selected worker regeneration",
+      "synthesis staleness/rerun",
+      "desktop campaign lifecycle/result projection"
+    ],
+    "known_producers": [
+      "manifest/job loader",
+      "campaign runner",
+      "provider adapters",
+      "event writer",
+      "run/stage/usage persistence"
+    ],
+    "known_consumers": [
+      "bots5 run/status/inspect CLI",
+      "native desktop Phase 10 surface",
+      "historical run readers",
+      "synthesis renderer/gates",
+      "human campaign evidence review"
+    ],
+    "affected_subsystems": [
+      "campaign manifest/model/runner/storage/events/usage",
+      "native Qt desktop/session/bootstrap integration",
+      "campaign tests and closure/current-state documentation"
+    ],
+    "cross_cutting": {
+      "authority": "possible",
+      "migration": "conditional_on_design",
+      "storage": "yes",
+      "filesystem": "yes",
+      "concurrency": "yes",
+      "provider": "yes",
+      "ui": "yes"
+    },
+    "impact_evidence": [
+      "current StageRecord/storage is one-record/one-output-per-stage",
+      "Phase 10 requires sibling attempts and explicit synthesis rerun",
+      "current runner rereads referenced filesystem inputs/prompts",
+      "current provider cost is generally known only from terminal provider telemetry",
+      "current filesystem run directory is the authoritative evidence boundary"
+    ],
+    "discovery_required": true
+  },
+  "validation_policy": {
+    "T0_exact": [
+      "zero-spend validation and approval binding",
+      "campaign lifecycle/progress/cost truth",
+      "result inspection",
+      "worker sibling regeneration",
+      "stale synthesis + explicit rerun"
+    ],
+    "T1_subsystem": [
+      "campaign engine + Phase 10 desktop subsystem"
+    ],
+    "T2_adjacent": [
+      "CLI compatibility, provider routing/cost, historical run readers, desktop shutdown/session"
+    ],
+    "T3_cross_cutting": [
+      "filesystem evidence, async/concurrency/shutdown/provider uncertainty only where touched"
+    ],
+    "T4_full_suite": {
+      "required": true,
+      "trigger": "Phase 10 milestone closure and shared campaign-engine substrate"
+    },
+    "explicitly_excluded": [
+      "paid external provider canary unless separately authorized",
+      "Phase 11 packaging",
+      "Phase 12 torture campaign"
+    ],
+    "selection_rationale": "Focused T0-T3 while implementing; one final full repository suite on the final exact sealed candidate. No repeated T4 tax without concrete impact evidence.",
+    "autonomous_expansion_requires_dependency_evidence": true,
+    "test_repair_may_change_product_requirement": false
+  },
+  "review_policy": {
+    "independent_review_required": true,
+    "falsification_required": true,
+    "fresh_context_required_when_material": true,
+    "specialist_review_preferred": true,
+    "evidence_reconciliation_required": true
+  },
+  "candidate_policy": {
+    "seal_required": true,
+    "initial_seal_before_independent_review": true,
+    "reverify_before_review": true,
+    "reseal_after_candidate_change": true,
+    "preserve_superseded_seals": true,
+    "evidence_reuse_requires_applicability_reconciliation": true,
+    "administrative_evidence_outside_candidate_by_default": true
+  },
+  "autonomy": {
+    "continue_inside_fence": true,
+    "routine_findings_are_not_stop_conditions": true,
+    "routine_repairs_are_autonomous": true,
+    "routine_resealing_is_autonomous": true,
+    "routine_evidence_reconciliation_is_autonomous": true,
+    "authorized_escalation_is_autonomous": true
+  },
+  "evidence": {
+    "preserve_failed_attempts": true,
+    "preserve_original_worker_reports": true,
+    "classify_before_repair": true,
+    "raw_logs_required": true,
+    "hashes_required": true,
+    "candidate_seal_required": true,
+    "required": [
+      "preflight baseline report",
+      "design specialist reports",
+      "sealed integrated design",
+      "design falsification and oracle",
+      "verbatim Mick continuation if implementation authorized",
+      "successor parcel-v2",
+      "implementation phase ledger",
+      "focused validation logs",
+      "implementation candidate manifest+seal before independent review",
+      "original independent reviewer reports",
+      "final T4 evidence bound to exact seal",
+      "final MiMo oracle",
+      "COMMIT_BOUNDARY_REPORT.md",
+      "usage/model routing telemetry"
+    ]
+  },
+  "usage": {
+    "checkpoint_required": true,
+    "meter": "campaign provider/API cost plus child-launch/repair counters; ChatGPT/Codex allowance only where actually observable",
+    "start": {
+      "percent": null,
+      "observed_at": null
+    }
+  },
+  "rendering": {
+    "prompt_path": "prompts/SUPERVISOR_LAUNCH.md",
+    "consistency_check": "pass_prelaunch",
+    "prompt_style": "concise_reference"
+  },
+  "closeout": {
+    "usage_telemetry_required": true,
+    "technical_completion_may_precede_administrative_closeout": true,
+    "substantive_acceptance_requires_mick": true,
+    "commit_requires_mick": true,
+    "push_requires_mick": true
+  },
+  "context_delivery": {
+    "mode": "immutable_parcel",
+    "parcel_id": "bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01-parcel-v1",
+    "parcel_manifest_path": "codex-context-parcel.json",
+    "parcel_manifest_sha256": "53a4a0248f43d42081daef5c9fce377f43436ad20ad9465b4c4b5b7ac70e6fed",
+    "supervisor_prompt_path": "prompts/SUPERVISOR_LAUNCH.md",
+    "inline_exception_reason": null,
+    "parcel_immutable_after_launch": true
+  }
+}

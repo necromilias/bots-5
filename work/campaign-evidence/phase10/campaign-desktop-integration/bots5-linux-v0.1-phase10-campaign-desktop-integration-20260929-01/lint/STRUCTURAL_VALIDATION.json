@@ -1,0 +1,26 @@
+{
+  "campaign_id": "bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01",
+  "status": "PASS",
+  "checks": {
+    "campaign_template_version_0_3": true,
+    "context_parcel_present": true,
+    "parcel_all_required_files_hashed": true,
+    "parcel_bound_to_campaign_record": true,
+    "design_only_initial_permissions": true,
+    "stage_commit_push_refs_orgmem_forbidden": true,
+    "exact_baseline_pinned": true,
+    "phase10_not_campaign_authoring": true,
+    "generic_retry_resume_reuse_forbidden": true,
+    "approval_binding_risk_recorded": true,
+    "pricing_authority_gap_recorded": true,
+    "seal_before_independent_review_required": true,
+    "final_t4_required": true,
+    "nonzero_test_collection_rule_present": true,
+    "no_repeat_passed_suite_for_count_rule_present": true,
+    "solar_excluded": true,
+    "jamba_final_review_only_max_one": true,
+    "gemini_architect_luna_falsifier_mimo_oracle": true,
+    "child_launch_limit_32": true,
+    "repair_wave_limit_8": true
+  }
+}

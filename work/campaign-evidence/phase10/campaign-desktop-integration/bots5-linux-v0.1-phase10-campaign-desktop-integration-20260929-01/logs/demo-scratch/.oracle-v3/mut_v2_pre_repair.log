@@ -1,0 +1,61 @@
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_ test_regenerate_opens_real_qdialog_over_selected_stage_and_typed_model_reaches_prepared_operation _
+
+tmp_path = PosixPath('/tmp/pytest-of-mick/pytest-2/test_regenerate_opens_real_qdi0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f0e93a510f0>
+
+    def test_regenerate_opens_real_qdialog_over_selected_stage_and_typed_model_reaches_prepared_operation(tmp_path, monkeypatch):
+        """D-2 behavioural guard: ``_on_regenerate`` really opens a QDialog.
+    
+        Over a real job tree with a real succeeded evidence-v2 run: a stage row is
+        selected, ``QDialog.exec`` is patched to return Accepted (the operator
+        confirms the dialog and types a replacement model), ``_on_regenerate`` is
+        called for real, and the model the operator typed is bound into the
+        prepared ``worker_regeneration`` operation. The pre-repair QWidget dialog
+        raised AttributeError here; a non-QDialog substitute cannot pass.
+        """
+        from PySide6.QtWidgets import (
+            QApplication,
+            QDialog,
+            QDialogButtonBox,
+            QFileDialog,
+            QLineEdit,
+        )
+    
+        qt_application = QApplication.instance() or QApplication([])
+    
+        provider = _OfflineRoutedProvider(
+            results={"model-w1": "worker-one-output", "model-synth": "synth-output"}
+        )
+        bridge, _run_dir, job_path = _run_v2_full_run(tmp_path, provider)
+    
+        dock = CampaignDockWidget(bridge_factory=lambda runs_dir: bridge)
+        monkeypatch.setattr(
+            QFileDialog,
+            "getOpenFileName",
+            staticmethod(lambda *args, **kwargs: (str(job_path), "")),
+        )
+        dock._on_load_job()
+        asyncio.run(dock._refresh_projection_async())
+    
+        table = dock._stages_table
+        assert table.rowCount() >= 1
+        assert table.item(0, 0).text() == "w1"
+        table.selectRow(0)
+        # A succeeded stage keeps Regenerate enabled (it is the normal target).
+>       assert dock._regenerate_button.isEnabled()
+E       assert False
+E        +  where False = <built-in method isEnabled of PySide6.QtWidgets.QPushButton object at 0x7f0e93af8600>()
+E        +    where <built-in method isEnabled of PySide6.QtWidgets.QPushButton object at 0x7f0e93af8600> = <PySide6.QtWidgets.QPushButton(0x56000435b4c0, name="campaignRegenerateButton") at 0x7f0e93af8600>.isEnabled
+E        +      where <PySide6.QtWidgets.QPushButton(0x56000435b4c0, name="campaignRegenerateButton") at 0x7f0e93af8600> = <bots5.desktop.campaign_dock.CampaignDockWidget(0x560004187b60, name="campaignDock") at 0x7f0e93ad7240>._regenerate_button
+
+tests/test_phase10_desktop_lifecycle.py:1018: AssertionError
+=============================== warnings summary ===============================
+tests/test_phase10_desktop_lifecycle.py::test_regenerate_opens_real_qdialog_over_selected_stage_and_typed_model_reaches_prepared_operation
+  /home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/.venv314/lib/python3.14/site-packages/pytest_asyncio/plugin.py:1216: DeprecationWarning: 'asyncio.get_event_loop_policy' is deprecated and slated for removal in Python 3.16
+    return asyncio.get_event_loop_policy()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_phase10_desktop_lifecycle.py::test_regenerate_opens_real_qdialog_over_selected_stage_and_typed_model_reaches_prepared_operation

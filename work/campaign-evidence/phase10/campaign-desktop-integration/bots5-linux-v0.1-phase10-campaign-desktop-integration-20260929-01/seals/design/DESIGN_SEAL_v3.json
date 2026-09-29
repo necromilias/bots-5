@@ -1,0 +1,151 @@
+{
+  "baseline_head": "0756904481ae884bb9e864e8e1e11fc4a27a72ff",
+  "baseline_tree": "7fe879035a01a87339dfe6319a435fa0e84c94bd",
+  "campaign_id": "bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01",
+  "created_at": "2026-09-28T21:34:19Z",
+  "design_artifacts": [
+    {
+      "bytes": 11688,
+      "path": "design/CAMPAIGN_EVIDENCE_EVOLUTION.md",
+      "sha256": "a7041a60e173c9c3b1b6f602a69091c8170327944d0ff2244b4bc85de8f9e0cc"
+    },
+    {
+      "bytes": 4331,
+      "path": "design/CLOSURE_STRATEGY.md",
+      "sha256": "ad5b2488bd74f0d9bc2a77865dbbab44654f21eecf0a41c7f45d92b1229abb4b"
+    },
+    {
+      "bytes": 14930,
+      "path": "design/DESKTOP_SURFACE_AND_LIFECYCLE.md",
+      "sha256": "008f081b17a0b58997a3d16aab318c84a8c5dafc8db9c5ebbe9deef78be0c93c"
+    },
+    {
+      "bytes": 9433,
+      "path": "design/HUMAN_SEMANTIC_FORK_REGISTER.md",
+      "sha256": "4b48890bde20a26acd15adf4601a7b9e9ba7a2825289297b82d8b8f8de4abcdd"
+    },
+    {
+      "bytes": 4424,
+      "path": "design/IMPLEMENTATION_SEQUENCE.md",
+      "sha256": "309b405e7d64d7041c092bbb257ce573e76b34906805fbefe5ec674bad1558bb"
+    },
+    {
+      "bytes": 5248,
+      "path": "design/INTEGRATION_RECORD.md",
+      "sha256": "f7e3d5a8866e80276493c7b89ce547bd50d2491f07833cde59de6ac6d3adec0d"
+    },
+    {
+      "bytes": 10028,
+      "path": "design/MUTATION_FENCE.json",
+      "sha256": "a13816988b0059d381b86c9d80f83003fde697a849fedf0acd351879e6941635"
+    },
+    {
+      "bytes": 12608,
+      "path": "design/PHASE10_CAMPAIGN_DESKTOP_DESIGN.md",
+      "sha256": "a525cda60d6cd62bdd281b78481e0c13f88146df7f7cb10eea8ae0cfd48977ac"
+    },
+    {
+      "bytes": 15266,
+      "path": "design/PREFLIGHT_APPROVAL_STATE_MACHINE.md",
+      "sha256": "33956d0415d9518850748c8f82ffddfa51e2ba63516c81ca3ba350d9d0dec9da"
+    },
+    {
+      "bytes": 14037,
+      "path": "design/REGENERATION_AND_STALE_SYNTHESIS.md",
+      "sha256": "477d42542e3372ff1f53d9b0b4d6edbd486d47921f140727855bb29ed5976ff0"
+    },
+    {
+      "bytes": 6891,
+      "path": "design/SPECIALIST_DISAGREEMENTS.md",
+      "sha256": "4475ad82e948e0dec426c2a533e1735aa71b5ff3b632e477ad35d3c21d7ee9ab"
+    },
+    {
+      "bytes": 13431,
+      "path": "design/VALIDATION_PLAN.md",
+      "sha256": "55699b59a2803721d59a5c9b6ece8f6fd1d606aed71f4562c6b795507ce3e611"
+    }
+  ],
+  "oracle_inputs": [
+    {
+      "bytes": 34247,
+      "path": "reports/oracle/MIMO_FINAL_DESIGN_ORACLE.md",
+      "sha256": "8dfab3b48aa0aff430b231b23d065ff7bc0220518a2954d5fb869b4d3a8cb21c"
+    }
+  ],
+  "orgmem_ref": "cc0c3c80348b1d798def65988102e0d8ad966730",
+  "parcel_version": 1,
+  "referenced_inputs": [
+    {
+      "bytes": 7166,
+      "path": "reports/design/COMMAND_OPERATOR_AUTHORITY_UX.md",
+      "sha256": "724551264ca287e182a84e1c0a7fe3e6837d8c10f5bca6f82b8f2b0de141b2fc"
+    },
+    {
+      "bytes": 6833,
+      "path": "reports/design/DESIGN_REPAIR_RECORD_v1_to_v2.md",
+      "sha256": "14fa28318198bc7583fe3b7340c62aa3b779bf00440fef72fd32bd647b874b16"
+    },
+    {
+      "bytes": 5767,
+      "path": "reports/design/DESIGN_REPAIR_RECORD_v2_to_v3.md",
+      "sha256": "85ce04b5ec152289b4be81c08f13a15fab0d627a4f4d678a2f98c65fe0de0d61"
+    },
+    {
+      "bytes": 47665,
+      "path": "reports/design/GEMINI_EVIDENCE_REGEN_ARCHITECTURE.md",
+      "sha256": "c90d61c38ca89b0eee6b26b340219019c512f42564f49000d9c7319ccf7c90ba"
+    },
+    {
+      "bytes": 12212,
+      "path": "reports/design/GLM_FEASIBILITY_AND_MUTATION_FENCE.md",
+      "sha256": "b32cc8d5a2d6b3af8c2f87d6548e9aaab824fcdc3618e85127ec58fa6bd4e9fd"
+    },
+    {
+      "bytes": 6938,
+      "path": "reports/design/GLM_PROPOSED_FENCE.json",
+      "sha256": "cc8087abff2b5dc83dd827d99ada0e49c8b45c554adf834b9bf36141f8c05faf"
+    },
+    {
+      "bytes": 43054,
+      "path": "reports/design/MINIMAX_LIFECYCLE_FORENSICS.md",
+      "sha256": "555c648e08ae01a4f3df566f5141daf430af143b8bc55b188e563581fd232673"
+    },
+    {
+      "bytes": 66078,
+      "path": "reports/design/QWEN_CAMPAIGN_ARCHAEOLOGY.md",
+      "sha256": "a1a8240bbe8d81e697117bbc3a37df7b8e5e6641b109220aba5df8af5bb94a3d"
+    },
+    {
+      "bytes": 34913,
+      "path": "reports/design/STEP_VALIDATION_ARCHITECTURE.md",
+      "sha256": "152bc8def3c7b7bea082a55d70a3ac1128126bd7b866f5b5a4e820e8d28fd384"
+    }
+  ],
+  "repair_records": [
+    "reports/design/DESIGN_REPAIR_RECORD_v1_to_v2.md",
+    "reports/design/DESIGN_REPAIR_RECORD_v2_to_v3.md"
+  ],
+  "review_inputs": [
+    {
+      "bytes": 22155,
+      "path": "reports/review/GPT6_LUNA_DESIGN_FALSIFICATION.md",
+      "sha256": "16524cfa1ad4bbdbfaa051b10908591b5b76c016a3dd6031f0d5567d3817b8fe"
+    }
+  ],
+  "seal_chain": [
+    {
+      "seal": "DESIGN_SEAL_v1.json",
+      "seal_id": "7ecbb502bd65dcc2ad1595b1dd709db3eff0bc5d5e079b00f8e77c29ee6d952f"
+    },
+    {
+      "seal": "DESIGN_SEAL_v2.json",
+      "seal_id": "2a57410dc1da155aab7fcbf480a244b999eac3525a9c7737e40adc703fdee0e4"
+    }
+  ],
+  "seal_template": "phase10-design-seal",
+  "seal_version": 3,
+  "supersedes": {
+    "seal": "DESIGN_SEAL_v2.json",
+    "seal_id": "2a57410dc1da155aab7fcbf480a244b999eac3525a9c7737e40adc703fdee0e4"
+  }
+}

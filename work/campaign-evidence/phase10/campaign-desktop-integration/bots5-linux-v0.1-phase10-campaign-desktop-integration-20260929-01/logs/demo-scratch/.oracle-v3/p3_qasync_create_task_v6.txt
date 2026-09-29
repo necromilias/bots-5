@@ -1,0 +1,47 @@
+==============================================================================
+P3 — five asyncio.create_task sites under the real qasync QEventLoop
+==============================================================================
+  dock.isVisible()                            : True
+  running loop inside coroutine               : QSelectorEventLoop
+  bridge factory calls                        : 1
+  bridge bound                                : True
+  validate status                             : Validation successful (zero spend)
+  646 _on_approve create_task                 : OK status='Run started'
+    hosted task running                       : True
+    provider factory constructions            : 1
+    rows while running                        : 2
+    run identity while running                : Run: test-job-20260929T221224Z-9db03e0b | Dir: /tmp/oracle-v2-p3-hsa702zv/.bots5/runs/test-job-20260929T221224Z-9db03e0b | State: running
+  698 _on_poll_timeout create_task            : OK (no RuntimeError)
+  1045 _on_visibility_changed create_task     : OK poll_timer_active=True
+  918 _on_make_current create_task            : OK status='Made w1 attempt 1 current'
+  1040 _on_cancel create_task                 : OK status='Cancel requested'
+    durable run state after cancel            : failed
+    durable stage records                     : ['synth.att1.json', 'w1.att1.json']
+    durable stage states                      : {"synth.att1.json": "failed", "w1.att1.json": "succeeded"}
+    bridge cancel verified terminal           : no exception raised
+    display state after cancel                : failed
+    cost line after cancel                    : cost: 0.01 + 1 unknown (synth) (partial)
+
+SUMMARY
+  dock.isVisible() = True
+  running loop inside coroutine = QSelectorEventLoop
+  bridge factory calls = 1
+  bridge bound = True
+  validate status = Validation successful (zero spend)
+  646 _on_approve create_task = OK status='Run started'
+    hosted task running = True
+    provider factory constructions = 1
+    rows while running = 2
+    run identity while running = Run: test-job-20260929T221224Z-9db03e0b | Dir: /tmp/oracle-v2-p3-hsa702zv/.bots5/runs/test-job-20260929T221224Z-9db03e0b | State: running
+  698 _on_poll_timeout create_task = OK (no RuntimeError)
+  1045 _on_visibility_changed create_task = OK poll_timer_active=True
+  918 _on_make_current create_task = OK status='Made w1 attempt 1 current'
+  1040 _on_cancel create_task = OK status='Cancel requested'
+    durable run state after cancel = failed
+    durable stage records = ['synth.att1.json', 'w1.att1.json']
+    durable stage states = {"synth.att1.json": "failed", "w1.att1.json": "succeeded"}
+    bridge cancel verified terminal = no exception raised
+    display state after cancel = failed
+    cost line after cancel = cost: 0.01 + 1 unknown (synth) (partial)
+
+SITES FAILING UNDER QASYNC: NONE

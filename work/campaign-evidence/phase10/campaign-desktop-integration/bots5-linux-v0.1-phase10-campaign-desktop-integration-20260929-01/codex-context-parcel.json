@@ -1,0 +1,89 @@
+{
+  "template": "codex-context-parcel",
+  "template_version": "0.1",
+  "parcel_id": "bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01-parcel-v1",
+  "job_or_campaign_id": "bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01",
+  "policy": {
+    "id": "procedure.codex-job-governance",
+    "version": "0.3",
+    "path": "procedures/candidates/CODEX_PROMPT_GENERATION_POLICY.md"
+  },
+  "root_path": ".",
+  "immutable_after_launch": true,
+  "files": {
+    "contract": {
+      "path": "parcel/CONTRACT.md",
+      "required": true,
+      "sha256": "f71a75bf7415a533b2e38143e8ed3f627c308d4242d90d236b850c6a50f8c5ec"
+    },
+    "scope": {
+      "path": "parcel/SCOPE.json",
+      "required": true,
+      "sha256": "1c5e145d52d56bfffee2c52c3e6748188f8f8fa06fef9c710684563579790326"
+    },
+    "baseline": {
+      "path": "parcel/BASELINE.json",
+      "required": true,
+      "sha256": "c9de025de9bb73c61a2a383a5913618510fe5bad98c2b4f73fad43b9078b47e3"
+    },
+    "budget": {
+      "path": "parcel/BUDGET.json",
+      "required": true,
+      "sha256": "b04214e94d266521b8acf0715829ae5f0a74ccc86c9046ccd1e9e415738179cc"
+    },
+    "validation": {
+      "path": "parcel/VALIDATION.md",
+      "required": true,
+      "sha256": "28910aaaf73bc150aaeb319009c59f24afb96fc064a001dcb8b7c880e9906e6e"
+    },
+    "sources": {
+      "path": "parcel/SOURCES.md",
+      "required": true,
+      "sha256": "b8e7b027ede44494833355541dba30b8e23a4456908b88065f5bf12d5fdacca6"
+    },
+    "findings": {
+      "path": "parcel/FINDINGS.md",
+      "required": true,
+      "sha256": "05fe3ca1720a746d877d6eb072bdea65c3bbeeba52ae1138c792d86dfcd2af73"
+    },
+    "candidate": {
+      "path": "parcel/CANDIDATE.json",
+      "required": false,
+      "sha256": null
+    }
+  },
+  "authority_sources": [
+    {
+      "repository": "necromilias/organisational-memory",
+      "ref": "cc0c3c80348b1d798def65988102e0d8ad966730",
+      "role": "accepted_product_architecture_sequence_and_governance"
+    },
+    {
+      "repository": "necromilias/bots-5",
+      "ref": "0756904481ae884bb9e864e8e1e11fc4a27a72ff",
+      "role": "landed_runtime_and_current_technical_contract"
+    },
+    {
+      "source": "Mick current request",
+      "role": "campaign_pack_generation_and_model-routing instruction"
+    }
+  ],
+  "precedence": [
+    "Mick current explicit adjudication",
+    "pinned canonical OrgMem authority",
+    "pinned B.O.T.S. live implementation/runtime truth",
+    "current normative B.O.T.S. documentation where consistent",
+    "historical campaign/report evidence",
+    "model creator claims/benchmarks for routing only"
+  ],
+  "integrity": {
+    "hash_algorithm": "sha256",
+    "all_present_files_hashed": true
+  },
+  "notes": [
+    "Parcel-v1 is design-only.",
+    "Implementation requires a retained continuation and immutable successor parcel-v2.",
+    "Solar Pro 4 is explicitly excluded from Phase 10 routing.",
+    "Jamba is optional final implementation reviewer only, max one launch."
+  ]
+}

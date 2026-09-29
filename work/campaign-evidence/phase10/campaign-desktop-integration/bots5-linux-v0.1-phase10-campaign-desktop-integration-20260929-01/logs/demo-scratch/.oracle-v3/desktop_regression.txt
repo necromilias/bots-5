@@ -1,0 +1,28 @@
+============================= test session starts ==============================
+platform linux -- Python 3.14.7, pytest-9.1.1, pluggy-1.6.0
+PySide6 6.11.2 -- Qt runtime 6.11.2 -- Qt compiled 6.11.2
+rootdir: /home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, asyncio-0.26.0, qt-4.5.0
+asyncio: mode=Mode.STRICT, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 62 items
+
+tests/test_phase9_desktop_slice_e.py ...............................     [ 50%]
+tests/test_phase7_desktop.py .........                                   [ 64%]
+tests/test_phase1_desktop.py ...                                         [ 69%]
+tests/test_desktop_draft1.py .............                               [ 90%]
+tests/test_phase1_core.py ......                                         [100%]
+
+=============================== warnings summary ===============================
+tests/test_phase9_desktop_slice_e.py::test_transcript_export_action_writes_file_while_gui_thread_keeps_ticking
+  /home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/.venv314/lib/python3.14/site-packages/pytest_asyncio/plugin.py:1216: DeprecationWarning: 'asyncio.get_event_loop_policy' is deprecated and slated for removal in Python 3.16
+    return asyncio.get_event_loop_policy()
+
+tests/test_phase9_desktop_slice_e.py: 40707 warnings
+tests/test_phase7_desktop.py: 89 warnings
+tests/test_desktop_draft1.py: 2689 warnings
+  /home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/.venv314/lib/python3.14/site-packages/qasync/__init__.py:489: DeprecationWarning: 'asyncio.iscoroutinefunction' is deprecated and slated for removal in Python 3.16; use inspect.iscoroutinefunction() instead
+    if asyncio.iscoroutinefunction(callback):
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+================ 62 passed, 43486 warnings in 317.09s (0:05:17) ================

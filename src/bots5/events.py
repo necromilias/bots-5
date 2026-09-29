@@ -22,6 +22,16 @@ EVENT_TYPES = {
     "run_timed_out",
     "run_succeeded",
     "run_failed",
+    # Phase 10 additive vocabulary (CAMPAIGN_EVIDENCE_EVOLUTION.md §5). Append
+    # only: no existing kind is removed or renamed, and the writer below stays
+    # fail-closed (unknown types still raise StorageError).
+    "attempt_selected",
+    "synthesis_stale",
+    "run_cancelled",
+    "worker_regeneration_started",
+    "worker_regeneration_finished",
+    "synthesis_rerun_started",
+    "synthesis_rerun_finished",
 }
 
 

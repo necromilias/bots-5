@@ -1,0 +1,15 @@
+v5_pre_repair: exit=1 :: -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+  detail: FAILED tests/test_phase10_cross_cutting.py::test_synthesis_cancelled_before_dispatch_is_not_applicable_without_false_warning 
+775fcdcc9e8bc4ab613b076206d3cfe492a577f2b8d3407db63817247eea510f  src/bots5/desktop/campaign_dock.py 74f7df0f65721f29f5d7b3602531c46e0b5636d9e8c57f68fb88baa94565d0c2  src/bots5/storage.py 
+v6_pre_repair: exit=1 :: -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+  detail: FAILED tests/test_phase10_evidence_regeneration.py::test_persist_stage_attempt_output_fault_leaves_metadata_unadvanced 
+775fcdcc9e8bc4ab613b076206d3cfe492a577f2b8d3407db63817247eea510f  src/bots5/desktop/campaign_dock.py 74f7df0f65721f29f5d7b3602531c46e0b5636d9e8c57f68fb88baa94565d0c2  src/bots5/storage.py 
+v2_pre_repair: exit=1 :: -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+  detail: FAILED tests/test_phase10_desktop_lifecycle.py::test_regenerate_opens_real_qdialog_over_selected_stage_and_typed_model_reaches_prepared_operation 
+775fcdcc9e8bc4ab613b076206d3cfe492a577f2b8d3407db63817247eea510f  src/bots5/desktop/campaign_dock.py 74f7df0f65721f29f5d7b3602531c46e0b5636d9e8c57f68fb88baa94565d0c2  src/bots5/storage.py 
+d2_pre_repair: exit=1 :: -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+  detail: FAILED tests/test_phase10_desktop_lifecycle.py::test_regenerate_opens_real_qdialog_over_selected_stage_and_typed_model_reaches_prepared_operation 
+775fcdcc9e8bc4ab613b076206d3cfe492a577f2b8d3407db63817247eea510f  src/bots5/desktop/campaign_dock.py 74f7df0f65721f29f5d7b3602531c46e0b5636d9e8c57f68fb88baa94565d0c2  src/bots5/storage.py 
+v6_pristine_all: exit=4 :: (no match in any of [<Module test_phase10_desktop_lifecycle.py>])
+  detail: 
+775fcdcc9e8bc4ab613b076206d3cfe492a577f2b8d3407db63817247eea510f  src/bots5/desktop/campaign_dock.py 74f7df0f65721f29f5d7b3602531c46e0b5636d9e8c57f68fb88baa94565d0c2  src/bots5/storage.py 

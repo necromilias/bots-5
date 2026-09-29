@@ -1,0 +1,21 @@
+{
+  "template": "phase10-retained-continuation",
+  "template_version": "1",
+  "campaign_id": "bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01",
+  "from_parcel_id": "bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01-parcel-v1",
+  "from_campaign_record_sha256": "8eeb092f3c21daf9fe1aabddb7b4d4d410812c9dbfb1634eafd36fd93a60af7e",
+  "from_parcel_manifest_sha256": "53a4a0248f43d42081daef5c9fce377f43436ad20ad9465b4c4b5b7ac70e6fed",
+  "accepted_design_seal": null,
+  "human_adjudication_verbatim_path": "continuation/HUMAN_ADJUDICATION_VERBATIM.md",
+  "successor_campaign_record_path": "continuation/codex-campaign-v2.json",
+  "successor_parcel_manifest_path": "continuation/codex-context-parcel-v2.json",
+  "authority_granted": null,
+  "forbidden_inference": [
+    "design acceptance does not imply commit",
+    "implementation authority does not imply substantive acceptance",
+    "substantive acceptance does not imply staging/commit",
+    "commit does not imply push",
+    "push does not imply OrgMem mutation"
+  ],
+  "status": "awaiting_design_gate"
+}

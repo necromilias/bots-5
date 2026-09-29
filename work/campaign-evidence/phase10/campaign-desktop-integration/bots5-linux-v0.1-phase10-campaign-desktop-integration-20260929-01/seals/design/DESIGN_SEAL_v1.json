@@ -1,0 +1,110 @@
+{
+  "baseline_head": "0756904481ae884bb9e864e8e1e11fc4a27a72ff",
+  "baseline_tree": "7fe879035a01a87339dfe6319a435fa0e84c94bd",
+  "campaign_id": "bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01",
+  "created_at": "2026-09-28T21:02:10Z",
+  "design_artifacts": [
+    {
+      "bytes": 9576,
+      "path": "design/CAMPAIGN_EVIDENCE_EVOLUTION.md",
+      "sha256": "207cf1c8bdc83792d9013d9c1e8dd3acb30d4abfb07fcb3094f6b4c52c2d764c"
+    },
+    {
+      "bytes": 4331,
+      "path": "design/CLOSURE_STRATEGY.md",
+      "sha256": "ad5b2488bd74f0d9bc2a77865dbbab44654f21eecf0a41c7f45d92b1229abb4b"
+    },
+    {
+      "bytes": 10807,
+      "path": "design/DESKTOP_SURFACE_AND_LIFECYCLE.md",
+      "sha256": "906627feb2eafb57659da08478e317bdeb56046c425591450ba2c2c1822add1a"
+    },
+    {
+      "bytes": 8790,
+      "path": "design/HUMAN_SEMANTIC_FORK_REGISTER.md",
+      "sha256": "8194688e21b84716f14d68cdaa5b725fd5ed378bf621be6fac0dcfd033853284"
+    },
+    {
+      "bytes": 4303,
+      "path": "design/IMPLEMENTATION_SEQUENCE.md",
+      "sha256": "e4570619eced7308c7387d68bbdaf6cee32398528b08b7dd07548bfb352b4173"
+    },
+    {
+      "bytes": 5248,
+      "path": "design/INTEGRATION_RECORD.md",
+      "sha256": "f7e3d5a8866e80276493c7b89ce547bd50d2491f07833cde59de6ac6d3adec0d"
+    },
+    {
+      "bytes": 9228,
+      "path": "design/MUTATION_FENCE.json",
+      "sha256": "2afdea2ca4fc32b5fcd6f8f6b33e4ee29b8653d90f9c7834aeb4edf8d3840f84"
+    },
+    {
+      "bytes": 11786,
+      "path": "design/PHASE10_CAMPAIGN_DESKTOP_DESIGN.md",
+      "sha256": "9a9f70827c9aad5cecea55c0bed26a8c97bf3cb00cf872952067ebf59ec98331"
+    },
+    {
+      "bytes": 8962,
+      "path": "design/PREFLIGHT_APPROVAL_STATE_MACHINE.md",
+      "sha256": "cb7e5ba066cb41dc4863175b87674d293d58cc62d2262b6d5ece5ce8fa80f1bb"
+    },
+    {
+      "bytes": 8611,
+      "path": "design/REGENERATION_AND_STALE_SYNTHESIS.md",
+      "sha256": "d53e3f576e21fec3b5704810c5cf6b9e09875452367cac08f951a657d3f81f7d"
+    },
+    {
+      "bytes": 6866,
+      "path": "design/SPECIALIST_DISAGREEMENTS.md",
+      "sha256": "1914d0d0b0c384eba35927446bcaf62a68d898c574277e511561d94d081bcc5f"
+    },
+    {
+      "bytes": 10990,
+      "path": "design/VALIDATION_PLAN.md",
+      "sha256": "8da9a9f55ed00cee0255d24c59df0249b5adc0800ecaba2133e8642c8e14ad8c"
+    }
+  ],
+  "orgmem_ref": "cc0c3c80348b1d798def65988102e0d8ad966730",
+  "parcel_version": 1,
+  "referenced_inputs": [
+    {
+      "bytes": 7166,
+      "path": "reports/design/COMMAND_OPERATOR_AUTHORITY_UX.md",
+      "sha256": "724551264ca287e182a84e1c0a7fe3e6837d8c10f5bca6f82b8f2b0de141b2fc"
+    },
+    {
+      "bytes": 47665,
+      "path": "reports/design/GEMINI_EVIDENCE_REGEN_ARCHITECTURE.md",
+      "sha256": "c90d61c38ca89b0eee6b26b340219019c512f42564f49000d9c7319ccf7c90ba"
+    },
+    {
+      "bytes": 12212,
+      "path": "reports/design/GLM_FEASIBILITY_AND_MUTATION_FENCE.md",
+      "sha256": "b32cc8d5a2d6b3af8c2f87d6548e9aaab824fcdc3618e85127ec58fa6bd4e9fd"
+    },
+    {
+      "bytes": 6938,
+      "path": "reports/design/GLM_PROPOSED_FENCE.json",
+      "sha256": "cc8087abff2b5dc83dd827d99ada0e49c8b45c554adf834b9bf36141f8c05faf"
+    },
+    {
+      "bytes": 43054,
+      "path": "reports/design/MINIMAX_LIFECYCLE_FORENSICS.md",
+      "sha256": "555c648e08ae01a4f3df566f5141daf430af143b8bc55b188e563581fd232673"
+    },
+    {
+      "bytes": 66078,
+      "path": "reports/design/QWEN_CAMPAIGN_ARCHAEOLOGY.md",
+      "sha256": "a1a8240bbe8d81e697117bbc3a37df7b8e5e6641b109220aba5df8af5bb94a3d"
+    },
+    {
+      "bytes": 34913,
+      "path": "reports/design/STEP_VALIDATION_ARCHITECTURE.md",
+      "sha256": "152bc8def3c7b7bea082a55d70a3ac1128126bd7b866f5b5a4e820e8d28fd384"
+    }
+  ],
+  "seal_template": "phase10-design-seal",
+  "seal_version": 1,
+  "supersedes": null
+}

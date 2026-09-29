@@ -1,0 +1,80 @@
+{
+  "campaign_id": "bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01",
+  "parcel_version": 2,
+  "initial_phase": "design_only",
+  "initial_allowed": [
+    "read/inspect the exact B.O.T.S. checkout and pinned OrgMem authority",
+    "run zero-provider commands and tests for discovery/evidence",
+    "write retained campaign evidence under the campaign work/evidence area",
+    "launch the explicitly authorized design/review worker models within budget",
+    "repair/reseal design evidence inside the design-evidence fence",
+    "record runtime/model/effort availability truthfully"
+  ],
+  "initial_forbidden": [
+    "tracked product/test/documentation mutation",
+    "dependency changes",
+    "external B.O.T.S. product provider/API test calls",
+    "campaign job publication or execution through B.O.T.S. solely to prove UI",
+    "staging",
+    "commit",
+    "push",
+    "ref mutation",
+    "OrgMem mutation",
+    "Phase 11 or Phase 12 work",
+    "general campaign authoring system",
+    "generic stage retry/resume/reuse",
+    "automatic retry after uncertain provider spend",
+    "daemon/remote-client/tool/plugin/RAG/mode-framework work",
+    "retained-installation cleanup"
+  ],
+  "post_gate_rule": "No tracked mutation until Mick accepts an exact sealed Phase 10 design and grants implementation authority; then persist a continuation and create immutable parcel-v2.",
+  "human_stop_conditions": [
+    "a genuine product/authority semantic fork not mechanically settled by current authority",
+    "exact mutation fence proves materially broader than accepted Phase 10",
+    "a dependency change is required",
+    "provider-route/model-change semantics for regeneration require broader authority",
+    "preflight pricing authority cannot be resolved without a product choice",
+    "durable result/New Job behavior across application restart requires an unrecorded product choice",
+    "the existing campaign engine would need to be replaced rather than extended",
+    "budget exhausted before required evidence can be completed",
+    "a required critical model role is unavailable and no already-authorized independent route can satisfy it",
+    "candidate repair requires work outside the accepted implementation fence",
+    "the accepted mutation fence, accepted product semantics, dependency boundary, or a Mick adjudication must change"
+  ],
+  "later_gates": {
+    "substantive_acceptance": "Mick only",
+    "stage_commit": "Mick only",
+    "push": "Mick only",
+    "orgmem_landing": "Mick only"
+  },
+  "current_phase": "implementation_authorized",
+  "implementation_allowed": [
+    "tracked product/test mutation strictly inside design/MUTATION_FENCE.json (9 modify, 8 add)",
+    "focused T0-T3 validation during milestones, one final serial T4 on the exact final sealed candidate",
+    "independent implementation falsification/review against a materialized candidate seal",
+    "bounded repairs inside the fence + candidate resealing",
+    "campaign evidence writes under the campaign work/evidence area"
+  ],
+  "implementation_forbidden": [
+    "tracked product/test/documentation mutation",
+    "dependency changes",
+    "external B.O.T.S. product provider/API test calls",
+    "campaign job publication or execution through B.O.T.S. solely to prove UI",
+    "staging",
+    "commit",
+    "push",
+    "ref mutation",
+    "OrgMem mutation",
+    "Phase 11 or Phase 12 work",
+    "general campaign authoring system",
+    "generic stage retry/resume/reuse",
+    "automatic retry after uncertain provider spend",
+    "daemon/remote-client/tool/plugin/RAG/mode-framework work",
+    "retained-installation cleanup",
+    "any path outside design/MUTATION_FENCE.json",
+    "pricing registry or network pricing lookup (HSF-1 Branch A is operator-entered only)",
+    "application-database campaign pointer or migration (HSF-2 2a)",
+    "run-directory enumeration/browsing infrastructure (HSF-3 3a)",
+    "provider-route switching (HSF-5 5a)"
+  ]
+}

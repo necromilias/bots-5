@@ -1,0 +1,43 @@
+==============================================================================
+P8a — hand-built version-1 run, synthesis DECLARED, state succeeded
+==============================================================================
+  evidence_version        : 1
+  synthesis_freshness     : LEGACY_UNVERIFIED
+  integrity_warnings      : []
+  P8a RESULT: PASS (LEGACY_UNVERIFIED)
+
+==============================================================================
+P8b — version-1 record WITH an adversarial explicit started_at: null
+==============================================================================
+  evidence_version        : 1
+  synthesis_freshness     : LEGACY_UNVERIFIED
+  integrity_warnings      : []
+  P8b RESULT: PASS (version guard holds)
+
+==============================================================================
+P8c — REAL legacy engine run (run_job, no snapshot/approval, WITH synthesis)
+==============================================================================
+  run.json evidence_version : '<ABSENT>'
+  run.json keys             : ['ended_at', 'run_id', 'run_timeout_seconds', 'stage_order', 'stages', 'started_at', 'state', 'synthesis_skipped_reason', 'usage']
+  job.resolved synthesis    : {'depends_on': ['w1', 'w2'], 'id': 'synth', 'max_output_tokens': 100, 'model': 'model-synth', 'provider': 'openrouter', 'system_prompt_path': '/tmp/oracle-v3-p8-c_k0j4_h/p8c/prompts/synth.md', 'temperature': 0.1, 'timeout_seconds': 1.0}
+  files in run dir          : ['events.jsonl', 'job.resolved.json', 'result.md', 'run.json', 'stages/synth.json', 'stages/synth.md', 'stages/w1.json', 'stages/w1.md', 'stages/w2.json', 'stages/w2.md', 'usage.json']
+  evidence_version          : 1
+  synthesis_freshness       : LEGACY_UNVERIFIED
+  integrity_warnings        : []
+  P8c RESULT: PASS (LEGACY_UNVERIFIED)
+
+==============================================================================
+P8d — literal state: skipped on a version-1 record (pre-existing O-1 rule)
+==============================================================================
+  evidence_version        : 1
+  synthesis_freshness     : NOT_APPLICABLE
+  integrity_warnings      : []
+  P8d RESULT: PASS (unchanged O-1 rule)
+
+==============================================================================
+SUMMARY
+==============================================================================
+  P8a RESULT: PASS (LEGACY_UNVERIFIED)
+  P8b RESULT: PASS (version guard holds)
+  P8c RESULT: PASS (LEGACY_UNVERIFIED)
+  P8d RESULT: PASS (unchanged O-1 rule)

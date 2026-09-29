@@ -1,0 +1,144 @@
+==============================================================================
+P1a — counting bridge factory + Load Job
+==============================================================================
+  dock type                      : CampaignDockWidget
+  dock._bridge BEFORE Load Job   : None
+  bridge_factory call count      : 0
+  validate enabled before load   : False
+  bridge_factory call count AFTER: 1  -> ['/tmp/oracle-v2-p1-4riivo7m/.bots5/runs']
+  dock._bridge                   : CampaignBridge
+  isinstance CampaignBridge      : True
+  job identity label             : Name: test-job | Version: 1 | Runs dir: /tmp/oracle-v2-p1-4riivo7m/.bots5/runs | Workers: 2 | Synthesis: yes | Parallel: 2
+  status                         : Job loaded: /tmp/oracle-v2-p1-4riivo7m/job.json
+  validate enabled               : True
+  approve enabled (preflight)    : True
+  pricing status                 : Pricing evidence complete — accepting the recorded bound approves spend
+  runs dir exists before run     : False
+  P1a RESULT: PASS
+
+==============================================================================
+P1b — Validate (zero spend)
+==============================================================================
+  status                         : Validation successful (zero spend)
+  runs dir exists after validate : False
+  provider constructions so far  : 0
+  P1b RESULT: PASS
+
+==============================================================================
+P1c/P1d — Approve a full run with complete pricing, drive to terminal (NO NETWORK)
+==============================================================================
+  approve enabled                : True
+  prepared operation             : full_run
+  approval.pricing_evidence set  : True
+  --- preflight summary shown to the operator ---
+      operation: full_run
+      job: test-job (schema_version=1)
+      job_path: /tmp/oracle-v2-p1-4riivo7m/job.json
+      run_id: test-job-20260929T192006Z-7e6606a2 (the run directory is created only when the approval is consumed)
+      runs_dir: /tmp/oracle-v2-p1-4riivo7m/.bots5/runs
+      stages:
+        - w1: provider=openrouter model=model-w1 temperature=0.1 max_output_tokens=100 timeout_seconds=1.0
+        - w2: provider=openrouter model=model-w2 temperature=0.1 max_output_tokens=100 timeout_seconds=1.0
+        - synth: provider=openrouter model=model-synth temperature=0.1 max_output_tokens=100 timeout_seconds=1.0 depends_on=w1,w2
+      execution_limits: {"max_parallelism": 2, "run_timeout_seconds": 10.0, "stop_before_synthesis_if_known_cost_exceeds_usd": "2.0"}
+      provider_routes: {"openrouter": {"api_key_env_name": "OPENROUTER_API_KEY", "api_key_source": "environment", "base_url": "https://openrouter.ai/api/v1", "kind": "openrouter"}}
+      pricing_evidence: {"entries": [{"basis": "per stage: input token ceiling = ceil(len(compiled_prompt_text) / 4), output token ceiling = that stage's configured max_output_tokens, stage cost = input_ceiling * input_rate / 1e6 + output_ceiling * output_rate / 1e6; bound = sum over all dispatched stages. Recorded divisor=4; stage_count=3; configured ceilings: w1(input_token_ceiling=259, max_output_tokens=100), w2(input_token_ceiling=259, max_output_tokens=100), synth(input_token_ceiling=263, max_output_tokens=100).", "conservative_upper_bound_usd": "0.003962", "input_usd_per_1m": "2.00", "models": ["model-w1", "model-w2", "model-synth"], "observed_at": "2026-09-30T00:00:00Z", "output_usd_per_1m": "8.00", "provider": "openrouter", "rate_source": "https://example.invalid/pricing (operator-cited)", "route": {"api_key_env_name": "OPENROUTER_API_KEY", "api_key_source": "environment", "base_url": "https://openrouter.ai/api/v1", "kind": "openrouter"}}]}
+      pricing: route=openrouter rates=input=2.00 output=8.00 USD/1M source='https://example.invalid/pricing (operator-cited)' observed_at=2026-09-30T00:00:00Z conservative_upper_bound_usd=0.003962 basis=per stage: input token ceiling = ceil(len(compiled_prompt_text) / 4), output token ceiling = that stage's configured max_output_tokens, stage cost = input_ceiling * input_rate / 1e6 + output_ceiling * output_rate / 1e6; bound = sum over all dispatched stages. Recorded divisor=4; stage_count=3; configured ceilings: w1(input_token_ceiling=259, max_output_tokens=100), w2(input_token_ceiling=259, max_output_tokens=100), synth(input_token_ceiling=263, max_output_tokens=100).
+      preflight_digest: 2a5311121115d00198c946ed1bfd0ef4ad658f7d98159e46cdb35082eb9e3fd0
+      approval_draft: approval-20260929T192006Z-d8039028 approved_by='desktop-user' scope=full_run
+      spend_notice: approving constructs the providers and starts the run; preparing wrote nothing and constructed no provider
+  status after Approve           : Run started
+  provider factory constructions : 1
+  terminal result                : RunResult state=succeeded
+
+  P1e — projection render after terminal state
+  --- stages table: rows=3
+    stage=w1 | state=succeeded | attempt=1 | model=model-w1 | duration=0.0s | tokens=30 | cost=0.01 | outcome=Complete
+    stage=w2 | state=succeeded | attempt=1 | model=model-w2 | duration=0.0s | tokens=30 | cost=0.01 | outcome=Complete
+    stage=synth | state=succeeded | attempt=1 | model=model-synth | duration=0.0s | tokens=33 | cost=— | outcome=Complete
+  run identity label             : Run: test-job-20260929T192006Z-7e6606a2 | Dir: /tmp/oracle-v2-p1-4riivo7m/.bots5/runs/test-job-20260929T192006Z-7e6606a2 | State: succeeded
+  LIVE COST LINE                 : cost: 0.02 + 1 unknown (synth) (partial)
+  FRESHNESS LABEL                : Synthesis freshness: FRESH
+  integrity warnings             : ''
+  cancel button enabled (terminal): False
+  provider.complete() calls      : 3  models=['model-w1', 'model-w2', 'model-synth']
+  projection.live_cost           : {"basis": "known subtotal plus explicit unknown set over the selected attempts; provider cost lands only at terminal completion; no accrual is fabricated", "complete": "False", "known_subtotal_usd": "0.02", "status": "partial", "total_tokens_known_sum": "93", "unknown_stage_ids": "['synth']"}
+  projection.display_state       : succeeded
+  projection.evidence_version    : 2
+  P1e RESULT: PASS (rows=True, unknown_set=True, freshness=True)
+
+==============================================================================
+P1f/P1g — Regenerate control (D-2) and what Approve does afterwards
+==============================================================================
+  selected stage                 : {'stage_id': 'w1', 'state': 'succeeded', 'attempt_number': 1, 'requested_model': 'model-w1', 'duration': '0.0s', 'total_tokens': '30', 'cost_usd': '0.01', 'outcome': 'Complete'}
+  regenerate button enabled      : False  (stage state = succeeded)
+  rerun-synthesis button enabled : False
+  engine prepare_regeneration on a SUCCEEDED stage: ACCEPTED (operation=worker_regeneration, attempt=2)
+  dialog capture                 : {"dialog_class": "QDialog", "dialog_is_qdialog": "True", "has_accept": "True", "has_reject": "True", "accept_call": "ok", "line_edits": "1"}
+  status after Regenerate prepare: Regeneration prepared for w1 with model model-w1-alt
+  prepared operation             : worker_regeneration
+  approve button enabled         : True
+  D-2 AttributeError             : NONE — control did not raise
+  P1f RESULT: PASS
+
+  P1g — operator presses Approve for the prepared REGENERATION
+  status shown to operator       : "Approval failed: approve_and_start requires a full_run operation; got 'worker_regeneration'"
+  attempt-2 file created         : False  ([])
+  run tree changed by Approve    : False
+  provider calls                 : 3
+  P1g RESULT: REGENERATION NOT EXECUTED BY THE DESKTOP
+
+==============================================================================
+P1h — create a second attempt (via the bridge seam) then Make current
+==============================================================================
+  --- after regeneration of w1 -> attempt 2: rows=3
+    stage=w1 | state=succeeded | attempt=1 | model=model-w1 | duration=0.0s | tokens=30 | cost=0.01 | outcome=Complete  [combo items=['1', '2'] current=1]
+    stage=w2 | state=succeeded | attempt=1 | model=model-w2 | duration=0.0s | tokens=30 | cost=0.01 | outcome=Complete
+    stage=synth | state=succeeded | attempt=1 | model=model-synth | duration=0.0s | tokens=33 | cost=— | outcome=Complete
+  freshness after regen (selection still attempt 1): Synthesis freshness: FRESH
+  attempt switcher widget on row 0: QComboBox
+  combo choices=['1', '2']
+  selected stage after combo change: {'stage_id': 'w1', 'state': 'succeeded', 'attempt_number': 2, 'requested_model': 'model-w1', 'duration': '0.0s', 'total_tokens': '30', 'cost_usd': '0.01', 'outcome': 'Complete'}
+  status                         : Made w1 attempt 2 current
+  FRESHNESS AFTER MAKE CURRENT   : Synthesis freshness: STALE
+  integrity warnings             : ''
+  --- after Make current -> attempt 2: rows=3
+    stage=w1 | state=succeeded | attempt=1 | model=model-w1-alt | duration=0.0s | tokens=30 | cost=0.01 | outcome=Complete  [combo items=['1', '2'] current=2]
+    stage=w2 | state=succeeded | attempt=1 | model=model-w2 | duration=0.0s | tokens=30 | cost=0.01 | outcome=Complete
+    stage=synth | state=succeeded | attempt=1 | model=model-synth | duration=0.0s | tokens=33 | cost=— | outcome=Complete
+  durable selection.json         : {"run_id": "test-job-20260929T192006Z-7e6606a2", "schema_version": 1, "selected_attempts": {"synth": 1, "w1": 2, "w2": 1}, "updated_at": "2026-09-29T19:20:06.999Z"}
+  P1h RESULT: PASS
+  (selection write changed run tree: True — expected, it is the explicit selection command)
+
+==============================================================================
+P1i — selected-attempt output rendered from durable storage through the bridge
+==============================================================================
+  selected stage                 : {'stage_id': 'w1', 'state': 'succeeded', 'attempt_number': 2, 'requested_model': 'model-w1-alt', 'duration': '0.0s', 'total_tokens': '30', 'cost_usd': '0.01', 'outcome': 'Complete'}
+  _result_text (first 200 chars) : 'W1-ATTEMPT-2-OUTPUT'
+  durable attempt artifacts      : ['w1.att1.md', 'w1.att2.md']
+  bridge.read_stage_output(...)  : 'W1-ATTEMPT-2-OUTPUT'
+  P1i RESULT: PASS
+
+==============================================================================
+P1j — New Job clears the view, run-directory bytes untouched
+==============================================================================
+  files in run dir               : 17
+  UI before: job='Name: test-job | Version: 1 | Runs dir: /tmp/oracle-v2-p1-4riivo7m/.bots5/runs | Workers: 2 | Synthesis: yes | Parallel: 2' run='Run: test-job-20260929T192006Z-7e6606a2 | Dir: /tmp/oracle-v2-p1-4riivo7m/.bots5/runs/test-job-20260929T192006Z-7e6606a2 | State: succeeded' rows=3 cost='cost: 0.02 + 1 unknown (synth) (partial)'
+  UI after : job='No job loaded' run='No run active' rows=0 cost='cost: unknown (no run active)' freshness='Synthesis freshness: N/A' status='' result=''
+  dock._bridge after New Job     : None
+  buttons: validate=False approve=False clear=False make_current=False regen=False
+  run-dir files byte-identical   : True  (17 files)
+  P1j RESULT: PASS
+
+==============================================================================
+SUMMARY
+==============================================================================
+  P1a factory/bind  : PASS
+  P1b validate      : PASS
+  P1e projection    : PASS
+  P1f regenerate D-2: PASS
+  P1g desktop executes regeneration: NO  <-- DEFECT
+  P1h make current/STALE: PASS
+  P1i output render : PASS
+  P1j New Job       : PASS
+  network touched   : NO (in-process SpyProvider only)

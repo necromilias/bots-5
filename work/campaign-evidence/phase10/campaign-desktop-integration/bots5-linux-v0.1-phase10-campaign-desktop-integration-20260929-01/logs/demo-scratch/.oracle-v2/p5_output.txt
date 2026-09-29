@@ -1,0 +1,83 @@
+
+==============================================================================
+P5b — paid approval with INCOMPLETE pricing evidence writes nothing
+==============================================================================
+  no evidence block at all                        : refused at approve  -> paid approval requires complete operator pricing evidence
+  entries present but rate_source missing         : refused at prepare  -> pricing rate_source is required for 'openrouter'
+  entries present but observed_at missing         : refused at prepare  -> pricing observed_at is required for 'openrouter'
+  empty entries list                              : refused at prepare  -> pricing evidence must cover exactly every paid route in use
+  route identity mismatch (tampered base_url)     : refused at prepare  -> pricing route identity does not match live route 'openrouter'
+  negative rate                                   : refused at prepare  -> pricing rates must be finite non-negative numbers for 'openrouter'
+  runs dir exists                          : False
+  whole tmp tree byte-identical            : True
+  attempt files anywhere                   : []
+  run.json files anywhere                  : []
+  provider factory constructions           : 0
+  provider.complete() calls                : 0
+  approval markers written                 : []
+  VERDICT: REFUSED BEFORE ANY RUN TREE / ATTEMPT / PROVIDER CALL, NOTHING WRITTEN
+
+==============================================================================
+P5c — local-only operation is exempt from pricing evidence
+==============================================================================
+  approval.pricing_evidence               : None
+  provider routes                         : {"local_openai": {"api_key_env_name": null, "api_key_source": "inline", "base_url": "http://127.0.0.1:9/v1", "kind": "local_openai"}}
+  approve button rule (paid? no)          : paid=False
+  run state                               : succeeded
+  provider factory constructions          : 1
+  provider.complete() calls               : 2
+  preflight.json pricing_evidence         : None
+  preflight.json has any pricing/rate key : ['pricing_evidence']
+  VERDICT: LOCAL-ONLY EXEMPT, RUN EXECUTED, NO PRICING FIELDS ADDED
+
+==============================================================================
+P5e — dual cost accounting; the stored selected_spend copy is only a cache
+==============================================================================
+  [after run + regeneration (selection still attempt 1)] per_attempt costs           : {'w1.att1': '0.01', 'w1.att2': '0.50'}
+  [after run + regeneration (selection still attempt 1)] cumulative_spend (durable)  : 0.51   projection: 0.51
+  [after run + regeneration (selection still attempt 1)] selected_spend stored cache : 0.01
+  [after run + regeneration (selection still attempt 1)] selected_spend DERIVED      : 0.01
+  [after run + regeneration (selection still attempt 1)] aggregate (legacy mirror)   : 0.01
+  [after run + regeneration (selection still attempt 1)] integrity warnings          : []
+  [after run + regeneration (selection still attempt 1)] selection.json              : {"run_id": "test-job-20260929T192331Z-67f5553e", "schema_version": 1, "selected_attempts": {"w1": 1}, "updated_at": "2026-09-29T19:23:31.823Z"}
+  cumulative(0.51) > selected(0.01) because attempt 2 (0.50) is NOT selected : True
+  [after Make current -> attempt 2 (expensive)] per_attempt costs           : {'w1.att1': '0.01', 'w1.att2': '0.50'}
+  [after Make current -> attempt 2 (expensive)] cumulative_spend (durable)  : 0.51   projection: 0.51
+  [after Make current -> attempt 2 (expensive)] selected_spend stored cache : 0.01
+  [after Make current -> attempt 2 (expensive)] selected_spend DERIVED      : 0.50
+  [after Make current -> attempt 2 (expensive)] aggregate (legacy mirror)   : 0.01
+  [after Make current -> attempt 2 (expensive)] integrity warnings          : ['usage.json selected_spend cache disagrees with the derived selected spend; the derived value is authoritative']
+  [after Make current -> attempt 2 (expensive)] selection.json              : {"run_id": "test-job-20260929T192331Z-67f5553e", "schema_version": 1, "selected_attempts": {"w1": 2}, "updated_at": "2026-09-29T19:23:32.124Z"}
+  [tampered] stored cache now         : 999.99
+  [tampered] projection DERIVED       : 0.50
+  [tampered] integrity warnings       : ['usage.json selected_spend cache disagrees with the derived selected spend; the derived value is authoritative']
+  VERDICT: DERIVED SELECTED SPEND IS AUTHORITATIVE; STORED COPY IS ONLY A CACHE
+
+==============================================================================
+P5f — deep cancellation dump (operator cancel while stages are in flight)
+==============================================================================
+  provider calls before cancel        : 2
+  bridge.cancel() returned (terminal record verified from disk)
+  run.json                            : {"ended_at": "2026-09-29T19:23:32.933Z", "evidence_version": 2, "run_id": "test-job-20260929T192332Z-e4515758", "run_timeout_seconds": 30.0, "stage_order": ["w1", "w2", "synth"], "stages": {"synth": {"attempt_number": 1, "completion": null, "cost_known": false, "cost_usd": null, "duration_seconds": null, "ended_at": "2026-09-29T19:23:32.932Z", "failure": {"message": "run cancelled before the stage reached a terminal state", "provider_side_outcome_unknown": false, "type": "cancelled"}, "output_path": null, "preflight_digest": "807e236228646a46e4c1e8aaab268918bc46f6cbcd6af553fdf20fbdcf88b18f", "provider": "openrouter", "provider_request_id": null, "requested_model": "model-synth", "returned_model": null, "stage_id": "synth", "started_at": null, "state": "failed", "usage": {"completion_tokens": null, "prompt_tokens": null, "reasoning_tokens": null, "total_tokens": null}}, "w1": {"attempt_number": 1, "completion": null, "cost_known": false, "cost_usd": null, "duration_seconds": 0.8035198409343138, "ended_at": "2026-09-29T19:23:32.931Z", "failure": {"message": "stage cancelled before terminal classification", "provider_side_outcome_unknown": true, "type": "cancelled"}, "output_path": null, "preflight_digest": "807e236228646a46e4c1e8aaab268918bc46f6cbcd6af553fdf20fbdcf88b18f", "provider": "openrouter", "provider_request_id": null, "requested_model": "model-w1", "returned_model": null, "stage_id": "w1", "started_at": "2026-09-29T19:23:32.128Z", "state": "failed", "usage": {"completion_tokens": null, "prompt_tokens": null, "reasoning_tokens": null, "total_tokens": null}}, "w2": {"attempt_number": 1, "completion": null, "cost_known": false, "cost_usd": null, "duration_seconds": 0.8036598589969799, "ended_at": "2026-09-29T19:23:32.932Z", "failure": {"message": "stage cancelled before terminal classification", "provider_side_outcome_unknown": true, "type": "cancelled"}, "output_path": null, "preflight_digest": "807e236228646a46e4c1e8aaab268918bc46f6cbcd6af553fdf20fbdcf88b18f", "provider": "openrouter", "provider_request_id": null, "requested_model": "model-w2", "returned_model": null, "stage_id": "w2", "started_at": "2026-09-29T19:23:32.128Z", "state": "failed", "usage": {"completion_tokens": null, "prompt_tokens": null, "reasoning_tokens": null, "total_tokens": null}}}, "started_at": "2026-09-29T19:23:32.127Z", "state": "cancelled", "synthesis_skipped_reason": null, "usage": {"completion_tokens_known_sum": 0, "cost_complete": false, "cost_status": "unknown", "cost_usd_known_sum": "0", "prompt_tokens_known_sum": 0, "reasoning_tokens_known_sum": 0, "total_tokens_known_sum": 0, "unknown_cost_stage_ids": ["w1", "w2", "synth"]}}
+  stage synth.att1.json       : {"attempt_number": 1, "error_type": null, "finished_at": null, "id": null, "provider_side_outcome_unknown": null, "started_at": null, "state": "failed"}
+  stage w1.att1.json          : {"attempt_number": 1, "error_type": null, "finished_at": null, "id": null, "provider_side_outcome_unknown": null, "started_at": "2026-09-29T19:23:32.128Z", "state": "failed"}
+  stage w2.att1.json          : {"attempt_number": 1, "error_type": null, "finished_at": null, "id": null, "provider_side_outcome_unknown": null, "started_at": "2026-09-29T19:23:32.128Z", "state": "failed"}
+  --- events.jsonl ---
+    {"ts":"2026-09-29T19:23:32.127Z","run_id":"test-job-20260929T192332Z-e4515758","event":"run_started"}
+    {"ts":"2026-09-29T19:23:32.128Z","run_id":"test-job-20260929T192332Z-e4515758","event":"stage_queued","stage_id":"w1"}
+    {"ts":"2026-09-29T19:23:32.128Z","run_id":"test-job-20260929T192332Z-e4515758","event":"stage_queued","stage_id":"w2"}
+    {"ts":"2026-09-29T19:23:32.128Z","run_id":"test-job-20260929T192332Z-e4515758","event":"stage_queued","stage_id":"synth"}
+    {"ts":"2026-09-29T19:23:32.128Z","run_id":"test-job-20260929T192332Z-e4515758","event":"stage_started","stage_id":"w1"}
+    {"ts":"2026-09-29T19:23:32.128Z","run_id":"test-job-20260929T192332Z-e4515758","event":"request_sent","stage_id":"w1","meta":{"model":"model-w1"}}
+    {"ts":"2026-09-29T19:23:32.128Z","run_id":"test-job-20260929T192332Z-e4515758","event":"stage_started","stage_id":"w2"}
+    {"ts":"2026-09-29T19:23:32.128Z","run_id":"test-job-20260929T192332Z-e4515758","event":"request_sent","stage_id":"w2","meta":{"model":"model-w2"}}
+    {"ts":"2026-09-29T19:23:32.932Z","run_id":"test-job-20260929T192332Z-e4515758","event":"stage_failed","stage_id":"w1","meta":{"error_type":"cancelled_pending"}}
+    {"ts":"2026-09-29T19:23:32.932Z","run_id":"test-job-20260929T192332Z-e4515758","event":"stage_failed","stage_id":"w2","meta":{"error_type":"cancelled_pending"}}
+    {"ts":"2026-09-29T19:23:32.932Z","run_id":"test-job-20260929T192332Z-e4515758","event":"stage_failed","stage_id":"w1","meta":{"error_type":"cancelled"}}
+    {"ts":"2026-09-29T19:23:32.932Z","run_id":"test-job-20260929T192332Z-e4515758","event":"stage_failed","stage_id":"w2","meta":{"error_type":"cancelled"}}
+    {"ts":"2026-09-29T19:23:32.932Z","run_id":"test-job-20260929T192332Z-e4515758","event":"stage_failed","stage_id":"synth","meta":{"error_type":"cancelled"}}
+    {"ts":"2026-09-29T19:23:32.932Z","run_id":"test-job-20260929T192332Z-e4515758","event":"run_cancelled"}
+  lines mentioning cancelled_pending/timed_out: [8, 9]
+  display_state                       : cancelled
+  integrity warnings                  : ['dispatched synthesis attempt has absent provenance (consumed_dependencies/dependency_digests)']
+  VERDICT run-level cancelled & no timeout label & no live cancelled_pending stage: True

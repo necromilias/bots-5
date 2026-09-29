@@ -1,0 +1,100 @@
+Traceback (most recent call last):
+  File "/home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/work/campaign-evidence/phase10/campaign-desktop-integration/bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01/logs/demo-scratch/.oracle-v3/p4_adversarial.py", line 452, in main
+    fn()
+    ~~^^
+  File "/home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/work/campaign-evidence/phase10/campaign-desktop-integration/bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01/logs/demo-scratch/.oracle-v3/p4_adversarial.py", line 165, in p4b
+    prepared2 = bridge.prepare_full_run("oracle", pricing_evidence=bad)
+  File "/home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/src/bots5/core/campaign.py", line 960, in prepare_full_run
+    pricing = build_pricing_evidence(pricing_stages, snapshot.provider_routes, pricing_evidence)
+  File "/home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/src/bots5/runner.py", line 464, in build_pricing_evidence
+    raise ApprovalInvalidatedError(f"pricing rate_source is required for {provider!r}")
+bots5.errors.ApprovalInvalidatedError: pricing rate_source is required for 'openrouter'
+Traceback (most recent call last):
+  File "/home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/work/campaign-evidence/phase10/campaign-desktop-integration/bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01/logs/demo-scratch/.oracle-v3/p4_adversarial.py", line 452, in main
+    fn()
+    ~~^^
+  File "/home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/work/campaign-evidence/phase10/campaign-desktop-integration/bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01/logs/demo-scratch/.oracle-v3/p4_adversarial.py", line 232, in p4c
+    bridge.load_job(job_path)
+    ~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/src/bots5/core/campaign.py", line 713, in load_job
+    job = load_job(job_path)
+  File "/home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/src/bots5/manifest.py", line 352, in load_job
+    return validate_job(data, path.parent)
+  File "/home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/src/bots5/manifest.py", line 274, in validate_job
+    data = _closed(data, top_keys, top_keys, "job")
+  File "/home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/src/bots5/manifest.py", line 105, in _closed
+    raise ValidationError(f"{ctx}: unknown field(s): {', '.join(sorted(unknown))}")
+bots5.errors.ValidationError: job: unknown field(s): providers
+
+==============================================================================
+P4a — dock Approve after preparing a SYNTHESIS RERUN
+==============================================================================
+  status after Rerun synthesis : 'Synthesis rerun prepared'
+  prepared operation           : synthesis_rerun
+  approve enabled              : True
+  status after Approve         : 'Synthesis rerun started'
+  synthesis attempt files      : ['synth.att1.json', 'synth.att2.json']
+  run tree changed             : True
+  provider calls delta         : 1
+  VERDICT: SYNTHESIS RERUN EXECUTED
+
+==============================================================================
+P4b — paid approval with INCOMPLETE pricing evidence
+==============================================================================
+  approval.pricing_evidence    : None
+  OK: refused -> ApprovalInvalidatedError: paid approval requires complete operator pricing evidence
+  PROBE p4b CRASHED:
+
+==============================================================================
+P4c — local-only operation needs no pricing evidence
+==============================================================================
+  PROBE p4c CRASHED:
+
+==============================================================================
+P4d — legacy path: run_job with NO snapshot and NO approval
+==============================================================================
+  run_job(no snapshot/approval) result : RunResult state=succeeded
+  run.json evidence_version present   : False
+  complete() calls                    : 1
+  artifacts                           : ['w1.json', 'w1.md']
+  stage has attempt_number key        : True value=1
+  stage has pricing keys              : []
+  preflight.json written on legacy run: False
+  VERDICT: legacy run executed with no approval gate required: YES
+
+==============================================================================
+P4e — dual cost accounting (cumulative vs derived selected; stored copy is a cache)
+==============================================================================
+  per_attempt                     : {"w1.att1": "{'completion_tokens': 20, 'cost_known': True, 'cost_usd': '0.01', 'prompt_tokens': 10, 'reasoning_tokens': None, 'total_tokens': 30}", "w1.att2": "{'completion_tokens': 20, 'cost_known': True, 'cost_usd': '0.50', 'prompt_tokens': 10, 'reasoning_tokens': None, 'total_tokens': 30}"}
+  cumulative_spend                : {"cost_complete": true, "cost_status": "known", "cost_usd_known_sum": "0.51", "total_tokens_known_sum": 60, "unknown_cost_stage_ids": []}
+  stored selected_spend (cache)   : {"cost_complete": true, "cost_status": "known", "cost_usd_known_sum": "0.01", "total_tokens_known_sum": 30, "unknown_cost_stage_ids": []}
+  aggregate                       : {"cost_complete": true, "cost_status": "known", "cost_usd_known_sum": "0.01", "total_tokens_known_sum": 30, "unknown_cost_stage_ids": []}
+  derived selected_spend          : {"cost_complete": "True", "cost_status": "known", "cost_usd_known_sum": "0.01", "total_tokens_known_sum": "30", "unknown_cost_stage_ids": "[]"}
+  projection cumulative_spend     : {"cost_complete": "True", "cost_status": "known", "cost_usd_known_sum": "0.51", "total_tokens_known_sum": "60", "unknown_cost_stage_ids": "[]"}
+  integrity warnings (cache)      : []
+  cumulative(0) >= selected(0)          : True
+  stored cache == derived (both attempts selected?) : see below
+  after select attempt 1: derived selected_spend  : {"cost_complete": "True", "cost_status": "known", "cost_usd_known_sum": "0.01", "total_tokens_known_sum": "30", "unknown_cost_stage_ids": "[]"}
+  after select attempt 1: stored cache           : {"cost_complete": true, "cost_status": "known", "cost_usd_known_sum": "0.01", "total_tokens_known_sum": 30, "unknown_cost_stage_ids": []}
+  integrity warnings                              : []
+  derived(0) != stored cache(0) and derived wins : False
+  cumulative unchanged by selection               : True
+  VERDICT: FAIL
+
+==============================================================================
+P4f — cancellation matrix and durable cancelled_pending truth
+==============================================================================
+  (i) run.json state                    : cancelled
+  (i) stage states                      : {"synth.att1.json": "failed", "w1.att1.json": "failed", "w2.att1.json": "failed"}
+  (i) stage error_type                  : {"synth.att1.json": null, "w1.att1.json": null, "w2.att1.json": null}
+  (i) any stage labelled timed_out      : False
+  (i) any cancelled_pending left        : ['events.jsonl']
+  (i) event kinds                       : ['run_started', 'stage_queued', 'stage_queued', 'stage_queued', 'stage_started', 'request_sent', 'stage_started', 'request_sent', 'stage_failed', 'stage_failed', 'stage_failed', 'stage_failed', 'stage_failed', 'run_cancelled']
+  (i) display_state                     : cancelled
+  (ii) durable run state                : running (host gone)
+  (ii) durable stage state              : cancelled_pending
+  (ii) display_state                    : interrupted_uncertain
+  (ii) integrity warnings               : []
+  (ii) never displayed as success/resumable : True
+  (iii) durable running w/o host        : interrupted_uncertain
+  VERDICT: cancellation matrix truthful: YES

@@ -1,0 +1,68 @@
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_ test_synthesis_cancelled_before_dispatch_is_not_applicable_without_false_warning _
+
+tmp_path = PosixPath('/tmp/pytest-of-mick/pytest-0/test_synthesis_cancelled_befor0')
+
+    def test_synthesis_cancelled_before_dispatch_is_not_applicable_without_false_warning(tmp_path):
+        """V-5: a run cancelled before synthesis dispatch must not claim a dispatched attempt.
+    
+        The reserved implementation oracle found that Rule 1 keyed only on the literal
+        ``skipped`` state, so the most common never-dispatched case of all -- a run
+        cancelled while workers were in flight, which persists ``synth.att1.json`` with
+        ``state: failed``, ``failure.type: cancelled``, an explicit ``started_at: null``
+        and no provenance -- was reported UNVERIFIABLE with an integrity warning
+        asserting that a *dispatched* synthesis attempt had absent provenance. Both
+        statements are false: no provider was ever called for that attempt. The accepted
+        design says never-dispatched synthesis is NOT_APPLICABLE and raises no integrity
+        warning (REGENERATION_AND_STALE_SYNTHESIS.md section 1).
+        """
+        run_dir = tmp_path / ".bots5" / "runs" / "cancelled-before-synth-dispatch"
+        _write_v2_provenance_case(
+            run_dir,
+            consumed={"w1": 1, "w2": 1},
+            digests={"w1": "a" * 64, "w2": "b" * 64},
+        )
+    
+        # Reshape the durable synthesis attempt exactly as a pre-dispatch cancellation
+        # persists it: it never started, so it carries no provenance and no provider
+        # ever saw it. The explicit started_at: null is what the durable writer emits.
+        synth_path = run_dir / "stages" / "synth.att1.json"
+        synth = json.loads(synth_path.read_text(encoding="utf-8"))
+        synth["state"] = "failed"
+        synth["started_at"] = None
+        synth["failure"] = {
+            "type": "cancelled",
+            "message": "run cancelled before the stage reached a terminal state",
+            "provider_side_outcome_unknown": False,
+        }
+        synth.pop("consumed_dependencies", None)
+        synth.pop("dependency_digests", None)
+        synth_path.write_text(json.dumps(synth), encoding="utf-8")
+        (run_dir / "run.json").write_text(
+            json.dumps({
+                "run_id": run_dir.name,
+                "state": "cancelled",
+                "evidence_version": 2,
+                "stage_order": ["w1", "w2", "synth"],
+            }),
+            encoding="utf-8",
+        )
+    
+        projection = project_run(run_dir)
+    
+>       assert projection.synthesis_freshness == "NOT_APPLICABLE"
+E       AssertionError: assert 'UNVERIFIABLE' == 'NOT_APPLICABLE'
+E         
+E         - NOT_APPLICABLE
+E         + UNVERIFIABLE
+
+tests/test_phase10_cross_cutting.py:227: AssertionError
+=============================== warnings summary ===============================
+tests/test_phase10_cross_cutting.py::test_synthesis_cancelled_before_dispatch_is_not_applicable_without_false_warning
+  /home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/.venv314/lib/python3.14/site-packages/pytest_asyncio/plugin.py:1216: DeprecationWarning: 'asyncio.get_event_loop_policy' is deprecated and slated for removal in Python 3.16
+    return asyncio.get_event_loop_policy()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_phase10_cross_cutting.py::test_synthesis_cancelled_before_dispatch_is_not_applicable_without_false_warning

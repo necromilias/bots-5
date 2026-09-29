@@ -1,0 +1,4 @@
+ERROR: not found: /home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/work/campaign-evidence/phase10/campaign-desktop-integration/bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01/logs/demo-scratch/.oracle-v3/repo/tests/test_phase10_desktop_lifecycle.py::test_approve_after_regeneration_dispatches_and_creates_sibling_attempt tests/test_phase10_cross_cutting.py::test_synthesis_cancelled_before_dispatch_is_not_applicable_without_false_warning tests/test_phase10_evidence_regeneration.py::test_persist_stage_attempt_output_fault_leaves_metadata_unadvanced tests/test_phase10_desktop_lifecycle.py::test_regenerate_opens_real_qdialog_over_selected_stage_and_typed_model_reaches_prepared_operation
+(no match in any of [<Module test_phase10_desktop_lifecycle.py>])
+
+

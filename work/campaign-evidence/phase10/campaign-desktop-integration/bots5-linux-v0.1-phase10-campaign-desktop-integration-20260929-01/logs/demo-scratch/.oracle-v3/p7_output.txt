@@ -1,0 +1,65 @@
+==============================================================================
+P7a — cancelled BEFORE dispatch (evidence-v2, started_at: null, no provenance)
+==============================================================================
+  raw synth record           : state=failed failure.type=cancelled started_at=None provenance keys present: []
+  synthesis_freshness        : NOT_APPLICABLE
+  integrity_warnings (0)   : []
+  any warning mentions 'dispatched': False
+  freshness report           : {"classification": "NOT_APPLICABLE", "dependencies": {}, "integrity_warning": false, "selected_attempt": 1, "skip_reason": "cancelled", "stage_id": "synth", "warnings": []}
+  P7a RESULT: PASS
+
+==============================================================================
+P7b — version-1 run, NO evidence_version marker
+==============================================================================
+  evidence_version           : 1
+  synthesis_freshness        : None
+  integrity_warnings         : []
+  P7b RESULT (succeeded legacy): FAIL
+  (adversarial) synthesis_freshness with started_at:null on a V1 record: None
+  P7b RESULT (started_at-null on v1): FAIL
+
+==============================================================================
+P7c — genuinely DISPATCHED evidence-v2 attempt with ABSENT provenance
+==============================================================================
+  raw synth record           : state=succeeded started_at='2026-09-30T00:00:00Z' provenance keys present: []
+  synthesis_freshness        : UNVERIFIABLE
+  integrity_warnings         : ['dispatched synthesis attempt has absent provenance (consumed_dependencies/dependency_digests)']
+  P7c RESULT: PASS (still UNVERIFIABLE with a warning)
+
+==============================================================================
+P7d — create=False: fault-injected OUTPUT write leaves metadata UN-advanced
+==============================================================================
+  metadata before fault      : state=running output_path=None
+  exception raised           : StorageError('injected fault writing /tmp/oracle-v3-p7-00p4t261/runs/p7d-run-20260101T000000Z-00000001/stages/w1.att1.md')
+  metadata byte-identical    : True
+  metadata after fault       : state=running output_path=None
+  output artifact exists     : False
+  P7d RESULT: PASS
+
+==============================================================================
+P7e — create=False happy path round-trip
+==============================================================================
+  metadata state             : succeeded  output_path='stages/w1.att1.md'
+  artifact readable          : True content='final output'
+  P7e RESULT: PASS
+
+==============================================================================
+P7f — create=True overwrite refusal leaves the run dir BYTE-IDENTICAL
+==============================================================================
+  refusal raised             : StorageError('refusing to overwrite existing artifact: /tmp/oracle-v3-p7-00p4t261/runs3/p7f-run-20260101T000000Z-00000003/stages/w1.att1.json')
+  files before               : ['events.jsonl', 'stages/w1.att1.json', 'stages/w1.att1.md']
+  files after                : ['events.jsonl', 'stages/w1.att1.json', 'stages/w1.att1.md']
+  byte-identical             : True
+  content still original     : 'first'
+  P7f RESULT: PASS
+
+==============================================================================
+SUMMARY
+==============================================================================
+  P7a RESULT: PASS
+  P7b RESULT (succeeded legacy): FAIL
+  P7b RESULT (started_at-null on v1): FAIL
+  P7c RESULT: PASS (still UNVERIFIABLE with a warning)
+  P7d RESULT: PASS
+  P7e RESULT: PASS
+  P7f RESULT: PASS

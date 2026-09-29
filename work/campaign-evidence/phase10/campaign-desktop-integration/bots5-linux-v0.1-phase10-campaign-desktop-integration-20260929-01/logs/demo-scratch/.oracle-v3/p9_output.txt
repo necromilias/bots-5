@@ -1,0 +1,89 @@
+==============================================================================
+P9a — DOCK-prepared worker_regeneration, Approve pressed
+==============================================================================
+  status after full run      : 'Run started'
+  provider calls after run   : ['model-w1', 'model-w2', 'model-synth']
+  selected row state         : succeeded
+  status after prepare       : 'Regeneration prepared for w1 with model model-w1-operator-choice'
+  status after Approve       : 'Regeneration started'
+  full_run refusal present   : False
+  w1.att2.json created       : True
+  sibling record             : state=succeeded attempt=2 requested_model=model-w1-operator-choice
+  provider calls delta       : 1 models=['model-w1-operator-choice']
+  P9a RESULT: PASS
+
+==============================================================================
+P9b — DOCK-prepared synthesis_rerun, Approve pressed
+==============================================================================
+  status after prepare       : 'Synthesis rerun prepared'
+  prepared operation         : synthesis_rerun
+  approve enabled            : True
+  status after Approve       : 'Synthesis rerun started'
+  full_run refusal present   : False
+  synth.att2.json created    : True
+  sibling record             : state=succeeded attempt=2 requested_model=model-synth
+  provider calls delta       : 1 models=['model-synth']
+  P9b RESULT: PASS
+==============================================================================
+P9c — V-2 enablement matrix (all rows succeeded after a full successful run)
+==============================================================================
+  run state                  : succeeded
+  rows                       : 3
+    row | stage | state     | regen enabled | rerun enabled
+    0   | w1    | succeeded | True          | True
+    1   | w2    | succeeded | True          | True
+    2   | synth | succeeded | True          | True
+  no selection: regen=False rerun=True (selection=None)
+  engine prepare_regeneration on SUCCEEDED stage: ACCEPTED operation=worker_regeneration attempt=2
+  P9c RESULT: PASS (rows_all_succeeded=['succeeded', 'succeeded', 'succeeded'], rerun_no_selection=True, engine=True)
+
+==============================================================================
+P9d — dispatch totality: unknown operation strings / missing operation attr
+==============================================================================
+  operation='bogus'                -> no exception  status="Approval failed: unsupported operation 'bogus'"
+  operation=None                   -> no exception  status='Approval failed: unsupported operation None'
+  no operation attribute           -> no exception  status='Approval failed: unsupported operation None'
+  operation='full_run' but stale   -> no exception  status="Approval failed: 'types.SimpleNamespace' object has no attribute 'snapshot'"
+  any case raised            : False
+  unknown operation refused gracefully : True
+  P9d RESULT: PASS (total, graceful)
+
+==============================================================================
+P9e — Regenerate offered on the SYNTHESIS row: what does the engine do?
+==============================================================================
+  selected                   : {'stage_id': 'synth', 'state': 'succeeded', 'attempt_number': 1, 'requested_model': 'model-synth', 'duration': '0.0s', 'total_tokens': '30', 'cost_usd': '—', 'outcome': 'Complete'}
+  regenerate button enabled  : True
+  status after prepare       : "Regeneration prepare failed: stage 'synth' is the synthesis stage; worker regeneration never targets synthesis (use prepare_synthesis_rerun)"
+  approve button enabled     : False
+  prepared operation         : 'full_run'
+  (engine refusal is surfaced verbatim and Approve is disabled: the operator
+   is redirected to Rerun synthesis; nothing is written, no provider built)
+  P9e RESULT: OBSERVED — offered by UI, refused by engine with a typed message
+
+==============================================================================
+P9f — Approve pressed while a campaign task is already hosted (single loop)
+==============================================================================
+  bridge.is_busy while running : True
+  provider calls so far        : ['model-w1']
+  run.json state (durable)     : 'running'
+  selected row                 : synth state=queued
+  regenerate button enabled    : True
+  status after prepare         : "Regeneration prepare failed: stage 'synth' is the synthesis stage; worker regeneration never targets synthesis (use prepare_synthesis_rerun)"
+  approve enabled              : False
+  status after Approve         : 'Approval failed: approve_and_start refused: a campaign task is already hosted (run test-job-20260929T224429Z-bede6ade)'
+  provider calls delta         : 0
+  bridge.is_busy after         : True
+  attempt files                : ['synth.att1.json', 'w1.att1.json']
+  run.json final state         : 'failed'
+  engine backstop refused      : True
+  P9f RESULT: 'PASS (engine refused the second host)'
+
+==============================================================================
+SUMMARY
+==============================================================================
+  P9a RESULT: PASS
+  P9b RESULT: PASS
+  P9c RESULT: PASS (rows_all_succeeded=['succeeded', 'succeeded', 'succeeded'], rerun_no_selection=True, engine=True)
+  P9d RESULT: PASS (total, graceful)
+  P9e RESULT: OBSERVED — offered by UI, refused by engine with a typed message
+  P9f RESULT: 'PASS (engine refused the second host)'

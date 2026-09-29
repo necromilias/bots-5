@@ -1,0 +1,88 @@
+{
+  "template": "phase10-parcel-v2-manifest",
+  "campaign_id": "bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01",
+  "parcel_id": "bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01-parcel-v2",
+  "parcel_version": 2,
+  "supersedes": {
+    "parcel_id": "bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01-parcel-v1",
+    "file": "codex-context-parcel.json",
+    "sha256": "53a4a0248f43d42081daef5c9fce377f43436ad20ad9465b4c4b5b7ac70e6fed"
+  },
+  "design_of_record": {
+    "seal_file": "seals/design/DESIGN_SEAL_v4.json",
+    "seal_id": "9739e87cd42459973a600e2d1b2b19408671f93e82fbff2d13c71b11e57ed9c1"
+  },
+  "mutation_fence": {
+    "path": "design/MUTATION_FENCE.json",
+    "sha256": "602e6d5d3a88eb893d11d064dfc28c70e8f692c52cb823cd0c8b2711907cf452"
+  },
+  "baseline": {
+    "head": "0756904481ae884bb9e864e8e1e11fc4a27a72ff",
+    "parent": "7c2fe400d1f78e2c4398f3bb2461e8dceff5c6f7",
+    "tree": "7fe879035a01a87339dfe6319a435fa0e84c94bd"
+  },
+  "files": [
+    {
+      "path": "parcel-v2/ADJUDICATION.md",
+      "sha256": "d7ad66a2c24670b5514ae8c9e4e38f8f6a0c5475990aad6f7182270300499cd5",
+      "bytes": 5323
+    },
+    {
+      "path": "parcel-v2/ADJUDICATION.json",
+      "sha256": "ae4d292122009b7aa33888c21d8a06cbcb5f5dce68ac7968b6b45cefda77ae7c",
+      "bytes": 3600
+    },
+    {
+      "path": "parcel-v2/NORMALIZED_CORRECTIONS.md",
+      "sha256": "80bf3840b66767659f1bd8b73331c7cde39896d2904cf21bd9865025b2ff7cc1",
+      "bytes": 4465
+    },
+    {
+      "path": "parcel-v2/CONTRACT.md",
+      "sha256": "39a20200547cc57ccd7de8994e5d321bcb31448c3dd0616ac4986301bfd09ee7",
+      "bytes": 9646
+    },
+    {
+      "path": "parcel-v2/SCOPE.json",
+      "sha256": "b80396c2606f5d38d6de28f467c5bff41d90215798e958ba5796a2af5573ec58",
+      "bytes": 3967
+    },
+    {
+      "path": "parcel-v2/BASELINE.json",
+      "sha256": "59407f57adac6df28a1bdca8d0c0c9b012c73a9328164ccd8393b05bc4be2b20",
+      "bytes": 4806
+    },
+    {
+      "path": "parcel-v2/BUDGET.json",
+      "sha256": "25bf45db30464dbaadf2f778b0d4dc70e3672f2ec30ece083d6dc1eb64534318",
+      "bytes": 9280
+    },
+    {
+      "path": "parcel-v2/VALIDATION.md",
+      "sha256": "6bad2fce600b0b4c535b59fe0097f14087cf0dbed3baf40dc23bbe0df681e5e1",
+      "bytes": 6521
+    },
+    {
+      "path": "parcel-v2/FINDINGS.md",
+      "sha256": "05fe3ca1720a746d877d6eb072bdea65c3bbeeba52ae1138c792d86dfcd2af73",
+      "bytes": 5186
+    },
+    {
+      "path": "parcel-v2/SOURCES.md",
+      "sha256": "b8e7b027ede44494833355541dba30b8e23a4456908b88065f5bf12d5fdacca6",
+      "bytes": 2650
+    },
+    {
+      "path": "parcel-v2/README.md",
+      "sha256": "5161b0a8d3915d41fa9f21abf1dca0cc04df8c4af61f24a4eca90d9789067903",
+      "bytes": 720
+    }
+  ],
+  "immutable_after_launch": true,
+  "created_at": "2026-09-29",
+  "notes": [
+    "Parcel-v2 authorizes implementation strictly inside the unchanged seed mutation fence.",
+    "Design seal v4 is frozen and must not be mutated or replaced by parcel-v2 or any implementation step.",
+    "No staging, commit, push, ref mutation, OrgMem mutation, dependency change, or Phase 11/12 work is authorized."
+  ]
+}

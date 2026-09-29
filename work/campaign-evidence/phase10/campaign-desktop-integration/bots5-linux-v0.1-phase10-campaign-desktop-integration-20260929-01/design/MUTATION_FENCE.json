@@ -1,0 +1,175 @@
+{
+  "campaign_id": "bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01",
+  "parcel_version": 1,
+  "baseline_head": "0756904481ae884bb9e864e8e1e11fc4a27a72ff",
+  "baseline_parent": "7c2fe400d1f78e2c4398f3bb2461e8dceff5c6f7",
+  "baseline_tree": "7fe879035a01a87339dfe6319a435fa0e84c94bd",
+  "status": "proposed_design_fence_requires_mick_acceptance_and_parcel_v2",
+  "authority": "design-only parcel-v1; no tracked mutation authorized",
+  "depends_on": [
+    "design/PHASE10_CAMPAIGN_DESKTOP_DESIGN.md",
+    "design/PREFLIGHT_APPROVAL_STATE_MACHINE.md",
+    "design/CAMPAIGN_EVIDENCE_EVOLUTION.md",
+    "design/REGENERATION_AND_STALE_SYNTHESIS.md",
+    "design/DESKTOP_SURFACE_AND_LIFECYCLE.md",
+    "design/IMPLEMENTATION_SEQUENCE.md",
+    "design/VALIDATION_PLAN.md",
+    "design/HUMAN_SEMANTIC_FORK_REGISTER.md"
+  ],
+  "modify": [
+    {
+      "path": "src/bots5/errors.py",
+      "why": "Add ApprovalInvalidatedError(Bots5Error) for typed preflight/approval refusal.",
+      "contract": "new error subclass; no existing error semantics change",
+      "guards": []
+    },
+    {
+      "path": "src/bots5/models.py",
+      "why": "Additive StageRecord fields (attempt_number, consumed_dependencies, dependency_digests, preflight_digest) with defaults; new frozen FileSnapshot/PreflightSnapshot/ApprovalRecord; optional RunState.CANCELLED per HSF-4.",
+      "contract": "defaults keep v1 records loadable; existing to_dict keys unchanged",
+      "guards": []
+    },
+    {
+      "path": "src/bots5/storage.py",
+      "why": "Attempt-aware persist_stage_attempt; selection.json load/persist; v2-aware load_run_view/load_stage_view; preflight.json persistence; selection/staleness reconstruction helpers. Flat <id>.att<N> names keep the containment predicate at storage.py:196-198 unchanged.",
+      "contract": "legacy v1 reader behavior byte-identical",
+      "guards": [
+        "tests/test_phase10_backward_compat.py",
+        "tests/test_storage_events.py",
+        "tests/test_runner.py",
+        "tests/test_cli_views.py"
+      ]
+    },
+    {
+      "path": "src/bots5/events.py",
+      "why": "Additive EVENT_TYPES kinds (attempt_selected, synthesis_stale, run_cancelled, worker_regeneration_started/finished, synthesis_rerun_started/finished). Existing 11 kinds untouched; writer stays fail-closed.",
+      "contract": "append-only; v1 logs remain parseable",
+      "guards": ["tests/test_storage_events.py"]
+    },
+    {
+      "path": "src/bots5/usage.py",
+      "why": "Dual accounting (cumulative_spend, selected_spend, per_attempt) while aggregate mirrors selected_spend for legacy consumers. No token-dollar projection.",
+      "contract": "aggregate/stages keys preserved",
+      "guards": ["tests/test_runner.py", "tests/test_local_provider.py"]
+    },
+    {
+      "path": "src/bots5/runner.py",
+      "why": "Preflight snapshot assertion before first provider request (closes TOCTOU at runner.py:265-267); zero-reread dispatch from frozen snapshot; CancelledError terminalization (runner.py:465 catches Exception only); synthesis dependency provenance (consumed_dependencies/dependency_digests); regenerate_worker and rerun_synthesis entry points; preflight.json persistence.",
+      "contract": "snapshot/approval optional: headless run_job behavior unchanged when omitted",
+      "guards": [
+        "tests/test_runner.py",
+        "tests/test_audit_blockers.py",
+        "tests/test_phase10_evidence_regeneration.py",
+        "tests/test_phase10_desktop_preflight.py"
+      ]
+    },
+    {
+      "path": "src/bots5/cli.py",
+      "why": "Headless parity: inspect --attempt, attempt/stale markers in status, regenerate and rerun-synthesis verbs (preflight-only unless --approve --actor/--approval is supplied). validate/run verbs and all exit codes unchanged.",
+      "contract": "v1 outputs and exit codes unchanged",
+      "guards": ["tests/test_cli_views.py", "tests/test_phase10_backward_compat.py"]
+    },
+    {
+      "path": "src/bots5/desktop/window.py",
+      "why": "Narrow dock attach at the existing MainWindow composition seam; no Phase 9 dock/dialog/bridge behavior change.",
+      "contract": "composition only",
+      "guards": [
+        "tests/test_phase9_desktop_slice_e.py",
+        "tests/test_phase7_desktop.py",
+        "tests/test_desktop_draft1.py"
+      ]
+    },
+    {
+      "path": "src/bots5/bootstrap/desktop.py",
+      "why": "Narrow wiring: compose CampaignBridge into build_runtime/serve and register campaign cancellation/terminal-await in the close driver before authority release. Authority acquisition order and _close_driver precedence table preserved.",
+      "contract": "composition + one bounded close stage",
+      "guards": [
+        "tests/test_phase1_desktop.py",
+        "tests/test_phase1_core.py",
+        "tests/test_phase9_desktop_slice_e.py"
+      ]
+    }
+  ],
+  "add": [
+    {
+      "path": "src/bots5/core/campaign.py",
+      "why": "Qt-free CampaignBridge + CampaignProjection: zero-spend validation, preflight/approval construction, hosted campaign task ownership, bounded filesystem polling projection, explicit selection command. The desktop observes/operates the engine only through this seam.",
+      "contract": "new module; no engine authority duplication",
+      "guards": []
+    },
+    {
+      "path": "src/bots5/desktop/campaign_dock.py",
+      "why": "Campaign dock widget + view model: load, validate, preflight/approve, truthful progress, attempt switcher, staleness indicator, expandable output, New Job.",
+      "contract": "new module; presentation only",
+      "guards": []
+    },
+    {
+      "path": "tests/test_phase10_backward_compat.py",
+      "why": "GATE-FIRST: golden-fixture V0/V0.2 reader tests must land and pass BEFORE any storage/models mutation. Today old-run compatibility has no automated proof.",
+      "contract": "new tests",
+      "guards": []
+    },
+    {
+      "path": "tests/test_phase10_desktop_preflight.py",
+      "why": "T0.1/T0.2/T0.3: zero-spend validation, approval binding and invalidation, no-provider-before-approval.",
+      "contract": "new tests",
+      "guards": []
+    },
+    {
+      "path": "tests/test_phase10_desktop_projection.py",
+      "why": "T0.7/T1.1: live projection truth (known subtotal + explicit unknown set), display classification, no fabricated cost.",
+      "contract": "new tests",
+      "guards": []
+    },
+    {
+      "path": "tests/test_phase10_desktop_lifecycle.py",
+      "why": "T0.6/T0.8/T0.10: crash/partial display truth, shutdown with active campaign, New Job presentation, cancellation terminalization.",
+      "contract": "new tests",
+      "guards": []
+    },
+    {
+      "path": "tests/test_phase10_evidence_regeneration.py",
+      "why": "T0.4/T0.5/T1.2/T1.3: attempt preservation, sibling regeneration, explicit model change, provider-route lock, mechanical staleness, explicit rerun, append-only events.",
+      "contract": "new tests",
+      "guards": []
+    },
+    {
+      "path": "tests/test_phase10_cross_cutting.py",
+      "why": "T3: filesystem durability/reconstruction, asyncio shutdown, provider-side uncertainty, desktop/core authority boundaries.",
+      "contract": "new tests",
+      "guards": []
+    }
+  ],
+  "unchanged_guards": [
+    "src/bots5/manifest.py — zero-spend validation reuses load_job/validate_referenced_files verbatim; no manifest schema change, so no JOB_SPEC.md obligation (docs/DEVELOPMENT.md:110-113)",
+    "src/bots5/paths.py — validate_stage_id / locate_run_dir / containing rules unchanged",
+    "src/bots5/core/application.py — zero-diff; Phase 1-9 authority machinery untouched; composition happens in bootstrap",
+    "src/bots5/core/execution.py, core/import_queue.py, core/events.py — untouched",
+    "src/bots5/providers/** — no provider-contract or route-mapping change",
+    "src/bots5/desktop/session.py, desktop/phase9*.py, desktop/bridge.py, desktop/widgets.py, desktop/theme.py, desktop/profile.py — Phase 9 surfaces unchanged",
+    "evidence/** — historical evidence never rewritten",
+    "examples/** — job assets unchanged",
+    "pyproject.toml — no dependency change",
+    "db/migrations/** — no migration unless HSF-2 option 2b is selected"
+  ],
+  "forbidden_expansions": [
+    "any pricing registry / live provider pricing lookup (HSF-1; static catalogue would also add a tracked asset)",
+    "app-DB persistence of campaign state (HSF-2 option 2b) unless Mick accepts the fence expansion",
+    "run-directory enumeration seam (HSF-3 option 3b) unless Mick accepts the fence expansion",
+    "explicit provider-route change on regeneration (HSF-5)",
+    "containment-predicate change for nested attempt layout (not adopted)",
+    "manifest schema change",
+    "dependency changes",
+    "provider streaming redesign",
+    "Phase 11/12 work",
+    "retained-installation cleanup"
+  ],
+  "notes": [
+    "The fence is the supervisor's integrated proposal, reconciled with GLM's feasibility fence (GLM_PROPOSED_FENCE.json) and Gemini's seam inventory.",
+    "GLM proposed 16 paths; the supervisor adds src/bots5/errors.py (typed refusal) => 9 modify.",
+    "Every added test file must prove non-zero collection before its gate is claimed (VALIDATION_PLAN.md §0).",
+    "No path may be changed outside this set without a new human adjudication and a successor parcel.",
+    "Post-falsification repair v1->v2 (reports/design/DESIGN_REPAIR_RECORD_v1_to_v2.md) required NO fence expansion: F-01/F-02/F-03 (operation snapshots, one-shot approval, provider-object route validation) touch models.py/runner.py/errors.py/storage.py; F-04 (provider error classification) touches errors.py/runner.py; F-05 (cancellation label) touches runner.py; F-06/F-07 (provenance outcomes, derived selected cost) touch storage.py/usage.py; F-08 touches the test files already fenced; F-09 is a documentation/fork correction.",
+    "src/bots5/providers/** remains a zero-diff guard: provider-object route validation reads the exposed base_url (and api_key_env only where a provider exposes it, i.e. OpenAICompatibleProvider) without changing provider semantics; OpenRouterProvider exposes only base_url."
+  ]
+}

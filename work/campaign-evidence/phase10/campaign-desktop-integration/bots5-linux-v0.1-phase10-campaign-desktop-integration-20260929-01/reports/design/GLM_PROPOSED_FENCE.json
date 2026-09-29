@@ -1,0 +1,118 @@
+{
+  "baseline_head": "0756904481ae884bb9e864e8e1e11fc4a27a72ff",
+  "paths": [
+    {
+      "path": "tests/test_phase10_backward_compat.py",
+      "action": "add",
+      "why": "GATE-FIRST: golden-fixture V0/V0.2 reader tests must land and pass BEFORE any storage/models mutation (STEP_VALIDATION §10; Qwen [X]8)",
+      "tests": ["tests/test_phase10_backward_compat.py"]
+    },
+    {
+      "path": "src/bots5/models.py",
+      "action": "modify",
+      "why": "ADDITIVE ONLY: optional attempt_number/consumed_dependencies/dependency_digests fields on StageRecord (defaults preserve v1 records); new frozen PreflightSnapshot/ApprovalRecord dataclasses (GEMINI §10, §1.3)",
+      "tests": ["tests/test_phase10_evidence_regeneration.py", "tests/test_runner.py"]
+    },
+    {
+      "path": "src/bots5/storage.py",
+      "action": "modify",
+      "why": "Attempt-aware persist + selection load/persist + v2-aware readers; legacy load_run_view/load_stage_view v1 behavior unchanged; flat <id>.att<N> basenames keep the containment predicate (storage.py:196-198) intact (MiniMax C-3; GEMINI §1.1/§2)",
+      "tests": ["tests/test_phase10_backward_compat.py", "tests/test_phase10_evidence_regeneration.py", "tests/test_storage_events.py"]
+    },
+    {
+      "path": "src/bots5/events.py",
+      "action": "modify",
+      "why": "ADDITIVE EVENT_TYPES extension (attempt_selected, synthesis_stale, run_cancelled) - versioned evidence decision; existing kinds untouched (Qwen [X]7; GEMINI §10)",
+      "tests": ["tests/test_storage_events.py", "tests/test_phase10_evidence_regeneration.py"]
+    },
+    {
+      "path": "src/bots5/usage.py",
+      "action": "modify",
+      "why": "Dual-accounting usage_document (cumulative_spend + selected_spend); no token-dollar projection invented (GEMINI §6; MiniMax §7)",
+      "tests": ["tests/test_phase10_desktop_projection.py", "tests/test_runner.py"]
+    },
+    {
+      "path": "src/bots5/runner.py",
+      "action": "modify",
+      "why": "Preflight snapshot assert before first provider request (closes TOCTOU at runner.py:265-267); CancelledError terminalization (runner.py:465 catches Exception only); dependency provenance; regenerate_worker/rerun_synthesis entry points (MiniMax §4; GEMINI §4/§10)",
+      "tests": ["tests/test_phase10_desktop_preflight.py", "tests/test_phase10_desktop_lifecycle.py", "tests/test_phase10_cross_cutting.py", "tests/test_runner.py"]
+    },
+    {
+      "path": "src/bots5/cli.py",
+      "action": "modify",
+      "why": "Headless parity + preservation: --attempt on inspect, attempt/stale markers in status, rerun-synthesis verb; v1 run output shape and exit codes unchanged (STEP T0.9/T2.1; GEMINI §10)",
+      "tests": ["tests/test_cli_views.py", "tests/test_phase10_backward_compat.py"]
+    },
+    {
+      "path": "src/bots5/core/campaign.py",
+      "action": "add",
+      "why": "NEW bridge desktop<->engine: bounded filesystem polling projection, preflight/approval orchestration, background task ownership; desktop never becomes a second engine (GEMINI §7.2/§10; MiniMax §6)",
+      "tests": ["tests/test_phase10_desktop_projection.py", "tests/test_phase10_desktop_lifecycle.py"]
+    },
+    {
+      "path": "src/bots5/desktop/campaign_dock.py",
+      "action": "add",
+      "why": "NEW campaign dock widget: load, zero-spend validation view, preflight/approval modal, truthful progress, attempt switcher, expandable output (GEMINI §10; COMMAND §4)",
+      "tests": ["tests/test_phase10_desktop_preflight.py", "tests/test_phase10_desktop_projection.py"]
+    },
+    {
+      "path": "src/bots5/desktop/window.py",
+      "action": "modify",
+      "why": "NARROW WIRING ONLY: attach campaign dock at existing MainWindow composition; no Phase 9 dock/dialog/bridge behavior change",
+      "tests": ["tests/test_phase10_desktop_lifecycle.py", "tests/test_phase9_desktop_slice_e.py", "tests/test_phase7_desktop.py"]
+    },
+    {
+      "path": "src/bots5/bootstrap/desktop.py",
+      "action": "modify",
+      "why": "NARROW WIRING ONLY: compose core/campaign.py bridge into build_runtime/serve; authority acquisition order and _close_driver staging untouched",
+      "tests": ["tests/test_phase10_desktop_lifecycle.py", "tests/test_phase10_cross_cutting.py", "tests/test_phase1_desktop.py"]
+    },
+    {
+      "path": "tests/test_phase10_desktop_preflight.py",
+      "action": "add",
+      "why": "T0.1/T0.2/T0.3 gates: zero-spend validation, approval binding, fake-provider spend gate (STEP §3)",
+      "tests": ["tests/test_phase10_desktop_preflight.py"]
+    },
+    {
+      "path": "tests/test_phase10_desktop_projection.py",
+      "action": "add",
+      "why": "T0.7 gate: live projection truth (known subtotal + unknown set) (STEP §3.7)",
+      "tests": ["tests/test_phase10_desktop_projection.py"]
+    },
+    {
+      "path": "tests/test_phase10_desktop_lifecycle.py",
+      "action": "add",
+      "why": "T0.6/T0.8/T0.10 gates: crash/partial display truth, shutdown with active campaign, New Job presentation (STEP §3)",
+      "tests": ["tests/test_phase10_desktop_lifecycle.py"]
+    },
+    {
+      "path": "tests/test_phase10_evidence_regeneration.py",
+      "action": "add",
+      "why": "T0.4/T0.5 gates: attempt preservation, sibling regeneration, stale synthesis, explicit rerun (STEP §3.4/§3.5)",
+      "tests": ["tests/test_phase10_evidence_regeneration.py"]
+    },
+    {
+      "path": "tests/test_phase10_cross_cutting.py",
+      "action": "add",
+      "why": "T3 gates: filesystem durability/reconstruction, asyncio shutdown, provider-side uncertainty, authority boundaries (STEP §6)",
+      "tests": ["tests/test_phase10_cross_cutting.py"]
+    }
+  ],
+  "forks": [
+    "preflight pricing authority (H-4/F-06): HUMAN_FORK",
+    "provider change on regeneration (F-04): HUMAN_FORK",
+    "attempt path layout + storage containment (H-2): HUMAN_FORK (flat grammar is the only containment-preserving candidate; layout choice itself not settled)",
+    "cancellation terminal state (H-1/X-1): HUMAN_FORK",
+    "restart persistence of loaded campaign (H-5/F-15): HUMAN_FORK",
+    "run discovery (H-3/X-6): HUMAN_FORK",
+    "approval binding substrate (H-6/X-3): HUMAN_FORK"
+  ],
+  "unchanged_guards": [
+    "src/bots5/manifest.py (zero-spend validation reuses load_job/validate_referenced_files unchanged; no manifest schema change => no JOB_SPEC obligation)",
+    "src/bots5/paths.py (STAGE_ID_RE already admits attempt basenames; locate_run_dir unchanged unless run-discovery fork expands)",
+    "src/bots5/core/application.py (2775-line Phase 1-9 authority machinery; zero-diff required; desktop composes in bootstrap, not BotsApplication)",
+    "src/bots5/providers/** (no route/model mapping change; provider-change-on-regeneration is a human fork)",
+    "src/bots5/desktop/session.py, phase9*.py, bridge.py, widgets.py (Phase 9 surfaces untouched except window.py dock attach)",
+    "evidence/** historical trees (never rewritten)"
+  ]
+}

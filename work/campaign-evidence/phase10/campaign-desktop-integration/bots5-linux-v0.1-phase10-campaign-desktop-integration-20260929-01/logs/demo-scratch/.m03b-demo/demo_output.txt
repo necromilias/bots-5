@@ -1,0 +1,59 @@
+
+== setup: completed evidence-v2 run (real engine, full-run approval) ==
+  PASS  full run succeeded
+  PASS  run declares evidence_version 2
+  PASS  initial cumulative_spend = 0.03 (3 attempts)
+
+== 1. regenerate_worker appends w1.att2; att1 stays byte-identical ==
+  PASS  stages/w1.att2.json created
+  PASS  stages/w1.att2.md created
+  PASS  every pre-existing file byte-identical (att1, run.json, result.md, preflight.json...)
+  PASS  att2 record carries attempt_number 2
+  PASS  att2 record carries the approved preflight_digest
+  PASS  explicit model change: sibling records the new model, original untouched
+  PASS  regenerated attempt succeeded
+  PASS  worker_regeneration_started/finished events appended
+  PASS  request_sent carries the regenerated model
+
+== 2a. refusal: approval target attempt != disk-derived next number ==
+  PASS  regenerate_worker refuses to renumber (disk derives 3, approval says 2) [ApprovalInvalidatedError: approved attempt number 2 does not match the disk-derived next attempt number 3; the opera...]
+  PASS  refusal wrote nothing
+  PASS  no provider request on refusal
+
+== 2b. refusal: version 1 run is read-only (M-6), nothing written ==
+  PASS  fixture run is version 1 (marker absent)
+  PASS  regenerate_worker refuses a version 1 run (typed ValidationError) [ValidationError: run declares evidence version 1; this operation requires evidence_version >= 2 (version 1 ...]
+  PASS  version 1 run byte-identical (nothing written)
+
+== 3. cumulative_spend rises; selection.json still selects attempt 1 ==
+  PASS  cumulative_spend 0.03 -> 0.04 (sibling attempt counted immediately)
+  PASS  per_attempt includes w1.att2
+  PASS  selected_spend/aggregate unchanged (0.03)
+  PASS  selection.json still selects attempt 1 everywhere (no auto-select)
+
+== 4. explicit selection change -> STALE; reselect back -> FRESH ==
+  PASS  reconstruct_run_state: selected synthesis is STALE after w1 -> att2
+  PASS  reselecting w1 -> att1 restores FRESH (bidirectional)
+
+== 5/6. rerun: binding refusal after dependency regen+reselect; then success ==
+  PASS  disk-derived next synthesis attempt is 2
+  PASS  rerun_synthesis refuses: dependency regenerated+reselected after approval was prepared (selection/bytes binding) [ApprovalInvalidatedError: selected dependency attempts differ from the approved operation snapshot binding (selectio...]
+  PASS  rerun refusal wrote nothing
+  PASS  no provider request on rerun refusal
+  PASS  stages/synth.att2.json created
+  PASS  earlier synthesis attempt byte-identical
+  PASS  rerun attempt 2 succeeded
+  PASS  rerun record carries the frozen provenance (consumed deps + digests)
+  PASS  selection.json moved to synth att2 (w1 att3 kept)
+  PASS  result.md mirrors the new selected synthesis attempt
+  PASS  attempt_selected event records previous_attempt
+  PASS  cumulative_spend now 0.06 (6 executed attempts)
+  PASS  usage selected cache refreshed from the derived value (0.03)
+  PASS  reselected synthesis is FRESH for its new provenance
+
+== 7. replayed approvals raise ApprovalInvalidatedError, no second request ==
+  PASS  replayed regeneration approval refused [ApprovalInvalidatedError: approval already consumed: demo-regen-w1-att2-a...]
+  PASS  replayed rerun approval refused [ApprovalInvalidatedError: approval already consumed: demo-rerun-synth-att2-b...]
+  PASS  no second provider request for either replayed approval
+
+ALL 41 DEMONSTRATION CHECKS PASSED

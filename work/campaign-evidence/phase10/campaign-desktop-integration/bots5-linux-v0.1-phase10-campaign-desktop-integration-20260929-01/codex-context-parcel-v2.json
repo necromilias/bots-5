@@ -1,0 +1,123 @@
+{
+  "template": "codex-context-parcel",
+  "template_version": "0.1",
+  "parcel_id": "bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01-parcel-v2",
+  "job_or_campaign_id": "bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01",
+  "policy": {
+    "id": "procedure.codex-job-governance",
+    "version": "0.3",
+    "path": "procedures/candidates/CODEX_PROMPT_GENERATION_POLICY.md"
+  },
+  "root_path": ".",
+  "immutable_after_launch": true,
+  "supersedes": {
+    "parcel_id": "bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01-parcel-v1",
+    "path": "codex-context-parcel.json",
+    "sha256": "53a4a0248f43d42081daef5c9fce377f43436ad20ad9465b4c4b5b7ac70e6fed"
+  },
+  "files": {
+    "adjudication_md": {
+      "path": "parcel-v2/ADJUDICATION.md",
+      "required": true,
+      "sha256": "d7ad66a2c24670b5514ae8c9e4e38f8f6a0c5475990aad6f7182270300499cd5"
+    },
+    "adjudication_json": {
+      "path": "parcel-v2/ADJUDICATION.json",
+      "required": true,
+      "sha256": "ae4d292122009b7aa33888c21d8a06cbcb5f5dce68ac7968b6b45cefda77ae7c"
+    },
+    "normalized_corrections": {
+      "path": "parcel-v2/NORMALIZED_CORRECTIONS.md",
+      "required": true,
+      "sha256": "80bf3840b66767659f1bd8b73331c7cde39896d2904cf21bd9865025b2ff7cc1"
+    },
+    "contract": {
+      "path": "parcel-v2/CONTRACT.md",
+      "required": true,
+      "sha256": "39a20200547cc57ccd7de8994e5d321bcb31448c3dd0616ac4986301bfd09ee7"
+    },
+    "scope": {
+      "path": "parcel-v2/SCOPE.json",
+      "required": true,
+      "sha256": "b80396c2606f5d38d6de28f467c5bff41d90215798e958ba5796a2af5573ec58"
+    },
+    "baseline": {
+      "path": "parcel-v2/BASELINE.json",
+      "required": true,
+      "sha256": "59407f57adac6df28a1bdca8d0c0c9b012c73a9328164ccd8393b05bc4be2b20"
+    },
+    "budget": {
+      "path": "parcel-v2/BUDGET.json",
+      "required": true,
+      "sha256": "25bf45db30464dbaadf2f778b0d4dc70e3672f2ec30ece083d6dc1eb64534318"
+    },
+    "validation": {
+      "path": "parcel-v2/VALIDATION.md",
+      "required": true,
+      "sha256": "6bad2fce600b0b4c535b59fe0097f14087cf0dbed3baf40dc23bbe0df681e5e1"
+    },
+    "sources": {
+      "path": "parcel-v2/SOURCES.md",
+      "required": true,
+      "sha256": "b8e7b027ede44494833355541dba30b8e23a4456908b88065f5bf12d5fdacca6"
+    },
+    "findings": {
+      "path": "parcel-v2/FINDINGS.md",
+      "required": true,
+      "sha256": "05fe3ca1720a746d877d6eb072bdea65c3bbeeba52ae1138c792d86dfcd2af73"
+    },
+    "manifest": {
+      "path": "parcel-v2/PARCEL_V2_MANIFEST.json",
+      "required": true,
+      "sha256": "45fd91f3f383620e4da7575c7a5ba92abf9298ed47c72cf7eb30a315c854391b"
+    },
+    "contract_design": {
+      "path": "design/PHASE10_CAMPAIGN_DESKTOP_DESIGN.md",
+      "required": true
+    },
+    "design_seal": {
+      "path": "seals/design/DESIGN_SEAL_v4.json",
+      "required": true,
+      "sha256": "9739e87cd42459973a600e2d1b2b19408671f93e82fbff2d13c71b11e57ed9c1"
+    },
+    "mutation_fence": {
+      "path": "design/MUTATION_FENCE.json",
+      "required": true,
+      "sha256": "602e6d5d3a88eb893d11d064dfc28c70e8f692c52cb823cd0c8b2711907cf452"
+    }
+  },
+  "authority_sources": [
+    {
+      "source": "Mick adjudication 2026-09-29",
+      "path": "parcel-v2/ADJUDICATION.md",
+      "role": "design acceptance + implementation authority + fork adjudication"
+    },
+    {
+      "repository": "necromilias/organisational-memory",
+      "ref": "cc0c3c80348b1d798def65988102e0d8ad966730",
+      "role": "accepted_product_architecture_sequence_and_governance"
+    },
+    {
+      "repository": "necromilias/bots-5",
+      "ref": "0756904481ae884bb9e864e8e1e11fc4a27a72ff",
+      "role": "landed_runtime_and_current_technical_contract"
+    }
+  ],
+  "precedence": [
+    "Mick current explicit adjudication",
+    "accepted design seal v4 and its preserved seal chain",
+    "immutable parcel-v2 contract/budget/validation",
+    "pinned canonical OrgMem authority",
+    "pinned B.O.T.S. live implementation/runtime truth",
+    "historical campaign/report evidence"
+  ],
+  "integrity": {
+    "hash_algorithm": "sha256",
+    "all_present_files_hashed": true
+  },
+  "notes": [
+    "Parcel-v2 supersedes parcel-v1 for implementation; design seal v4 is frozen.",
+    "Solar Pro 4 excluded. Jamba optional final reviewer only, max one, normally unused.",
+    "MiMo V2.6 Flash cap amended to 4 with the fourth launch reserved for the final implementation oracle."
+  ]
+}

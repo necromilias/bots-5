@@ -1,0 +1,176 @@
+{
+  "campaign_id": "bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01",
+  "global": {
+    "total_child_launch_limit": 32,
+    "max_parallel_children": 4,
+    "bounded_repair_waves": 8,
+    "replacement_counts_as_launch": true,
+    "budget_resets_on_resume": false,
+    "budget_resets_on_restart": false
+  },
+  "supervisor": {
+    "provider_model_id": "deepseek/deepseek-v4.1-flash",
+    "display_name": "DeepSeek V4.1 Flash",
+    "requested_effort": "provider_maximum_if_exposed",
+    "role": "retained supervisor/orchestrator; never independent reviewer"
+  },
+  "families": {
+    "Qwen3.8 Flash": {
+      "provider_model_id": "qwen/qwen3.8-flash",
+      "max_launches": 7,
+      "requested_effort": "provider_maximum_if_exposed",
+      "roles": [
+        "repo/campaign-engine archaeology",
+        "fresh broad implementation falsification",
+        "repo-grounded cross-family diagnosis or semantic repair"
+      ],
+      "runtime_alias_warning": "verify actual selectable route/version; do not silently equate an alias with the creator model-card build"
+    },
+    "Gemini 3.8 Flash": {
+      "provider_model_id": "google/gemini-3.8-flash",
+      "max_launches": 4,
+      "requested_effort": "provider_maximum_if_exposed",
+      "roles": [
+        "campaign evidence/regeneration/stale-synthesis architecture"
+      ],
+      "not_roles": [
+        "fresh design falsifier",
+        "final implementation oracle"
+      ]
+    },
+    "MiniMax M2.7": {
+      "provider_model_id": "minimax/minimax-m2.7",
+      "max_launches": 4,
+      "requested_effort": "provider_maximum_if_exposed",
+      "roles": [
+        "lifecycle/concurrency/crash/partial-run/provider-uncertainty failure forensics",
+        "targeted implementation lifecycle review"
+      ]
+    },
+    "Command A+": {
+      "provider_model_id": "cohere/command-a-plus",
+      "max_launches": 2,
+      "requested_effort": "provider_maximum_if_exposed",
+      "roles": [
+        "design-only operator authority/preflight/spend/result UX specialist"
+      ],
+      "critical_path": false,
+      "not_roles": [
+        "implementation writer",
+        "final reviewer",
+        "oracle"
+      ]
+    },
+    "Step 3.7 Flash": {
+      "provider_model_id": "stepfun/step-3.7-flash",
+      "max_launches": 4,
+      "requested_effort": "provider_maximum_if_exposed",
+      "roles": [
+        "validation/proof architecture",
+        "targeted implementation validation-sufficiency review"
+      ]
+    },
+    "GLM 5.3 Flash": {
+      "provider_model_id": "z-ai/glm-5.3-flash",
+      "max_launches": 8,
+      "requested_effort": "provider_maximum_if_exposed",
+      "roles": [
+        "implementation feasibility/exact mutation fence after specialist reports",
+        "primary implementation writer",
+        "first narrow implementation repair"
+      ]
+    },
+    "GPT-6 Luna": {
+      "provider_model_id": "openai/gpt-6-luna",
+      "max_launches": 4,
+      "requested_effort": "max_if_exposed_else_highest_available",
+      "roles": [
+        "fresh independent design falsifier",
+        "difficult cross-family diagnosis after recurring/conflicting implementation evidence"
+      ]
+    },
+    "MiMo V2.6 Flash": {
+      "provider_model_id": "xiaomi/mimo-v2.6-flash",
+      "max_launches": 3,
+      "requested_effort": "provider_maximum_if_exposed",
+      "roles": [
+        "fresh final design oracle",
+        "fresh final implementation oracle"
+      ]
+    },
+    "Qwen3 Coder Next": {
+      "provider_model_id": "qwen/qwen3-coder-next",
+      "max_launches": 4,
+      "requested_effort": "provider_default",
+      "roles": [
+        "mechanically specified Qt/test/refactor work after semantics are sealed"
+      ],
+      "not_roles": [
+        "product-semantic design",
+        "authority adjudication",
+        "final review"
+      ]
+    },
+    "Jamba Large 1.7": {
+      "provider_model_id": "ai21/jamba-large-1.7",
+      "max_launches": 1,
+      "requested_effort": "provider_default",
+      "nominally_scheduled": false,
+      "roles": [
+        "optional final implementation reviewer only"
+      ],
+      "hard_restrictions": [
+        "never design",
+        "never archaeology",
+        "never implementation",
+        "never repair",
+        "never diagnosis",
+        "never intermediate review",
+        "never substitute for another role",
+        "if used, exactly one launch against a frozen/resealed final implementation candidate after scheduled reviewers/repairs; MiMo may follow only as the distinct final oracle"
+      ]
+    },
+    "Solar Pro 4": {
+      "provider_model_id": "upstage/solar-pro4",
+      "max_launches": 0,
+      "roles": [],
+      "reason": "excluded by observed Slice E reviewer behavior under OPv1 despite creator benchmark claims"
+    },
+    "Mistral Small 2603": {
+      "provider_model_id": "mistralai/mistral-small-2603",
+      "max_launches": 0,
+      "roles": [],
+      "reason": "no demonstrated Phase 10 niche that displaces a proven family"
+    }
+  },
+  "design_route": [
+    "qwen/qwen3.8-flash archaeology",
+    "google/gemini-3.8-flash architecture",
+    "minimax/minimax-m2.7 failure forensics",
+    "cohere/command-a-plus operator-authority UX (noncritical design-only)",
+    "stepfun/step-3.7-flash validation architecture",
+    "z-ai/glm-5.3-flash feasibility/fence",
+    "openai/gpt-6-luna fresh design falsification",
+    "xiaomi/mimo-v2.6-flash final design oracle"
+  ],
+  "implementation_route_after_mick_gate": [
+    "z-ai/glm-5.3-flash primary writer",
+    "qwen/qwen3-coder-next mechanical helper where semantics are already settled",
+    "qwen/qwen3.8-flash or openai/gpt-6-luna cross-family diagnosis after same-class recurrence",
+    "qwen/qwen3.8-flash fresh broad implementation falsification",
+    "minimax/minimax-m2.7 targeted lifecycle review where material",
+    "stepfun/step-3.7-flash targeted proof-sufficiency review where material",
+    "ai21/jamba-large-1.7 optional final reviewer only, max one, normally unused",
+    "xiaomi/mimo-v2.6-flash final implementation oracle"
+  ],
+  "availability": {
+    "silent_substitution": false,
+    "rule": "Record requested/configured/effective model+effort. Reroute only to an already-authorized family whose listed role covers the work and preserves independence; otherwise STOP FOR MICK. Solar/Mistral have no substitution authority. Jamba never substitutes."
+  },
+  "anti_loop": {
+    "first_narrow_repair_may_reuse_writer": true,
+    "same_semantic_defect_class_recurs": "different family diagnosis required before another mutation; prefer Qwen3.8 for repo-grounded root cause or GPT-6 Luna for difficult independent diagnosis",
+    "passing_test_not_rerun_for_count_only": true,
+    "serial_gate_must_remain_serial": true
+  }
+}

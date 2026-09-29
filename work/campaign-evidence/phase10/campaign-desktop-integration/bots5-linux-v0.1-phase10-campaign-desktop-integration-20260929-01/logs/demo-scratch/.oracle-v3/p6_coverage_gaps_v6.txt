@@ -1,0 +1,50 @@
+/home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/work/campaign-evidence/phase10/campaign-desktop-integration/bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01/logs/demo-scratch/.oracle-v3/p6_coverage_gaps.py:151: RuntimeWarning: coroutine 'MainWindow._finish_close' was never awaited
+  pass
+RuntimeWarning: Enable tracemalloc to get the object allocation traceback
+
+==============================================================================
+P6a — window attach (T0.10) executed, not read
+==============================================================================
+  WITHOUT factory: campaignDock children = 0
+  WITHOUT factory: has campaign_dock_action attr = False
+  WITHOUT factory: View menu = ['Import Queue']
+  WITH factory   : campaignDock children = 1
+  WITH factory   : visible = [False]
+  WITH factory   : has campaign_dock_action = True
+  WITH factory   : View menu = ['Import Queue', 'Campaign']
+  WITH factory   : dock objectName/type = [('campaignDock', 'CampaignDockWidget')]
+  factory invoked at construction: 0 time(s) (factory is lazy - invoked on Load Job)
+  after View toggle: dock visible = [False]
+  View menu added by factory  : ['Campaign']
+  View menu removed/changed   : []
+  VERDICT: WINDOW ATTACH BEHAVIOUR CORRECT (but untested in v4)
+
+==============================================================================
+P6b — shutdown with an ACTIVE campaign (fence T0.8) executed
+==============================================================================
+  b1 hosted & busy while draining : True
+  b1 durable run state after dock.drain() : succeeded
+  b1 VERDICT: drain reached a durable terminal record
+  b2 busy before close stage      : True
+  b2 _close_campaigns elapsed     : 0.001s (budget 30s)
+  b2 durable run state            : cancelled
+  b2 stage states                 : {"synth.att1.json": "failed", "w1.att1.json": "failed", "w2.att1.json": "failed"}
+  b2 stage error_type             : {"synth.att1.json": null, "w1.att1.json": null, "w2.att1.json": null}
+  b2 bridge set emptied           : True
+  b2 VERDICT: bounded close stage drains to a durable terminal record
+
+==============================================================================
+P6c — durable attempt record + freshness report of a cancelled run
+==============================================================================
+  --- synth.att1.json ---
+      {"attempt_number": 1, "completion": null, "cost_known": false, "cost_usd": null, "duration_seconds": null, "ended_at": "2026-09-29T22:12:34.563Z", "failure": {"message": "run cancelled before the stage reached a terminal state", "provider_side_outcome_unknown": false, "type": "cancelled"}, "output_path": null, "preflight_digest": "39c6078839eea5e721fff016d4a7729e2685943e277caa0375a3fb73c9453e40", "provider": "openrouter", "provider_request_id": null, "requested_model": "model-synth", "returned_model": null, "stage_id": "synth", "started_at": null, "state": "failed", "usage": {"completion_tokens": null, "prompt_tokens": null, "reasoning_tokens": null, "total_tokens": null}}
+  --- w1.att1.json ---
+      {"attempt_number": 1, "completion": null, "cost_known": false, "cost_usd": null, "duration_seconds": 0.5992440889822319, "ended_at": "2026-09-29T22:12:34.562Z", "failure": {"message": "stage cancelled before terminal classification", "provider_side_outcome_unknown": true, "type": "cancelled"}, "output_path": null, "preflight_digest": "39c6078839eea5e721fff016d4a7729e2685943e277caa0375a3fb73c9453e40", "provider": "openrouter", "provider_request_id": null, "requested_model": "model-w1", "returned_model": null, "stage_id": "w1", "started_at": "2026-09-29T22:12:33.963Z", "state": "failed", "usage": {"completion_tokens": null, "prompt_tokens": null, "reasoning_tokens": null, "total_tokens": null}}
+  --- w2.att1.json ---
+      {"attempt_number": 1, "completion": null, "cost_known": false, "cost_usd": null, "duration_seconds": 0.5993227390572429, "ended_at": "2026-09-29T22:12:34.562Z", "failure": {"message": "stage cancelled before terminal classification", "provider_side_outcome_unknown": true, "type": "cancelled"}, "output_path": null, "preflight_digest": "39c6078839eea5e721fff016d4a7729e2685943e277caa0375a3fb73c9453e40", "provider": "openrouter", "provider_request_id": null, "requested_model": "model-w2", "returned_model": null, "stage_id": "w2", "started_at": "2026-09-29T22:12:33.963Z", "state": "failed", "usage": {"completion_tokens": null, "prompt_tokens": null, "reasoning_tokens": null, "total_tokens": null}}
+  display_state                   : cancelled
+  synthesis_freshness             : NOT_APPLICABLE
+  synthesis_freshness_report      : {"classification": "NOT_APPLICABLE", "dependencies": {}, "integrity_warning": false, "selected_attempt": 1, "skip_reason": "cancelled", "stage_id": "synth", "warnings": []}
+  integrity warnings              : []
+  synth record keys                : ['attempt_number', 'completion', 'cost_known', 'cost_usd', 'duration_seconds', 'ended_at', 'failure', 'output_path', 'preflight_digest', 'provider', 'provider_request_id', 'requested_model', 'returned_model', 'stage_id', 'started_at', 'state', 'usage']
+  synth consumed/dependency keys   : {'consumed_dependencies': None, 'dependency_digests': None, 'preflight_digest': '39c6078839eea5e721fff016d4a7729e2685943e277caa0375a3fb73c9453e40'}

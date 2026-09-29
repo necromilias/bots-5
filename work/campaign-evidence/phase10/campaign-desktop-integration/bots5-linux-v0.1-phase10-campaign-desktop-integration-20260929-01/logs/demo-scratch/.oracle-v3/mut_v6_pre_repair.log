@@ -1,0 +1,65 @@
+F                                                                        [100%]
+=================================== FAILURES ===================================
+______ test_persist_stage_attempt_output_fault_leaves_metadata_unadvanced ______
+
+tmp_path = PosixPath('/tmp/pytest-of-mick/pytest-1/test_persist_stage_attempt_out0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f114c3cfbb0>
+
+    def test_persist_stage_attempt_output_fault_leaves_metadata_unadvanced(tmp_path, monkeypatch):
+        """D-12 (oracle V-6): the in-place terminal update writes output FIRST.
+    
+        ``persist_stage_attempt(create=False, text=...)`` is the queued → running →
+        terminal transition and its metadata write is what durably advertises the
+        terminal state and ``output_path``. The output artifact is therefore
+        written BEFORE the metadata: a failure between the two writes must leave
+        the metadata un-advanced rather than durable-claiming a succeeded stage
+        whose artifact cannot be read (a green dock stage that errors when the
+        operator expands it). The create=True claim path keeps its metadata-first
+        ordering: an overwrite refusal must leave the directory byte-identical.
+        """
+        dirs = create_run_tree(
+            tmp_path / ".bots5" / "runs", "bots5-d12-durability-20260101T000000Z-00000001"
+        )
+        meta_path = dirs.stages / "w1.att1.json"
+    
+        # The engine's real sequence: exclusive claim (create=True, queued), then
+        # the in-place running marker (create=False, no text).
+        persist_stage_attempt(dirs, _d12_record("w1", StageState.QUEUED), attempt_number=1, create=True)
+        persist_stage_attempt(dirs, _d12_record("w1", StageState.RUNNING), attempt_number=1)
+        before = meta_path.read_bytes()
+        assert json.loads(before)["state"] == "running"
+        assert json.loads(before)["output_path"] is None
+    
+        # FAULT-INJECTION: the output (.md) write fails on the terminal update.
+        def _disk_fault(path: Path, text: str) -> None:
+            raise StorageError(f"injected disk fault writing {path}")
+    
+        monkeypatch.setattr("bots5.storage.atomic_write_text", _disk_fault)
+        with pytest.raises(StorageError, match="injected disk fault"):
+            persist_stage_attempt(
+                dirs,
+                _d12_record("w1", StageState.SUCCEEDED),
+                attempt_number=1,
+                text="worker output",
+                create=False,
+            )
+    
+        # THE OLD-ORDERING CATCHER: the durable metadata is byte-identical to the
+        # pre-call record — it was NOT advanced to a succeeded state advertising
+        # an output that cannot be read. Under the old ordering the metadata was
+        # written before the faulting output write, so these assertions fail.
+>       assert meta_path.read_bytes() == before
+E       assert b'{\n  "attem...ull\n  }\n}\n' == b'{\n  "attem...ull\n  }\n}\n'
+E         
+E         At index 174 diff: b'"' != b'n'
+E         Use -v to get more diff
+
+tests/test_phase10_evidence_regeneration.py:950: AssertionError
+=============================== warnings summary ===============================
+tests/test_phase10_evidence_regeneration.py::test_persist_stage_attempt_output_fault_leaves_metadata_unadvanced
+  /home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/.venv314/lib/python3.14/site-packages/pytest_asyncio/plugin.py:1216: DeprecationWarning: 'asyncio.get_event_loop_policy' is deprecated and slated for removal in Python 3.16
+    return asyncio.get_event_loop_policy()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_phase10_evidence_regeneration.py::test_persist_stage_attempt_output_fault_leaves_metadata_unadvanced

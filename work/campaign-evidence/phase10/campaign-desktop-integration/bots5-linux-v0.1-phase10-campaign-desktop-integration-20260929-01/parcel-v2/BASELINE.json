@@ -1,0 +1,91 @@
+{
+  "campaign_id": "bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01",
+  "repository": "necromilias/bots-5",
+  "branch": "main",
+  "expected_head": "0756904481ae884bb9e864e8e1e11fc4a27a72ff",
+  "expected_parent": "7c2fe400d1f78e2c4398f3bb2461e8dceff5c6f7",
+  "expected_tree": "7fe879035a01a87339dfe6319a435fa0e84c94bd",
+  "expected_origin_main": "0756904481ae884bb9e864e8e1e11fc4a27a72ff",
+  "phase9": {
+    "status": "closed_and_landed",
+    "slice_e_candidate_manifest_sha256": "6b480612049c040f330eeaf3f2ed5af660806788e0cc11c62a454dca9449117f",
+    "final_t4": {
+      "tests": 1409,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 1,
+      "exit_code": 0
+    }
+  },
+  "orgmem": {
+    "repository": "necromilias/organisational-memory",
+    "expected_head": "cc0c3c80348b1d798def65988102e0d8ad966730",
+    "phase9_closure_decision": "projects/bots-5/decisions/0012-linux-v0.1-phase9-closure-and-landing.md"
+  },
+  "critical_bots_blob_pins": {
+    "src/bots5/manifest.py": "0dd9fde83bcea5beaa9379cc71e502d0d71f9fb0",
+    "src/bots5/models.py": "2c36babdc8d652ee722d469745c1e56511ad09c1",
+    "src/bots5/runner.py": "b09252beae0e97d20a260fd8858afd671bcb063e",
+    "src/bots5/storage.py": "74d4cdead17948b6af550a72c3e86d5cbf756dff",
+    "src/bots5/events.py": "0ea715f44bd04efcce1e1ed2a2baa04fe453e48d",
+    "src/bots5/cli.py": "26aa95565ec847b456e2b93c659d95bf47379a11",
+    "src/bots5/desktop/window.py": "4e1b14fb730ab61d748a1b54a8d9a6a1a24beeeb",
+    "src/bots5/desktop/widgets.py": "8261f7c006ee5af35b0a6891d77f1d5bd6814bf2",
+    "src/bots5/desktop/session.py": "0742b57a7904904d7e2b7d93cf7d1de163359269",
+    "src/bots5/bootstrap/desktop.py": "f09f3eb2c04827ced1e7ca4edc9f5c29d7e188a3",
+    "src/bots5/core/application.py": "a44fcd14e73e9e2e15b353b94499a544a0f486da",
+    "docs/LINUX_V0_1_DESIGN.md": "3810e968b063d0ba5340a441565b52d5903c192c",
+    "docs/OPERATING_PROCEDURE_V1.md": "c9b40138aeac21c2ac9879fe400334afa6471baf",
+    "docs/OPERATING_PROCEDURE_V2.md": "699022cbb2824cfc5b8a6cfdf715e16e3faa009f",
+    "docs/WORKER_CONTRACTS.md": "d73108e3f8a98c17d4f703ef17e04d45032ba093",
+    "docs/LINUX_V0_1_PHASE9_SLICE_E_CLOSURE_REPORT.md": "21ec4fd2e59ff31257adc165d7938e17c42cd3f8",
+    "pyproject.toml": "9745d51cdc2a9cc49b2235af9e726ee4b18844f1"
+  },
+  "critical_orgmem_blob_pins": {
+    "core/authority.md": "d451e25389a0bed3f026c332a64e8738553a985b",
+    "core/approval-boundaries.md": "75aff6d1c6e45a5ce6af2e6a8a13656544070c53",
+    "procedures/candidates/CODEX_PROMPT_GENERATION_POLICY.md": "bd1f8f246cfe3f319f54f7c55f0cb97c2e7153ca",
+    "procedures/candidates/CODEX_PROMPT_LINT_RULES.md": "626dfb48a88e7cd422f9166fbcb897190e48ccab",
+    "projects/bots-5/decisions/0004-linux-v0.1-product-baseline.md": "281e97af391f2c250902cd0756c4e5734fd8e8e0",
+    "projects/bots-5/decisions/0005-linux-v0.1-architecture-baseline.md": "7f9057aef6bb003c4a3d7959c1817f09c8342411",
+    "projects/bots-5/decisions/0007-linux-v0.1-implementation-sequence.md": "914a539291f2157a46768a1001cd3665745c0c99",
+    "projects/bots-5/decisions/0012-linux-v0.1-phase9-closure-and-landing.md": "5a3329909fc01fd6d0c9c8db2bdedf06a69a329d",
+    "projects/bots-5/ACTIVE.md": "d0f3c05a35e9bb42cf3387bcf600072bce011669"
+  },
+  "preflight": [
+    "verify local HEAD/parent/tree/origin-main exactly",
+    "record git status including staged/tracked/untracked; preserve work/**",
+    "do not reset/rebase/clean over drift",
+    "recompute critical blob pins from local objects/files",
+    "verify OrgMem exact authority commit and source pins",
+    "record configured/effective model+effort availability before first child launch",
+    "re-verify HEAD/tree/origin and design seal v4 identity before the first implementation worker launch"
+  ],
+  "parcel_version": 2,
+  "design_of_record": {
+    "seal_file": "seals/design/DESIGN_SEAL_v4.json",
+    "seal_id": "9739e87cd42459973a600e2d1b2b19408671f93e82fbff2d13c71b11e57ed9c1",
+    "seal_chain_preserved": [
+      "7ecbb502bd65dcc2ad1595b1dd709db3eff0bc5d5e079b00f8e77c29ee6d952f",
+      "2a57410dc1da155aab7fcbf480a244b999eac3525a9c7737e40adc703fdee0e4",
+      "b08d85744065ab6d1b41e4f83912f4f194bc025725f6d95ab4c7b959874f1ded"
+    ],
+    "mutation_fence": "design/MUTATION_FENCE.json",
+    "fence_shape": {
+      "modify": 9,
+      "add": 8
+    },
+    "immutable": true
+  },
+  "implementation_baseline": {
+    "expected_head": "0756904481ae884bb9e864e8e1e11fc4a27a72ff",
+    "expected_tree": "7fe879035a01a87339dfe6319a435fa0e84c94bd",
+    "tracked_tree_must_be_clean_at_implementation_start": true
+  },
+  "product_target": {
+    "immutable_target": false,
+    "mutation_permission": "fence_limited",
+    "fence": "design/MUTATION_FENCE.json",
+    "note": "the parcel is immutable after launch; the product target is mutable only inside the fence"
+  }
+}

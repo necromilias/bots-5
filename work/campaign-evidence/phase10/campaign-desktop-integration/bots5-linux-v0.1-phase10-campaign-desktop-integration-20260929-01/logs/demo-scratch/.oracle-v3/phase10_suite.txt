@@ -1,0 +1,23 @@
+============================= test session starts ==============================
+platform linux -- Python 3.14.7, pytest-9.1.1, pluggy-1.6.0
+PySide6 6.11.2 -- Qt runtime 6.11.2 -- Qt compiled 6.11.2
+rootdir: /home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, asyncio-0.26.0, qt-4.5.0
+asyncio: mode=Mode.STRICT, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 96 items
+
+tests/test_phase10_backward_compat.py ...............                    [ 15%]
+tests/test_phase10_cross_cutting.py .....................                [ 37%]
+tests/test_phase10_desktop_lifecycle.py .................                [ 55%]
+tests/test_phase10_desktop_preflight.py .................                [ 72%]
+tests/test_phase10_desktop_projection.py ..........                      [ 83%]
+tests/test_phase10_evidence_regeneration.py ................             [100%]
+
+=============================== warnings summary ===============================
+tests/test_phase10_backward_compat.py::test_golden_v0_run_directory_loads_through_load_run_view
+  /home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/.venv314/lib/python3.14/site-packages/pytest_asyncio/plugin.py:1216: DeprecationWarning: 'asyncio.get_event_loop_policy' is deprecated and slated for removal in Python 3.16
+    return asyncio.get_event_loop_policy()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+======================== 96 passed, 1 warning in 12.67s ========================

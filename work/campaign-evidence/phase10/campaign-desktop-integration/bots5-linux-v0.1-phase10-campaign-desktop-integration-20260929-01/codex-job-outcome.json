@@ -1,0 +1,115 @@
+{
+  "template": "codex-job-outcome",
+  "template_version": "0.3",
+  "job_or_campaign_id": "bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01",
+  "policy": {
+    "id": "procedure.codex-job-governance",
+    "version": "0.3"
+  },
+  "result": {
+    "technical_disposition": null,
+    "administrative_disposition": null,
+    "technical_completed_at": null,
+    "administrative_closed_at": null
+  },
+  "routing": {
+    "requested": {
+      "model": "deepseek/deepseek-v4.1-flash",
+      "effort": "provider_maximum_if_exposed"
+    },
+    "configured": {
+      "model": null,
+      "effort": null,
+      "verification": "not_assessed"
+    },
+    "effective": {
+      "model": null,
+      "effort": null,
+      "verification": "not_assessed"
+    }
+  },
+  "workers": {
+    "total_launches": 0,
+    "peak_parallel": 0,
+    "assignments": []
+  },
+  "escalations": [],
+  "execution": {
+    "started_at": null,
+    "ended_at": null,
+    "wall_time": null,
+    "repair_waves_used": 0,
+    "test_runs": 0
+  },
+  "validation": {
+    "test_groups_run": [],
+    "defects_found": [],
+    "broader_validation_result": "not_performed",
+    "broader_validation_evidence": null
+  },
+  "evidence": {
+    "candidate_identity": null,
+    "prompt_record": "codex-campaign.json",
+    "generated_prompt": "prompts/SUPERVISOR_LAUNCH.md",
+    "worker_reports": [],
+    "reviewer_reports": [],
+    "raw_logs": [],
+    "other": [
+      "MODEL_ROUTING_EVIDENCE.md",
+      "continuation/CONTINUATION_TEMPLATE.json",
+      "continuation/IMPLEMENTATION_ROUTING.md"
+    ],
+    "context_parcel": {
+      "parcel_id": "bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01-parcel-v1",
+      "manifest_path": "codex-context-parcel.json",
+      "manifest_sha256": "53a4a0248f43d42081daef5c9fce377f43436ad20ad9465b4c4b5b7ac70e6fed"
+    },
+    "generated_worker_prompts": [
+      "prompts/design/01_QWEN_CAMPAIGN_ARCHAEOLOGY.md",
+      "prompts/design/02_GEMINI_EVIDENCE_REGEN_ARCHITECT.md",
+      "prompts/design/03_MINIMAX_LIFECYCLE_FORENSICS.md",
+      "prompts/design/04_COMMAND_OPERATOR_AUTHORITY_UX.md",
+      "prompts/design/05_STEP_VALIDATION_ARCHITECT.md",
+      "prompts/design/06_GLM_FEASIBILITY_FENCE.md",
+      "prompts/review/01_GPT6_LUNA_DESIGN_FALSIFICATION.md",
+      "prompts/oracle/01_MIMO_FINAL_DESIGN_ORACLE.md"
+    ]
+  },
+  "efficiency_review": {
+    "model_sizing": {
+      "status": "not_assessed",
+      "evidence": null
+    },
+    "effort_sizing": {
+      "status": "not_assessed",
+      "evidence": null
+    },
+    "test_scope": {
+      "status": "not_assessed",
+      "evidence": null
+    },
+    "delegation_efficiency": {
+      "status": "not_assessed",
+      "evidence": null
+    }
+  },
+  "usage": {
+    "meter": "campaign provider/API cost plus child-launch/repair counters; ChatGPT/Codex allowance only where observable",
+    "start": {
+      "percent": null,
+      "observed_at": null
+    },
+    "end": {
+      "percent": null,
+      "observed_at": null
+    },
+    "reset_status": "not_assessed",
+    "reset_note": null,
+    "unrelated_usage": "unknown",
+    "comparability": "insufficient_data",
+    "observed_delta_percent": null,
+    "telemetry_status": "pending",
+    "source": "campaign runtime / Mick where applicable"
+  },
+  "recommendations": []
+}
