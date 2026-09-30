@@ -1,0 +1,595 @@
+# B.O.T.S. 5 CI v1 -- authoritative sharded T4.
+#
+# Purpose: take one exact immutable candidate commit, run the complete
+# authoritative pytest population concurrently on standard GitHub-hosted Linux
+# runners, mechanically prove that no test was omitted or duplicated, preserve
+# compact evidence, and return one truthful aggregate result bound to that SHA.
+#
+# Two lifecycle states:
+#   * bootstrap: a push to the ci/bootstrap-v1 branch namespace, which exists
+#     because workflow_dispatch cannot trigger a workflow that is not yet on the
+#     default branch;
+#   * landed/authoritative: an explicit workflow_dispatch that names the exact
+#     expected commit SHA and fails closed if the checkout differs.
+#
+# Least privilege: contents:read only.  No secrets, no paid/larger/self-hosted
+# runners, no branch mutation, no provider credentials.
+name: T4
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: "Exact 40-hex commit SHA that must be checked out and tested"
+        required: true
+        type: string
+      ref:
+        description: "Git ref to resolve (branch or tag); it must resolve to expected_sha"
+        required: false
+        default: main
+        type: string
+      shard_count:
+        description: "Number of T4 shards (1-16)"
+        required: false
+        default: "6"
+        type: string
+  push:
+    branches:
+      - ci/bootstrap-v1
+      - "ci/bootstrap-v1-*"
+
+permissions:
+  contents: read
+
+concurrency:
+  # Distinct candidates never cancel one another.  Superseded bootstrap pushes
+  # on the same moving branch may cancel; sealed authoritative runs never do.
+  group: t4-${{ github.event_name }}-${{ github.ref }}-${{ inputs.expected_sha || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  # test_phase10_desktop_lifecycle.py creates a QApplication without setting a
+  # platform, so every shard must export a headless Qt platform.
+  QT_QPA_PLATFORM: offscreen
+  # The authoritative population asserts host filesystem properties; construct
+  # them truthfully rather than weakening the tests.
+  BOTS5_CI_BTRFS_BUILD: "1"
+  # Boolean: build the second, embedded-SQLite interpreter at .venv.
+  BOTS5_CI_STATIC_VENV: "1"
+  # Path (never confused with the boolean above): tests spawn .venv/bin/python.
+  BOTS5_CI_STATIC_VENV_DIR: .venv
+  BOTS5_CI_STATIC_PYTHON: python
+  PYTHONPATH: "src:."
+
+jobs:
+  prepare:
+    name: prepare canonical inventory
+    runs-on: ubuntu-26.04
+    timeout-minutes: 35
+    outputs:
+      candidate_sha: ${{ steps.candidate.outputs.candidate_sha }}
+      canonical_count: ${{ steps.manifest.outputs.canonical_count }}
+      shard_count: ${{ steps.manifest.outputs.shard_count }}
+      shards: ${{ steps.manifest.outputs.shards }}
+      trusted_tools: ${{ steps.trust.outputs.trusted }}
+      tool: ${{ steps.trust.outputs.tool }}
+      baseline: ${{ steps.trust.outputs.baseline }}
+      allowed: ${{ steps.trust.outputs.allowed }}
+    steps:
+      - name: Check out the requested candidate
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 1
+
+      - name: Resolve and verify candidate SHA
+        id: candidate
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "${EXPECTED_SHA}" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::expected candidate is not a 40-hex commit id: ${EXPECTED_SHA}"
+            exit 1
+          fi
+          actual="$(git rev-parse HEAD)"
+          if [ "${actual}" != "${EXPECTED_SHA}" ]; then
+            echo "::error::candidate mismatch: checked out ${actual}, expected ${EXPECTED_SHA}"
+            exit 1
+          fi
+          echo "candidate_sha=${actual}" >> "${GITHUB_OUTPUT}"
+
+      # The verifier, the reviewed population floor and the skip policy must not
+      # come from the commit under test.  Once CI v1 has landed on the default
+      # branch this checkout supplies them; during bootstrap (when the default
+      # branch does not yet contain scripts/ci) it is absent and the run is
+      # explicitly marked self-attested.
+      - name: Check out trusted CI tooling from the default branch
+        continue-on-error: true
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: tools
+          fetch-depth: 1
+
+      - name: Resolve trusted tooling
+        id: trust
+        run: |
+          set -euo pipefail
+          if [ -f tools/scripts/ci/ci_support.py ] \
+             && [ -f tools/scripts/ci/t4_baseline_inventory.txt ] \
+             && [ -f tools/scripts/ci/allowed_skips.txt ]; then
+            trusted=true
+            tool=tools/scripts/ci/ci_support.py
+            baseline=tools/scripts/ci/t4_baseline_inventory.txt
+            allowed=tools/scripts/ci/allowed_skips.txt
+          else
+            trusted=false
+            tool=scripts/ci/ci_support.py
+            baseline=scripts/ci/t4_baseline_inventory.txt
+            allowed=scripts/ci/allowed_skips.txt
+            echo "::warning::default branch has no scripts/ci tooling; this run is self-attested"
+            if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+              echo "::error::an authoritative dispatch requires trusted CI tooling on the default branch"
+              exit 1
+            fi
+          fi
+          echo "trusted=${trusted}" >> "${GITHUB_OUTPUT}"
+          echo "tool=${tool}" >> "${GITHUB_OUTPUT}"
+          echo "baseline=${baseline}" >> "${GITHUB_OUTPUT}"
+          echo "allowed=${allowed}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up standalone Python for the embedded-SQLite interpreter
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.14"
+
+      - name: Cache pip downloads
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-t4-pip-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-t4-pip-
+
+      - name: Build environment
+        run: bash scripts/ci/setup_env.sh
+
+      - name: Canonical collection and shard manifest
+        id: manifest
+        env:
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.candidate_sha }}
+          SHARD_COUNT: ${{ inputs.shard_count || '6' }}
+          TOOL: ${{ steps.trust.outputs.tool }}
+          BASELINE: ${{ steps.trust.outputs.baseline }}
+          ALLOWED: ${{ steps.trust.outputs.allowed }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          set +e
+          .venv-ci/bin/python -m pytest -o addopts= -q --collect-only -p no:cacheprovider \
+            > artifacts/collect.raw.txt 2> artifacts/collect.err.txt
+          code=$?
+          set -e
+          if [ "${code}" -ne 0 ]; then
+            echo "::error::canonical collection failed (exit ${code})"
+            cat artifacts/collect.err.txt || true
+            exit 1
+          fi
+          .venv-ci/bin/python "${TOOL}" build-shards \
+            --collect-output artifacts/collect.raw.txt \
+            --candidate-sha "${CANDIDATE_SHA}" \
+            --shard-count "${SHARD_COUNT}" \
+            --allowed-skips "${ALLOWED}" \
+            --baseline "${BASELINE}" \
+            --out artifacts \
+            --github-output "${GITHUB_OUTPUT}"
+          .venv-ci/bin/python "${TOOL}" env-report \
+            --out artifacts/prepare.env.json \
+            --candidate-sha "${CANDIDATE_SHA}" --role prepare
+
+      - name: Upload canonical manifest
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: t4-manifest
+          path: artifacts/
+          retention-days: 14
+          if-no-files-found: error
+
+  shards:
+    name: shard ${{ matrix.shard }}
+    needs: prepare
+    runs-on: ubuntu-26.04
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.prepare.outputs.shards) }}
+    steps:
+      - name: Check out the exact candidate
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.prepare.outputs.candidate_sha }}
+          fetch-depth: 1
+
+      - name: Verify candidate SHA
+        env:
+          EXPECTED_SHA: ${{ needs.prepare.outputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          if [ "${actual}" != "${EXPECTED_SHA}" ]; then
+            echo "::error::shard checkout ${actual} != candidate ${EXPECTED_SHA}"
+            exit 1
+          fi
+
+      # As in prepare: the evidence producer should not come from the commit
+      # under test once CI v1 is on the default branch.
+      - name: Check out trusted CI tooling from the default branch
+        continue-on-error: true
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: tools
+          fetch-depth: 1
+
+      - name: Resolve trusted tooling
+        id: trust
+        run: |
+          set -euo pipefail
+          if [ -f tools/scripts/ci/ci_pytest_report.py ] \
+             && [ -f tools/scripts/ci/ci_support.py ]; then
+            cp tools/scripts/ci/ci_pytest_report.py "${RUNNER_TEMP}/trusted_ci_pytest_report.py"
+            plugin=trusted_ci_pytest_report
+            plugin_path="${RUNNER_TEMP}"
+            tool=tools/scripts/ci/ci_support.py
+          else
+            plugin=scripts.ci.ci_pytest_report
+            plugin_path=.
+            tool=scripts/ci/ci_support.py
+            if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+              echo "::error::an authoritative dispatch requires trusted CI tooling on the default branch"
+              exit 1
+            fi
+          fi
+          echo "plugin=${plugin}" >> "${GITHUB_OUTPUT}"
+          echo "plugin_path=${plugin_path}" >> "${GITHUB_OUTPUT}"
+          echo "tool=${tool}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up standalone Python for the embedded-SQLite interpreter
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.14"
+
+      - name: Cache pip downloads
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-t4-pip-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-t4-pip-
+
+      - name: Build environment
+        run: bash scripts/ci/setup_env.sh
+
+      - name: Download canonical manifest
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: t4-manifest
+          path: manifest
+
+      - name: Compute shard id
+        id: sid
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+        run: echo "sid=$(printf 'shard-%02d' "${SHARD_INDEX}")" >> "${GITHUB_OUTPUT}"
+
+      - name: Run assigned shard
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+          CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate_sha }}
+          PLUGIN: ${{ steps.trust.outputs.plugin }}
+          PLUGIN_PATH: ${{ steps.trust.outputs.plugin_path }}
+          PYTHONPATH: "${{ steps.trust.outputs.plugin_path }}:src:."
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          sid="${{ steps.sid.outputs.sid }}"
+          assigned="manifest/${sid}.txt"
+          if [ ! -s "${assigned}" ]; then
+            echo "::error::assigned shard file ${assigned} is missing or empty"
+            exit 1
+          fi
+          assigned_sha="$(.venv-ci/bin/python -c \
+            'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' \
+            "${assigned}")"
+          mapfile -t IDS < "${assigned}"
+          echo "assigned_count=${#IDS[@]}"
+          export BOTS5_CI_CANDIDATE_SHA="${CANDIDATE_SHA}"
+          export BOTS5_CI_SHARD_INDEX="${SHARD_INDEX}"
+          export BOTS5_CI_ASSIGNED_SHA256="${assigned_sha}"
+          export BOTS5_CI_REPORT_PATH="artifacts/${sid}.report.json"
+          set +e
+          .venv-ci/bin/python -m pytest -o addopts= -p no:cacheprovider -q \
+            -p "${PLUGIN}" \
+            --junitxml="artifacts/${sid}.junit.xml" \
+            --basetemp="${RUNNER_TEMP}/t4-basetemp-${SHARD_INDEX}" \
+            "${IDS[@]}" 2>&1 | tee "artifacts/${sid}.pytest.log"
+          code=${PIPESTATUS[0]}
+          set -e
+          printf '%s\n' "${code}" > "artifacts/${sid}.exit"
+          exit "${code}"
+
+      - name: Record shard environment
+        if: always()
+        env:
+          CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate_sha }}
+          SHARD_INDEX: ${{ matrix.shard }}
+          TOOL: ${{ steps.trust.outputs.tool }}
+        run: |
+          mkdir -p artifacts
+          sid="${{ steps.sid.outputs.sid }}"
+          if ! .venv-ci/bin/python "${TOOL}" env-report \
+               --out "artifacts/${sid}.env.json" \
+               --candidate-sha "${CANDIDATE_SHA}" --role "${sid}"; then
+            echo "::warning::environment report failed for ${sid}; recording a marker"
+            printf '{"role":"%s","error":"env-report failed"}\n' "${sid}" \
+              > "artifacts/${sid}.env.json"
+          fi
+
+      - name: Verify tests did not modify the candidate tree
+        if: always()
+        env:
+          EXPECTED_SHA: ${{ needs.prepare.outputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          sid="${{ steps.sid.outputs.sid }}"
+          mkdir -p artifacts
+          seal="artifacts/${sid}.tree"
+          # The seal is written only on the normal path.  If this step aborts,
+          # no <sid>.tree exists at all, and the aggregate treats a missing seal
+          # as a failure.  Removing any file the tests may have planted here is
+          # essential: `artifacts/` is candidate-writable, so without this an
+          # aborted seal would leave a planted *empty* seal looking clean.
+          rm -f "${seal}" "${seal}.tmp"
+          actual_head="$(git rev-parse HEAD)"
+          if [ "${actual_head}" != "${EXPECTED_SHA}" ]; then
+            printf 'HEAD moved: %s != %s\n' "${actual_head}" "${EXPECTED_SHA}" > "${seal}"
+            echo "::error::the checked-out commit moved during the shard"
+            cat "${seal}"
+            exit 1
+          fi
+          # The reference is the immutable candidate commit, not a snapshot file
+          # and not `git status`.  A snapshot under ${RUNNER_TEMP} would be
+          # writable by the tests themselves, `git status`/`git diff` are
+          # defeated by `git update-index --assume-unchanged`, and an index that
+          # the tests rewrite is defeated by comparing against HEAD's tree.
+          # `--no-filters` ignores attribute/clean-filter tricks; symlinks are
+          # hashed as their stored target text, matching ls-tree's blob.
+          git ls-tree -r -z HEAD | while IFS= read -r -d '' entry; do
+            meta="${entry%%$'\t'*}"
+            path="${entry#*$'\t'}"
+            mode="${meta%% *}"
+            expected_blob="${meta##* }"
+            if [ "${mode}" = "120000" ]; then
+              actual_blob="$(printf '%s' "$(readlink -- "${path}" 2>/dev/null)" \
+                | git hash-object --stdin 2>/dev/null || echo MISSING)"
+            else
+              actual_blob="$(git hash-object --no-filters -- "${path}" 2>/dev/null \
+                || echo MISSING)"
+            fi
+            if [ "${actual_blob}" != "${expected_blob}" ]; then
+              printf '%s\n' "${path}"
+            fi
+          done > "${seal}.tmp"
+          if [ -s "${seal}.tmp" ]; then
+            mv "${seal}.tmp" "${seal}"
+            echo "::error::tests modified tracked repository files"
+            cat "${seal}"
+            exit 1
+          fi
+          # Clean is an explicit marker, never an empty file: an empty seal is
+          # indistinguishable from one the tests planted before this step ran.
+          printf 'clean %s %s\n' "${EXPECTED_SHA}" "${sid}" > "${seal}"
+          rm -f "${seal}.tmp"
+
+      - name: Upload shard evidence
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: t4-shard-${{ matrix.shard }}
+          # Explicit per-shard file list: a shard must not be able to upload
+          # files named for another shard, which merge-multiple would otherwise
+          # allow to overwrite genuine evidence.
+          path: |
+            artifacts/${{ steps.sid.outputs.sid }}.report.json
+            artifacts/${{ steps.sid.outputs.sid }}.exit
+            artifacts/${{ steps.sid.outputs.sid }}.tree
+            artifacts/${{ steps.sid.outputs.sid }}.junit.xml
+            artifacts/${{ steps.sid.outputs.sid }}.pytest.log
+            artifacts/${{ steps.sid.outputs.sid }}.env.json
+          retention-days: 14
+          if-no-files-found: error
+
+  compat:
+    name: SQLite compatibility lane
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Check out the exact candidate
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.prepare.outputs.candidate_sha }}
+          fetch-depth: 1
+
+      - name: Verify candidate SHA
+        env:
+          EXPECTED_SHA: ${{ needs.prepare.outputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          if [ "${actual}" != "${EXPECTED_SHA}" ]; then
+            echo "::error::compat checkout ${actual} != candidate ${EXPECTED_SHA}"
+            exit 1
+          fi
+
+      - name: Cache pip downloads
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-t4-compat-pip-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-t4-compat-pip-
+
+      - name: Build environment (boring SQLite class)
+        env:
+          BOTS5_CI_BTRFS_BUILD: "0"
+          BOTS5_CI_STATIC_VENV: "0"
+        run: bash scripts/ci/setup_env.sh
+
+      - name: Record actual environment
+        env:
+          CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate_sha }}
+        run: |
+          .venv-ci/bin/python -m scripts.ci.ci_support env-report \
+            --out compat.env.json --candidate-sha "${CANDIDATE_SHA}" --role compat
+
+      - name: Assert the boring SQLite class
+        run: |
+          set -euo pipefail
+          .venv-ci/bin/python -c \
+            'import sqlite3,sys; v=sqlite3.sqlite_version; print("compat_sqlite="+v); sys.exit(0) if v.startswith("3.45.") else sys.exit("unexpected system SQLite "+v+": this lane must exercise the 3.45.x class")'
+
+      - name: Focused old-SQLite secret-guard conformance
+        run: |
+          set -euo pipefail
+          .venv-ci/bin/python -m pytest -o addopts= -p no:cacheprovider -q \
+            --basetemp="${RUNNER_TEMP}/t4-compat" \
+            tests/test_secret_key_sql_conformance.py
+
+      - name: Upload compatibility evidence
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: t4-compat
+          path: |
+            compat.env.json
+            scripts/ci/allowed_skips.txt
+          retention-days: 30
+          if-no-files-found: error
+
+  aggregate:
+    name: aggregate T4
+    needs: [prepare, shards]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out CI support scripts
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.prepare.outputs.candidate_sha || github.sha }}
+          fetch-depth: 1
+
+      # The judge must not be the commit under test.  When the default branch
+      # already carries CI v1, the reconciler and the reviewed population floor
+      # come from there.
+      - name: Check out trusted CI tooling from the default branch
+        continue-on-error: true
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: tools
+          fetch-depth: 1
+
+      - name: Resolve trusted tooling
+        id: trust
+        run: |
+          set -euo pipefail
+          if [ -f tools/scripts/ci/ci_support.py ] \
+             && [ -f tools/scripts/ci/t4_baseline_inventory.txt ]; then
+            trusted=true
+            tool=tools/scripts/ci/ci_support.py
+            baseline=tools/scripts/ci/t4_baseline_inventory.txt
+            allowed=tools/scripts/ci/allowed_skips.txt
+          else
+            trusted=false
+            tool=scripts/ci/ci_support.py
+            baseline=scripts/ci/t4_baseline_inventory.txt
+            allowed=scripts/ci/allowed_skips.txt
+            echo "::warning::default branch has no scripts/ci tooling; reconciling with the candidate's own verifier (self-attested)"
+            if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+              echo "::error::an authoritative dispatch requires trusted CI tooling on the default branch"
+              exit 1
+            fi
+          fi
+          echo "trusted=${trusted}" >> "${GITHUB_OUTPUT}"
+          echo "tool=${tool}" >> "${GITHUB_OUTPUT}"
+          echo "baseline=${baseline}" >> "${GITHUB_OUTPUT}"
+          echo "allowed=${allowed}" >> "${GITHUB_OUTPUT}"
+
+      - name: Download the trusted canonical manifest
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        continue-on-error: true
+        with:
+          name: t4-manifest
+          path: evidence/manifest
+
+      - name: Download untrusted shard evidence
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        continue-on-error: true
+        with:
+          pattern: t4-shard-*
+          path: evidence/shards
+          merge-multiple: true
+
+      - name: Reconcile authoritative T4
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha || github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          ACTOR: ${{ github.actor }}
+          TOOL: ${{ steps.trust.outputs.tool }}
+          BASELINE: ${{ steps.trust.outputs.baseline }}
+          ALLOWED: ${{ steps.trust.outputs.allowed }}
+          TRUSTED: ${{ steps.trust.outputs.trusted }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          echo "trusted_tools=${TRUSTED}"
+          echo "--- trusted manifest ---"
+          find evidence/manifest -maxdepth 2 -type f | sort || true
+          echo "--- shard evidence ---"
+          find evidence/shards -maxdepth 2 -type f | sort || true
+          # The manifest is read only from evidence/manifest, the accepted SHA
+          # comes from the workflow, and the population floor and skip policy
+          # come from the trusted ref when one exists — never from the evidence
+          # under test.
+          python3 "${TOOL}" aggregate \
+            --manifest evidence/manifest \
+            --evidence evidence/shards \
+            --expected-sha "${EXPECTED_SHA}" \
+            --baseline "${BASELINE}" \
+            --allowed-skips "${ALLOWED}" \
+            --event-name "${EVENT_NAME}" \
+            --ref "${REF}" \
+            --actor "${ACTOR}" \
+            --trusted-tools "${TRUSTED}" \
+            --out evidence/aggregate.json \
+            --github-step-summary "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload aggregate result
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: t4-aggregate
+          path: evidence/aggregate.json
+          retention-days: 30
+          if-no-files-found: warn

@@ -1,0 +1,8 @@
+# Tests that are expected to skip in ordinary CI v1.
+#
+# The only declared skip is the opt-in live local-provider acceptance probe in
+# tests/test_phase3_local_qwen.py.  It skips unless an operator explicitly
+# configures a local endpoint, and ordinary CI v1 must never contact a model
+# provider.  Any *other* skip is treated by the aggregate gate as a failure, so
+# silent environment degradation cannot be mistaken for T4 PASS.
+tests/test_phase3_local_qwen.py::test_opt_in_local_qwen_acceptance_path
