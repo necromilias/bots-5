@@ -38,9 +38,11 @@ content-addressed. The rooted SQLite/native VFS and attachment layer preserve de
 durability barriers, resource lifetime, and outcome classification. Authoritative corruption or uncertain
 consequential state fails closed rather than being converted into ordinary success.
 
-The finite participation inventory and closure evidence are:
+The finite participation accounting and closure evidence are:
 
-- `UNIFIED_AUTHORITY_EFFECT_INVENTORY.md`;
+- `UNIFIED_AUTHORITY_EFFECT_INVENTORY.md` — landed Phase 6 base inventory, authoritative for its own
+  closure scope and not superseded;
+- `UNIFIED_AUTHORITY_EFFECT_INVENTORY_PHASE7_10_SUPPLEMENT.md` — landed Phase 7–10 participation deltas;
 - `LINUX_V0_1_PHASE6_IMPLEMENTATION_REPORT.md`;
 - `LINUX_V0_1_PHASE6_CLOSURE_REPORT.md`.
 

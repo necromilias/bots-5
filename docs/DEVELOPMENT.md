@@ -67,9 +67,11 @@ Linux desktop persistence changes are consequential. Before changing the rooted 
 startup/recovery, authority, grant, or durability boundaries, read:
 
 - `LINUX_V0_1_DESIGN.md`;
-- `UNIFIED_AUTHORITY_EFFECT_INVENTORY.md`;
+- `UNIFIED_AUTHORITY_EFFECT_INVENTORY.md` (landed Phase 6 base inventory);
+- `UNIFIED_AUTHORITY_EFFECT_INVENTORY_PHASE7_10_SUPPLEMENT.md` (landed Phase 7–10 participation
+  deltas — read **both** records when changing an affected authority boundary);
 - `LINUX_V0_1_PHASE6_CLOSURE_REPORT.md`;
-- the relevant phase implementation report.
+- the relevant later phase implementation/closure report.
 
 The landed Phase 6 rule is fail-closed: authoritative corruption or uncertain consequential outcomes may
 not be silently converted into success. Forward effects require valid authority ownership; release-only

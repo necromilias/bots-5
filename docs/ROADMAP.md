@@ -88,7 +88,9 @@ historical checkpoints and do not override the current closure record.
 - SQLite ≤ 3.45.1 parser-compatibility repair — landed at
   `dee0b3b8446d7f84bcc4e1a5af2339c5ed78383f`; recorded in
   `docs/SQLITE_COMPATIBILITY_REPAIR.md`.
-- CI v1 — landed; current `main` is `5bb783326b5a8c68bb1e2b2719aca6070e22f225`; recorded in
+- CI v1 — landed, culminating in the CI-v1 admission-retirement commit
+  `5bb783326b5a8c68bb1e2b2719aca6070e22f225`, which made the workflow dispatch-only; the
+  authoritative run exercised candidate `58fca2c7b1b4111d982733980c303565bf91695e`; recorded in
   `docs/CI_V1.md`.
 
 ### Current implementation phase
@@ -101,8 +103,10 @@ so **Phase 9 is closed** (see their bullets above and `docs/LINUX_V0_1_DESIGN.md
 campaign desktop integration — is closed and landed** at
 `9762170099889ecd87d451341a15a29ce7aceae8` (`docs/LINUX_V0_1_PHASE10_CLOSURE_REPORT.md`). The
 SQLite ≤ 3.45.1 parser-compatibility repair landed at
-`dee0b3b8446d7f84bcc4e1a5af2339c5ed78383f`, and CI v1 landed with current `main`
-`5bb783326b5a8c68bb1e2b2719aca6070e22f225` (`docs/CI_V1.md`).
+`dee0b3b8446d7f84bcc4e1a5af2339c5ed78383f`, and CI v1 landed through the admission-retirement commit
+`5bb783326b5a8c68bb1e2b2719aca6070e22f225`, with the authoritative run exercising candidate
+`58fca2c7b1b4111d982733980c303565bf91695e` rather than `5bb7833` or any later `main` descendant
+(`docs/CI_V1.md`).
 
 **Phase 11 — product finishing and standalone packaging — is next in the accepted sequence and is not
 authorized by this repository state.** Its final visual basis is not yet adjudicated (see

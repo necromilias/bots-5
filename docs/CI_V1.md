@@ -36,9 +36,11 @@ candidate's own verifier, population floor, and skip policy.
 | `5bb783326b5a8c68bb1e2b2719aca6070e22f225` | CI: retire the temporary bootstrap push trigger |
 
 `58fca2c7b1b4111d982733980c303565bf91695e` is the candidate of the authoritative run below.
-`5bb783326b5a8c68bb1e2b2719aca6070e22f225` is current `main`; it retired the temporary bootstrap push
-admission and made the workflow dispatch-only. That change altered workflow admission only, not the T4
-execution machinery, so **no further T4 run was performed against `5bb7833`**.
+`5bb783326b5a8c68bb1e2b2719aca6070e22f225` is the CI-v1 admission-retirement/closure commit; it
+retired the temporary bootstrap push admission and made the workflow dispatch-only. That change altered
+workflow admission only, not the T4 execution machinery, so **no further T4 run was performed against
+`5bb7833`**, and later `main` descendants do not change which candidate the authoritative run
+exercised.
 
 ## Authoritative run
 
@@ -61,7 +63,8 @@ permitted-skip allow-list. The canonical inventory sha256 for this population is
 inventory hash at the candidate.
 
 **The authoritative run executed against `58fca2c7b1b4111d982733980c303565bf91695e`, not against
-current `main` `5bb7833`.** The run identity and the candidate SHA must not be collapsed.
+`5bb7833` or any later `main` descendant.** The run identity and the candidate SHA must not be
+collapsed.
 
 ## Bootstrap history (retired)
 

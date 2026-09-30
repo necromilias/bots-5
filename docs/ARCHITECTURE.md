@@ -95,8 +95,11 @@ Rooted database resources retain consequential child cursor/statement state unti
 classification; the parent resource may not be released first. Native/SQLite/filesystem uncertainty is
 handed into the common coordinator rather than silently rewritten as success.
 
-The finite participation inventory is `UNIFIED_AUTHORITY_EFFECT_INVENTORY.md`. Phase 6 closure is recorded
-in `LINUX_V0_1_PHASE6_CLOSURE_REPORT.md`.
+The finite participation accounting is the landed Phase 6 base inventory
+`UNIFIED_AUTHORITY_EFFECT_INVENTORY.md` together with the Phase 7–10 delta supplement
+`UNIFIED_AUTHORITY_EFFECT_INVENTORY_PHASE7_10_SUPPLEMENT.md`. The Phase 6 record remains authoritative
+for its own closure scope and is not superseded. Phase 6 closure is recorded in
+`LINUX_V0_1_PHASE6_CLOSURE_REPORT.md`.
 
 ### Context and attachments
 

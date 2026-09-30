@@ -70,8 +70,11 @@ desktop integration and Phase 9 technical closure — landed at
 is its closure record. Phase 10 — campaign desktop integration — subsequently landed at
 `9762170099889ecd87d451341a15a29ce7aceae8`; `docs/LINUX_V0_1_PHASE10_CLOSURE_REPORT.md` is its
 closure and landing record. A SQLite ≤ 3.45.1 parser-compatibility repair landed at
-`dee0b3b8446d7f84bcc4e1a5af2339c5ed78383f` (`docs/SQLITE_COMPATIBILITY_REPAIR.md`), and CI v1
-landed with current `main` `5bb783326b5a8c68bb1e2b2719aca6070e22f225` (`docs/CI_V1.md`).
+`dee0b3b8446d7f84bcc4e1a5af2339c5ed78383f` (`docs/SQLITE_COMPATIBILITY_REPAIR.md`), and CI v1 landed
+through `5bb783326b5a8c68bb1e2b2719aca6070e22f225` — the CI-v1 admission-retirement commit that made
+the workflow dispatch-only. The authoritative CI v1 run exercised candidate
+`58fca2c7b1b4111d982733980c303565bf91695e`, not `5bb7833` or any later `main` descendant
+(`docs/CI_V1.md`).
 
 **Phase 11 — product finishing and standalone packaging — is next in the accepted sequence and is
 not authorized by this repository state.**
@@ -120,7 +123,10 @@ unrelated work may settle only within its existing ownership. Database resources
 child cursors, remain accounted for until consequential native state has settled or been classified.
 Unknown or integrity-threatening outcomes fail closed rather than being rewritten as success.
 
-See `docs/UNIFIED_AUTHORITY_EFFECT_INVENTORY.md` for the finite participation inventory.
+See `docs/UNIFIED_AUTHORITY_EFFECT_INVENTORY.md` — the landed Phase 6 base inventory — together with
+`docs/UNIFIED_AUTHORITY_EFFECT_INVENTORY_PHASE7_10_SUPPLEMENT.md`, which records the landed Phase 7–10
+participation deltas. The Phase 6 record remains authoritative for its own closure scope and is not
+superseded.
 
 ## Local Phase 3 compatibility route
 
