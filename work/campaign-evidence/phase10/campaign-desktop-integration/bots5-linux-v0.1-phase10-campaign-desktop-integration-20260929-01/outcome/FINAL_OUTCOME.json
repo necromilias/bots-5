@@ -1,0 +1,253 @@
+{
+  "record": {
+    "record_kind": "additive_final_outcome",
+    "record_scope": "post_boundary_closeout",
+    "schema_version": 1,
+    "campaign_id": "bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01",
+    "not_the_issuance_template": true,
+    "summary": "Observed closeout facts for the Phase 10 campaign, recorded additively after the sealed pre-commit boundary because the issuance-time outcome template is hash-pinned and must remain unpopulated."
+  },
+  "campaign": {
+    "campaign_id": "bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01",
+    "phase": "Phase 10",
+    "title": "Campaign desktop integration",
+    "pack_root": "work/campaign-evidence/phase10/campaign-desktop-integration/bots5-linux-v0.1-phase10-campaign-desktop-integration-20260929-01"
+  },
+  "relationship_to_issuance": {
+    "issuance_outcome_path": "codex-job-outcome.json",
+    "issuance_outcome_state": "untouched_issuance_time_pending_template",
+    "issuance_outcome_sha256": "53fcb9e45e840821897195e8b7171e3263a20573454771dc4eb79e86b37f19c1",
+    "issuance_outcome_bytes": 3273,
+    "issuance_outcome_hash_pinned_by": "PACK_MANIFEST.json",
+    "issuance_manifest_path": "PACK_MANIFEST.json",
+    "issuance_manifest_role": "issuance_record",
+    "evidence_index_path": "EVIDENCE_INDEX_FINAL.json",
+    "evidence_index_role": "point_in_time_sealed_pre_commit_boundary_index",
+    "supersedes_issuance_artefact": false,
+    "rewrites_issuance_artefact": false,
+    "retroactively_modifies_issuance_artefact": false,
+    "included_in_issuance_manifest": false,
+    "included_in_evidence_index": false,
+    "intentionally_post_index_additive": true,
+    "note": "outcome/README.md instructs populating codex-job-outcome.json during closeout. Doing so in place would break the sha256 pins held by PACK_MANIFEST.json and EVIDENCE_INDEX_FINAL.json, so this record captures the closeout facts additively instead. This file is deliberately not added to either existing manifest or index, and neither is regenerated."
+  },
+  "disposition": {
+    "technical_disposition": "PASS_WITH_LIMITATIONS",
+    "substantive_disposition": "accepted_with_recorded_limitations",
+    "substantive_authority": "Mick",
+    "substantive_acceptance_date": "2026-09-30",
+    "substantive_acceptance_evidence": "logs/HUMAN_ADJUDICATION_2026-09-30_ACCEPTANCE_AND_GIT_AUTHORITY.md",
+    "distinct_axes_note": "Technical completion, substantive acceptance, commit authority, push authority and landing are recorded separately and must not be collapsed into a single status."
+  },
+  "candidate": {
+    "candidate_seal": "PHASE10_CANDIDATE_SEAL_v6.json",
+    "candidate_id": "d5c433073332b9a0c0de3eaf7dc93d8550168348f8f0603c0e888515181f2946",
+    "candidate_seal_sha256": "36078b8838dd1d6266e732e6161ce1bbb7979bb64e9328de4d2957a1cd103197",
+    "candidate_fenced_file_count": 17,
+    "accepted_design_seal": "DESIGN_SEAL_v4",
+    "design_seal_sha256": "9739e87cd42459973a600e2d1b2b19408671f93e82fbff2d13c71b11e57ed9c1",
+    "campaign_baseline_head": "0756904481ae884bb9e864e8e1e11fc4a27a72ff"
+  },
+  "validation": {
+    "canonical_environment": "QT_QPA_PLATFORM=offscreen PYTHONPATH=src .venv314/bin/python (Python 3.14.7)",
+    "authoritative_final_t4": {
+      "candidate_seal": "PHASE10_CANDIDATE_SEAL_v6.json",
+      "mode": "complete_repository_suite_serial",
+      "passed": 1504,
+      "skipped": 1,
+      "failed": null,
+      "errors": null,
+      "exit_code": 0,
+      "duration_seconds": 5543.31,
+      "duration_human": "1:32:23",
+      "counts_note": "The validation record states passed, skipped and exit code only; failed and error counts are not recorded there and are therefore left null rather than invented."
+    },
+    "phase10_fenced_suite": {
+      "passed": 96,
+      "exit_code": 0
+    },
+    "desktop_and_engine_guard_set": {
+      "passed": 125,
+      "exit_code": 0
+    }
+  },
+  "independent_review": {
+    "final_oracle": "reserved sixth launch, MiMo V2.6 Flash, against candidate v6",
+    "verification_milestones_completed": 9,
+    "terminal_event": "upstream idle timeout during final report emission",
+    "oracle_authored_final_report_exists": false,
+    "surviving_artefact_path": "reports/oracle/MIMO_FINAL_IMPLEMENTATION_ORACLE_v3_SUPERVISOR_RECONSTRUCTION.md",
+    "surviving_artefact_kind": "supervisor_reconstruction",
+    "surviving_artefact_is_oracle_authored": false,
+    "surviving_artefact_is_signed": false,
+    "surviving_artefact_is_independently_emitted": false,
+    "finding": "no candidate-changing defect of any severity was found",
+    "raised_test_gaps": [
+      "F-2",
+      "F-3"
+    ],
+    "human_acceptance": "Mick explicitly accepted the reconstruction as sufficient campaign evidence; no additional oracle is required or authorized.",
+    "provenance_note": "The reconstruction is evidence of what the oracle executed and concluded, but it is not an independent document and must not be cited as oracle-authored, signed or independently emitted."
+  },
+  "accepted_limitations": [
+    {
+      "id": "F-2",
+      "oracle_ref": null,
+      "kind": "test_gap",
+      "severity": "MEDIUM",
+      "description": "Rerun-synthesis independence is not fully regression-discriminated: re-coupling Rerun-synthesis to the selected worker row's state leaves all 96 fenced tests passing, so the V-2 repair is only half guarded.",
+      "disposition": "accepted_non_blocking_test_debt",
+      "repaired": false
+    },
+    {
+      "id": "F-3",
+      "oracle_ref": null,
+      "kind": "test_gap",
+      "severity": "LOW",
+      "description": "Legacy-v1 freshness is not fully regression-discriminated: making version-1 freshness return None leaves the suite green, so the V-5 version guard is unexercised.",
+      "disposition": "accepted_non_blocking_test_debt",
+      "repaired": false
+    },
+    {
+      "id": "D-10",
+      "oracle_ref": "V-7",
+      "kind": "product_limitation",
+      "severity": "LOW",
+      "description": "Operator pricing entries need not affirm the route or models.",
+      "disposition": "accepted_documented_limitation",
+      "repaired": false
+    },
+    {
+      "id": "D-11",
+      "oracle_ref": "V-8",
+      "kind": "product_limitation",
+      "severity": "LOW",
+      "description": "Legacy-mode runs created after Phase 10 carry the additive attempt_number key.",
+      "disposition": "accepted_documented_limitation",
+      "repaired": false
+    },
+    {
+      "id": "D-13",
+      "oracle_ref": "V-9",
+      "kind": "product_limitation",
+      "severity": "LOW",
+      "description": "The output panel is hard-capped at 200 px, so per-attempt output is readable scroll-only rather than in an expanded pane.",
+      "disposition": "accepted_documented_limitation",
+      "repaired": false
+    }
+  ],
+  "budget_and_process": {
+    "authorized_child_launches_used": 36,
+    "authorized_child_launches_ceiling": 36,
+    "child_launches_remaining": 0,
+    "mimo_launches_used": 6,
+    "mimo_launches_ceiling": 6,
+    "glm_launches_used": 14,
+    "glm_launches_ceiling": 14,
+    "process_deviations": [
+      {
+        "kind": "supervisor_accounting_failure",
+        "subject": "GLM 5.3 Flash family ceiling",
+        "original_ceiling": 8,
+        "used_before_amendment": 12,
+        "chronology": "The original GLM family ceiling of 8 was exceeded before the later Mick-authorized amendment raised the allowance to 14; the overage was then folded into the amended ceiling.",
+        "amended_ceiling": 14,
+        "final_used": 14,
+        "note": "Recorded as a supervisor/accounting failure. The sequence must not be rewritten to make the overrun retroactively authorized."
+      },
+      {
+        "kind": "launches_producing_no_artefact",
+        "description": "The Qwen3.8 broad implementation falsification returned null twice; that work was completed instead on GPT-6 Luna. Both failed launches consumed Qwen3.8 allocation."
+      },
+      {
+        "kind": "dispatch_failure_not_consumed",
+        "description": "One workflow dispatch of the wave-4 GLM workers failed before any child session existed because the script returned un-awaited promises; it was re-dispatched and is recorded as not consumed."
+      },
+      {
+        "kind": "launch_consumed_without_report",
+        "description": "Launch 36 ran the full oracle assignment, completed all nine verification milestones, then died before emitting its report."
+      }
+    ],
+    "telemetry": {
+      "token_usage": "not_assessed",
+      "provider_cost": "not_assessed",
+      "allowance_percent": "not_assessed",
+      "overall_campaign_wall_clock": "not_assessed"
+    },
+    "telemetry_note": "No campaign-level token total, provider-cost total, allowance-percent telemetry or overall campaign wall-clock total is established by the campaign evidence. Specific validation durations recorded elsewhere in this outcome remain established evidence."
+  },
+  "git": {
+    "implementation_commit": "9762170099889ecd87d451341a15a29ce7aceae8",
+    "implementation_tree": "c220b64b703d756b2f27a44aaeb02e8829bebdd8",
+    "implementation_parent": "0756904481ae884bb9e864e8e1e11fc4a27a72ff",
+    "implementation_commit_subject": "Phase 10: native desktop surface over the headless campaign engine",
+    "campaign_human_adjudication": {
+      "staging": "authorized",
+      "commit": "authorized",
+      "push": "not_authorized"
+    },
+    "later_landing_fact": {
+      "implementation_commit_is_ancestor_of_main_lineage": true,
+      "observed_against": "e45502e3eb3c2f2f0768f761e4e1a4ca46fa4397",
+      "note": "Observed directly from Git during this record's preparation. The campaign adjudication itself authorized staging and commit only; how the commit subsequently reached origin/main is a later, separate governance fact not established by the campaign record."
+    },
+    "push_authority_record": "not_established",
+    "push_authority_note": "Git proving that the commit later reached origin/main does not establish a later push-authority record. This field records the absence of such a record, not a determination about the complete real-world history of the push.",
+    "phase_11_authority": "not_granted"
+  },
+  "unresolved_or_unestablished": [
+    {
+      "field": "record_creation_timestamp",
+      "state": "not_established",
+      "note": "The supporting evidence carries dates, not a precise creation time for this record, so no timestamp is asserted."
+    },
+    {
+      "field": "push_authority_record",
+      "state": "not_established",
+      "note": "Absence of a later authority record; not reconstructed and not retroactively granted."
+    },
+    {
+      "field": "effective_supervisor_effort",
+      "state": "not_applied",
+      "note": "Requested provider_maximum_if_exposed was not applied because the harness exposes no per-child effort control; recorded as a harness limitation, not a substitution."
+    },
+    {
+      "field": "oracle_authored_final_report",
+      "state": "does_not_exist",
+      "note": "The sixth oracle completed its milestones but died before writing its report; only a supervisor reconstruction survives."
+    },
+    {
+      "field": "real_gui_session",
+      "state": "not_performed",
+      "note": "All review and validation used deterministic fakes and the offscreen Qt platform."
+    },
+    {
+      "field": "real_provider_call",
+      "state": "not_performed",
+      "note": "No live provider call was exercised; operator-supplied rate currentness cannot be machine-verified by design."
+    },
+    {
+      "field": "phase_11_and_phase_12_authority",
+      "state": "not_granted",
+      "note": "This closeout grants no Phase 11 or Phase 12 authority and introduces no new Phase 11 decision."
+    }
+  ],
+  "sources": [
+    "codex-job-outcome.json",
+    "outcome/README.md",
+    "PACK_MANIFEST.json",
+    "EVIDENCE_INDEX_FINAL.json",
+    "reports/COMMIT_BOUNDARY_REPORT.md",
+    "reports/MODEL_USAGE_LEDGER.md",
+    "validation/PHASE10_T4_VALIDATION_RECORD.md",
+    "logs/HUMAN_ADJUDICATION_2026-09-30_ACCEPTANCE_AND_GIT_AUTHORITY.md",
+    "logs/BUDGET_AMENDMENT_2026-09-30.md",
+    "reports/oracle/MIMO_FINAL_IMPLEMENTATION_ORACLE_v3_SUPERVISOR_RECONSTRUCTION.md",
+    "seals/implementation/PHASE10_CANDIDATE_SEAL_v6.json",
+    "seals/design/DESIGN_SEAL_v4.json",
+    "docs/LINUX_V0_1_PHASE10_CLOSURE_REPORT.md",
+    "git:9762170099889ecd87d451341a15a29ce7aceae8",
+    "git:0756904481ae884bb9e864e8e1e11fc4a27a72ff",
+    "git:e45502e3eb3c2f2f0768f761e4e1a4ca46fa4397"
+  ]
+}
