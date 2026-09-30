@@ -33,6 +33,13 @@ from tests._authority_test_support import SQLiteAppStateStore, upgrade_database
 
 
 def _run_qasync(qt_application: QApplication, operation: Awaitable[None]) -> None:
+    # qasync stops the event loop when the application quits, and Qt quits when the
+    # last top-level window closes.  Without this, a test that closes its window and
+    # then awaits cleanup is aborted mid-flight unless an earlier test in the same
+    # process happened to leave a window open -- so the test would pass or fail
+    # purely on what ran before it.  Tie the loop's lifetime to the test, not to the
+    # window count.
+    qt_application.setQuitOnLastWindowClosed(False)
     event_loop = QEventLoop(qt_application)
     asyncio.set_event_loop(event_loop)
     with event_loop:
