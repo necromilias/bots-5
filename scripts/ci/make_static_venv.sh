@@ -8,18 +8,26 @@
 # canonical development environment (a python-build-standalone / uv-managed
 # interpreter) and CI v1 reproduces it rather than skipping the test.
 #
-# The interpreter comes from actions/setup-python (a standalone build with an
-# embedded `_sqlite3`).  Its site-packages is linked to the CI environment's
-# site-packages through a .pth file (same CPython minor version), so no second
-# full dependency download is needed.  The project itself is imported through
-# PYTHONPATH=src by the test, exactly as the test does today.
+# The interpreter is a *python-build-standalone* CPython (the shape uv installs
+# and the shape the canonical development `.venv` has): only such a build embeds
+# its own SQLite, which is the property the test asserts.  Its site-packages is
+# linked to the CI environment's site-packages through a .pth file (same CPython
+# minor version), so no second full dependency download is needed.  The project
+# itself is imported through PYTHONPATH=src by the test, exactly as the test does
+# today.
+#
+# Why not actions/setup-python: on the ubuntu-26.04 image that toolcache build
+# links the *system* libsqlite3 (it reports the image's SQLite version), so the
+# rooted VFS registers successfully there and the test premise does not hold.
+# Callers may still name an explicit interpreter with BOTS5_CI_STATIC_PYTHON; the
+# default resolves one from uv.
 #
 # Fail-closed: a missing standalone interpreter or an interpreter whose SQLite
 # is *not* embedded aborts the build here, loudly.
 set -euo pipefail
 
 VENV_DIR="${BOTS5_CI_STATIC_VENV_DIR:-.venv}"
-PYTHON_BIN="${BOTS5_CI_STATIC_PYTHON:-python}"
+PYTHON_BIN="${BOTS5_CI_STATIC_PYTHON:-}"
 CI_VENV_DIR="${BOTS5_CI_VENV:-.venv-ci}"
 
 # Guard against the historical variable-name collision: the enable flag is
@@ -37,13 +45,39 @@ if [ ! -x "${CI_VENV_DIR}/bin/python" ]; then
   echo "::error::${CI_VENV_DIR} must exist before building ${VENV_DIR}" >&2
   exit 1
 fi
-if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
-  echo "::error::standalone interpreter '${PYTHON_BIN}' not found" >&2
-  exit 1
+
+# Resolve a python-build-standalone interpreter unless the caller named one.
+# "python" is the historical default and cannot be trusted to be standalone, so
+# it is treated exactly like "unset".
+STANDALONE_MINOR="${BOTS5_CI_STANDALONE_MINOR:-}"
+if [ -z "${STANDALONE_MINOR}" ]; then
+  STANDALONE_MINOR="$("${CI_VENV_DIR}/bin/python" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
 fi
 
-rm -rf "${VENV_DIR}"
-"${PYTHON_BIN}" -m venv "${VENV_DIR}"
+if [ -z "${PYTHON_BIN}" ] || [ "${PYTHON_BIN}" = "python" ]; then
+  UV_BIN="$(command -v uv 2>/dev/null || true)"
+  if [ -z "${UV_BIN}" ] && [ -x "${CI_VENV_DIR}/bin/uv" ]; then
+    UV_BIN="${CI_VENV_DIR}/bin/uv"
+  fi
+  if [ -z "${UV_BIN}" ]; then
+    echo "installing uv to obtain a python-build-standalone CPython ${STANDALONE_MINOR}" >&2
+    "${CI_VENV_DIR}/bin/python" -m pip install --quiet uv
+    UV_BIN="${CI_VENV_DIR}/bin/uv"
+  fi
+  if [ ! -x "${UV_BIN}" ]; then
+    echo "::error::uv is unavailable, so no python-build-standalone interpreter can be resolved; set BOTS5_CI_STATIC_PYTHON to one explicitly" >&2
+    exit 1
+  fi
+  rm -rf "${VENV_DIR}"
+  # uv creates the venv from a managed (python-build-standalone) CPython and
+  # downloads it on demand; only-managed keeps it from reusing a system build.
+  "${UV_BIN}" venv --python-preference only-managed --python "${STANDALONE_MINOR}" "${VENV_DIR}"
+  PYTHON_BIN="${VENV_DIR}/bin/python"
+else
+  rm -rf "${VENV_DIR}"
+  "${PYTHON_BIN}" -m venv "${VENV_DIR}" 2>/dev/null \
+    || "${PYTHON_BIN}" -m venv --without-pip "${VENV_DIR}"
+fi
 
 PY_VERSION="$("${VENV_DIR}/bin/python" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
 CI_SITE="$("${CI_VENV_DIR}/bin/python" -c 'import site; print(site.getsitepackages()[0])')"

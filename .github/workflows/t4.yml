@@ -64,7 +64,10 @@ env:
   BOTS5_CI_STATIC_VENV: "1"
   # Path (never confused with the boolean above): tests spawn .venv/bin/python.
   BOTS5_CI_STATIC_VENV_DIR: .venv
-  BOTS5_CI_STATIC_PYTHON: python
+  # Left unset on purpose: make_static_venv.sh resolves a python-build-standalone
+  # interpreter through uv, because the actions/setup-python toolcache build on
+  # this image links the *system* libsqlite3 and would not reproduce the
+  # embedded-SQLite property the authoritative test asserts.
   PYTHONPATH: "src:."
 
 jobs:
@@ -145,7 +148,7 @@ jobs:
           echo "baseline=${baseline}" >> "${GITHUB_OUTPUT}"
           echo "allowed=${allowed}" >> "${GITHUB_OUTPUT}"
 
-      - name: Set up standalone Python for the embedded-SQLite interpreter
+      - name: Set up Python for CI tooling
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.14"
@@ -262,7 +265,7 @@ jobs:
           echo "plugin_path=${plugin_path}" >> "${GITHUB_OUTPUT}"
           echo "tool=${tool}" >> "${GITHUB_OUTPUT}"
 
-      - name: Set up standalone Python for the embedded-SQLite interpreter
+      - name: Set up Python for CI tooling
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.14"

@@ -9,7 +9,10 @@
 #     interpreters embed their own SQLite and cannot host the VFS;
 #   * constructs the exact host filesystem properties the authoritative tests
 #     assert (a real btrfs build/ directory, /dev/shm is already tmpfs);
-#   * provides the second, embedded-SQLite interpreter that one test requires;
+#   * provides the second, embedded-SQLite interpreter that one test requires,
+#     as a python-build-standalone CPython (the shape the canonical .venv has);
+#     the actions/setup-python toolcache build on this image links the system
+#     libsqlite3 and therefore does not have that property;
 #   * installs the project editable plus its declared dev extras;
 #   * builds the native rooted VFS from repository source;
 #   * prints the real Python and SQLite versions so no job can imply a runtime
@@ -22,7 +25,10 @@
 #   BOTS5_CI_VENV          authoritative venv (default .venv-ci)
 #   BOTS5_CI_BTRFS_BUILD   "1" to mount btrfs at build/
 #   BOTS5_CI_STATIC_VENV   "1" to create the embedded-SQLite .venv
-#   BOTS5_CI_STATIC_PYTHON standalone interpreter for .venv (default python)
+#   BOTS5_CI_STATIC_PYTHON explicit standalone interpreter for .venv (default:
+#                          resolve a python-build-standalone CPython through uv)
+#   BOTS5_CI_STANDALONE_MINOR  CPython minor for that interpreter (default: the
+#                          CI venv's own minor)
 set -euo pipefail
 
 PYTHON_BIN="${BOTS5_CI_PYTHON:-/usr/bin/python3}"
