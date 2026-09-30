@@ -17,11 +17,21 @@ the correctness logic lives here.
 ## Trusted tooling
 
 `build-shards`, the baseline and the allow-list are policy, so the workflow does not take them
-from the commit under test when it can avoid it: `prepare`, `shards` and `aggregate` each
-check out the default branch into `tools/` and prefer `tools/scripts/ci/*`. During bootstrap
-(the default branch does not yet carry CI v1) that checkout is absent, the candidate's copies
-are used, and the aggregate records `event.trusted_tools = "false"` — self-attested, proving
-the mechanism rather than conferring authority.
+from the commit under test: `prepare`, `shards` and `aggregate` each check out the default
+branch into `tools/` and use `tools/scripts/ci/*`. CI v1 is itself on the default branch, so
+this is the normal path for every run, and `aggregate.json` records
+`event.trusted_tools = "true"`. If that trusted tooling is ever unavailable, an authoritative
+dispatch **fails closed** — the jobs error out rather than judging a candidate with the
+candidate's own verifier, population floor and skip policy.
+
+The workflow is dispatch-only; an ordinary push cannot trigger it.
+
+*History:* before CI v1 was on the default branch it could not be dispatched, so a temporary
+`push` trigger on the `ci/bootstrap-v1` branch namespace was used to publish and validate the
+mechanism. Those runs had no trusted checkout available, so they used the candidate's own
+copies and recorded `event.trusted_tools = "false"` — self-attested, proving the mechanism
+rather than conferring authority. That trigger has been retired; the bootstrap run is kept as
+historical evidence.
 
 ## Local use
 

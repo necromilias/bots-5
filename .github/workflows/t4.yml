@@ -5,12 +5,14 @@
 # runners, mechanically prove that no test was omitted or duplicated, preserve
 # compact evidence, and return one truthful aggregate result bound to that SHA.
 #
-# Two lifecycle states:
-#   * bootstrap: a push to the ci/bootstrap-v1 branch namespace, which exists
-#     because workflow_dispatch cannot trigger a workflow that is not yet on the
-#     default branch;
-#   * landed/authoritative: an explicit workflow_dispatch that names the exact
-#     expected commit SHA and fails closed if the checkout differs.
+# Operation: dispatch-only.  An explicit workflow_dispatch names the exact
+# expected commit SHA and fails closed if the checkout differs.
+#
+# History: while CI v1 was not yet on the default branch it could not be
+# dispatched, so the workflow also accepted a push to the ci/bootstrap-v1 branch
+# namespace.  That trigger was retired once the first authoritative
+# default-branch run passed; the bootstrap run is retained as historical
+# evidence and is not reproducible through this workflow any more.
 #
 # Least privilege: contents:read only.  No secrets, no paid/larger/self-hosted
 # runners, no branch mutation, no provider credentials.
@@ -33,19 +35,17 @@ on:
         required: false
         default: "6"
         type: string
-  push:
-    branches:
-      - ci/bootstrap-v1
-      - "ci/bootstrap-v1-*"
 
 permissions:
   contents: read
 
 concurrency:
-  # Distinct candidates never cancel one another.  Superseded bootstrap pushes
-  # on the same moving branch may cancel; sealed authoritative runs never do.
+  # Distinct candidates never cancel one another: the group includes the
+  # expected SHA, and cancellation is never enabled, so a later submission
+  # cannot abort an in-flight authoritative run.  (Cancellation used to apply
+  # to superseded bootstrap pushes; that trigger is retired.)
   group: t4-${{ github.event_name }}-${{ github.ref }}-${{ inputs.expected_sha || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'push' }}
+  cancel-in-progress: false
 
 defaults:
   run:
@@ -109,10 +109,11 @@ jobs:
           echo "candidate_sha=${actual}" >> "${GITHUB_OUTPUT}"
 
       # The verifier, the reviewed population floor and the skip policy must not
-      # come from the commit under test.  Once CI v1 has landed on the default
-      # branch this checkout supplies them; during bootstrap (when the default
-      # branch does not yet contain scripts/ci) it is absent and the run is
-      # explicitly marked self-attested.
+      # come from the commit under test.  CI v1 is on the default branch, so this
+      # checkout supplies them on every run, and if the default branch ever lacks
+      # scripts/ci a dispatch fails closed below instead of falling back to the
+      # candidate's copies.  (While CI v1 was not yet on the default branch the
+      # checkout was absent and the run was marked self-attested instead.)
       - name: Check out trusted CI tooling from the default branch
         continue-on-error: true
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
