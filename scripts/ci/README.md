@@ -4,6 +4,10 @@ Small, standard-library-only helpers that make the authoritative sharded T4 gate
 inspectable and unit-testable outside GitHub. `.github/workflows/t4.yml` orchestrates;
 the correctness logic lives here.
 
+The landed, authoritative CI v1 record — including the authoritative run identity,
+its exact counts, and the known limits of the CI evidence — is `docs/CI_V1.md`.
+This file documents the machinery; it is not the CI authority record.
+
 | File | Purpose |
 |---|---|
 | `ci_support.py` | parse/validate the canonical pytest inventory, deterministic shard assignment, environment reporting, and the aggregate reconciliation gate. CLI: `build-shards`, `aggregate`, `env-report`, `check-sha`. |
@@ -25,6 +29,28 @@ dispatch **fails closed** — the jobs error out rather than judging a candidate
 candidate's own verifier, population floor and skip policy.
 
 The workflow is dispatch-only; an ordinary push cannot trigger it.
+
+## Compatibility lane
+
+The workflow also runs a separate `compat` job on Ubuntu 24.04. It asserts that the
+runner's system SQLite is in the 3.45.x class — the accepted authoritative run
+environment uses SQLite 3.45.1 — and runs the focused old-SQLite secret-guard
+conformance test.
+
+Its status differs by gate, and "non-gating" must be read against a specific one:
+
+- **Aggregate T4 adjudication.** The lane is non-gating: it is excluded from
+  `aggregate.needs`, its evidence is not consumed by the aggregate reconciler, and a
+  `compat` failure cannot change the aggregate `T4_PASS` / `T4_FAIL` result.
+- **Overall GitHub Actions run.** The lane is still an ordinary job with no job-level
+  `continue-on-error`, so a `compat` failure currently makes the overall workflow-run
+  conclusion `failure`. That follows from how the run is assembled; it is not a
+  support-policy statement.
+- **Platform/support policy.** The lane provides compatibility evidence only. It does
+  not establish Ubuntu 24.04, Ubuntu LTS, or SQLite 3.45.x as a supported platform, a
+  minimum version, a fleet policy, or a release gate.
+
+See `docs/SQLITE_COMPATIBILITY_REPAIR.md` for the repair it exercises.
 
 *History:* before CI v1 was on the default branch it could not be dispatched, so a temporary
 `push` trigger on the `ci/bootstrap-v1` branch namespace was used to publish and validate the

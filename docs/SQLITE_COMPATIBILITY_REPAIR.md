@@ -71,9 +71,15 @@ This repair does **not**:
 - make Ubuntu or any LTS an Ubuntu release gate;
 - establish a fleet support policy.
 
-SQLite 3.45.1 compatibility was repaired and demonstrated; that is the whole claim. The advisory,
-non-gating Ubuntu 24.04 / SQLite 3.45.1 lane in CI v1 (`docs/CI_V1.md`) exercises this repair but is
-likewise not a support-policy declaration.
+SQLite 3.45.1 compatibility was repaired and demonstrated; that is the whole claim. The Ubuntu 24.04 /
+SQLite 3.45.1 compatibility lane in CI v1 (`docs/CI_V1.md`) exercises this repair. Its status differs
+by gate: relative to the aggregate T4 adjudication it is non-gating — it is excluded from
+`aggregate.needs`, its evidence is not consumed by the aggregate reconciler, and a lane failure cannot
+change `T4_PASS` / `T4_FAIL` — while it remains an ordinary GitHub Actions job with no job-level
+`continue-on-error`, so a lane failure currently makes the overall workflow run conclude `failure`.
+The lane provides compatibility evidence only and is not a support-policy declaration: it does not
+establish Ubuntu 24.04, Ubuntu LTS, or SQLite 3.45.x as a formal supported platform, minimum version,
+fleet policy, or release gate.
 
 ## Evidence
 

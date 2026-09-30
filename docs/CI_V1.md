@@ -73,18 +73,31 @@ authority. That trigger was retired at `5bb7833`. The bootstrap branch `ci/boots
 remotely at `58fca2c7b1b4111d982733980c303565bf91695e`; whether to retain or delete it is an open
 policy decision, not a CI correctness requirement.
 
-## Advisory Ubuntu 24.04 / SQLite 3.45.1 compatibility lane
+## Ubuntu 24.04 / SQLite 3.45.1 compatibility lane
 
-The workflow includes a **non-gating, advisory** compatibility job on Ubuntu 24.04 (system Python
-3.12.3, SQLite 3.45.1) that asserts the SQLite version and runs the secret-key SQL conformance test,
-including a real `CREATE TRIGGER` on the 3.45.1 parser. It is **not** part of the aggregate gate's
-`needs`, is **not** a support-policy declaration, and does **not** make Ubuntu a release-blocking
-platform. See `docs/SQLITE_COMPATIBILITY_REPAIR.md` for the repair it exercises.
+The workflow includes a compatibility job on Ubuntu 24.04 (system Python 3.12.3, SQLite 3.45.1) that
+asserts the SQLite version and runs the secret-key SQL conformance test, including a real
+`CREATE TRIGGER` on the 3.45.1 parser. Its status differs by gate, and "non-gating" here must be read
+against a specific one:
+
+- **Aggregate T4 adjudication.** The lane is non-gating: it is excluded from the aggregate gate's
+  `needs`, its evidence is not consumed by the aggregate reconciler, and a failure cannot change the
+  aggregate `T4_PASS` / `T4_FAIL` result.
+- **Overall GitHub Actions run.** The lane is still an ordinary job with no job-level
+  `continue-on-error`, so a failure currently makes the overall workflow-run conclusion `failure`.
+  That follows from how the run is assembled; it is not a support-policy statement.
+- **Platform/support policy.** The lane provides compatibility evidence only. It does not establish
+  Ubuntu 24.04, Ubuntu LTS, or SQLite 3.45.x as a supported platform, a minimum version, a fleet
+  policy, or a release gate.
+
+See `docs/SQLITE_COMPATIBILITY_REPAIR.md` for the repair it exercises.
 
 ## Known limitations of the CI evidence
 
-- The compatibility lane is advisory and non-gating; it does not establish a minimum SQLite version or
-  an Ubuntu/LTS support guarantee.
+- The compatibility lane is non-gating only with respect to the aggregate T4 adjudication: it is
+  excluded from `aggregate.needs` and cannot change `T4_PASS` / `T4_FAIL`. It is still an ordinary
+  GitHub Actions job, so a lane failure currently makes the overall workflow run conclude `failure`;
+  and it does not establish a minimum SQLite version or an Ubuntu/LTS support guarantee.
 - The evidence does **not** prove six distinct physical machines. Recorded runner hostnames cover fewer
   hosts than shards; no claim of six distinct hosts is made.
 - There is **no external attestation**. The tree seal, reports, and aggregate are produced by the job
@@ -101,6 +114,9 @@ platform. See `docs/SQLITE_COMPATIBILITY_REPAIR.md` for the repair it exercises.
 These remain human decisions and are not settled by CI v1's existence:
 
 - whether Arch and Ubuntu LTS become formal blocking support gates;
+- whether the compatibility lane should become run-conclusion-non-blocking (for example through a
+  job-level `continue-on-error`), which is a separate decision from its status in the aggregate T4
+  adjudication;
 - whether to retain or delete the `ci/bootstrap-v1` branch;
 - whether to pin dependencies and/or address the residual (non-hostile-candidate) trust boundary.
 
@@ -109,7 +125,7 @@ These remain human decisions and are not settled by CI v1's existence:
 - `.github/workflows/t4.yml` — the workflow, including its own dispatch-only and least-privilege notes;
 - `scripts/ci/README.md` — the support machinery and trusted-tooling policy;
 - `docs/DEVELOPMENT.md` — how the gate fits the development workflow;
-- `docs/SQLITE_COMPATIBILITY_REPAIR.md` — the compatibility repair exercised by the advisory lane.
+- `docs/SQLITE_COMPATIBILITY_REPAIR.md` — the compatibility repair exercised by the compatibility lane.
 
 Detailed raw artifacts for run `36682157600` were captured during the CI v1 campaign in a local
 untracked `work/ci-evidence/` directory. They are supplementary evidence only; the claim above is
