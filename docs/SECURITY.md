@@ -25,7 +25,7 @@ limit. Unknown provider cost remains unknown.
 
 ## Linux desktop authority boundary
 
-Linux v0.1 is landed through Phase 6. It has consequential local persistence and therefore a stronger,
+Linux v0.1 is landed through Phase 10. It has consequential local persistence and therefore a stronger,
 explicit ownership boundary than the old campaign harness.
 
 One `DataRootAuthority` owns an authoritative data root. Forward application/store/database/event/filesystem
@@ -87,8 +87,28 @@ acquisition. Rooted descriptors/claims, fresh validation, durability fences, and
 classification govern consequential filesystem/database work. Live authoritative SQLite state is local to
 the authority host and must not be shared by placing the database on Samba/NFS for multi-host access.
 
-Backups/import/export/recovery remain later Linux v0.1 phases; their future implementation must preserve
-the single-authority and verified-adoption rules in `LINUX_V0_1_DESIGN.md`.
+Backups, archive import/export, and whole-installation recovery are landed Linux v0.1 phases (Phase 9
+Slices A–E); their implementation preserves the single-authority and verified-adoption rules in
+`LINUX_V0_1_DESIGN.md`.
+
+## Campaign desktop approval boundary
+
+The Phase 10 campaign desktop surface introduces a consequential-operation approval boundary that
+remains core-owned; Qt only presents it.
+
+- A full run, a worker regeneration, and a synthesis rerun are each bound to a preflight snapshot
+  digest and a typed approval scope and target. Binding is validated against durable inputs,
+  contracts, configuration, and provider-route identity before any provider request and before any
+  run-tree mutation.
+- Approval consumption is one-shot and durable: the first consumption writes an exclusive marker, and
+  a replayed or mismatched approval is refused before dispatch. An operation never silently renumbers
+  or retries around a mismatch.
+- Campaign evidence is append-only and attempt-addressed. Regeneration and synthesis rerun add new
+  attempts and never rewrite historical evidence; the selected attempt is recorded explicitly.
+- Cancellation is truthful: already-persisted partial output stays authoritative, terminal state is
+  persisted, and uncertain provider-side outcomes are preserved rather than converted to success.
+- Provider cost telemetry is never invented; cumulative and selected-attempt cost figures are kept
+  distinct, and the selected figure is derived at read time.
 
 ## Consequential actions beyond current Linux v0.1
 

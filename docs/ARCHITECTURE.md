@@ -5,16 +5,17 @@
 B.O.T.S. now contains two related execution surfaces:
 
 1. the closed V0/V0.2 manifest-driven campaign harness; and
-2. the native Linux v0.1 desktop product, landed through Phase 9 Slice D; Phase 9 Slice E
-   native desktop integration and Phase 9 technical closure is implemented in the current
-   pre-commit candidate.
+2. the native Linux v0.1 desktop product, landed through Phase 9 closure (Slices A–E) and
+   Phase 10 campaign desktop integration.
 
 The accepted desktop contract is `LINUX_V0_1_DESIGN.md`. Phases 1 through 8 and Phase 9 Slices A
-through D are landed. Phase 9 Slice A — Transcript v0.1 and strict Archive v1 export — landed at
-`35b206a404d4cd3e2dd05a5c07ffdc6dd0e1ba40`. Phase 9 Slice B — validated Archive import and durable
-import provenance — landed at `9a84d38b6ad2d3968db58f471d53bf85820656b1`. Phase 9 Slices C
-(backup/verification) and D (staged restart restore) are likewise landed; see the Slice C/D
-subsections below. Slice E desktop integration is implemented in the current pre-commit candidate.
+through E are landed, so Phase 9 is closed. Phase 9 Slice A — Transcript v0.1 and strict Archive v1
+export — landed at `35b206a404d4cd3e2dd05a5c07ffdc6dd0e1ba40`. Phase 9 Slice B — validated Archive
+import and durable import provenance — landed at
+`9a84d38b6ad2d3968db58f471d53bf85820656b1`. Phase 9 Slices C (backup/verification), D (staged
+restart restore), and E (desktop integration and technical closure) are likewise landed; see the
+Phase 9 subsections below. Phase 10 — campaign desktop integration — landed at
+`9762170099889ecd87d451341a15a29ce7aceae8`; see §Phase 10 campaign desktop surface.
 
 The campaign harness remains a bounded deterministic worker orchestrator. The desktop adds durable
 conversation state, native UI, streaming generation, SQLite-backed application persistence,
@@ -49,11 +50,11 @@ non-secret endpoint/configuration material; resolved credentials are not persist
 ## Linux v0.1 landed architecture
 
 The accepted desktop contract is `LINUX_V0_1_DESIGN.md`. Phases 1 through 8 and Phase 9 Slices A
-through D are landed. Phase 9 Slice E — native desktop integration for the landed Phase 9
-capabilities plus Phase 9 technical-closure documentation — is implemented in the current
-pre-commit candidate; final Git/OrgMem landing identity is a later administrative fact. Landed
-commit identities are recorded in the phase closure reports, and the current candidate boundary is
-recorded in `LINUX_V0_1_PHASE9_SLICE_E_CLOSURE_REPORT.md`.
+through E are landed, so Phase 9 is closed. Phase 10 — native campaign desktop surface over the
+headless campaign engine — is likewise landed. Landed commit identities are recorded in the phase
+closure reports; the Phase 9 technical-closure boundary is recorded in
+`LINUX_V0_1_PHASE9_SLICE_E_CLOSURE_REPORT.md`, and the Phase 10 landing is recorded in
+`LINUX_V0_1_PHASE10_CLOSURE_REPORT.md`.
 
 Linux v0.1 runs as one native Qt/PySide6 desktop process containing one authoritative, separable,
 headless-testable B.O.T.S. core. Multiple windows are clients/views over the same authority.
@@ -210,8 +211,33 @@ The non-UI operator entry point (`bootstrap/desktop.py` `_initiate_restore`,
 `RestoreStartupCoordinator` interception, then initiates one existing `RestoreService.restore`
 transaction without opening the store or importing Qt, and reports the typed outcomes with exit
 codes 0/1/2/3 as documented in `LINUX_V0_1_DESIGN.md`. The desktop restore handoff that reaches
-this bootstrap path from a running application is the Slice E candidate surface recorded in
+this bootstrap path from a running application is the landed Phase 9 Slice E surface recorded in
 `LINUX_V0_1_PHASE9_SLICE_E_CLOSURE_REPORT.md`.
+
+### Phase 10 campaign desktop surface
+
+Phase 10 lands a native desktop surface over the headless campaign engine without moving campaign
+semantics into Qt:
+
+- `core/campaign.py` is the sole desktop/campaign seam and is deliberately Qt-free. It exports the
+  `CampaignBridge` command/preflight surface and the read-only `CampaignProjection`/`StageProjection`
+  view models, built only from durable run files. Providers are constructed only when an operation is
+  approved and dispatched.
+- `desktop/campaign_dock.py` is the thin presentation layer. `CampaignDockWidget` receives an injected
+  bridge factory, renders projections, and issues commands through the bridge; it does not read or
+  mutate persistence directly. `desktop/window.py` registers it as a dismissible bottom dock behind a
+  View→Campaign action, and `bootstrap/desktop.py` supplies the production factory.
+- Attempt-addressed evidence is additive: `stages/<stage_id>.att<N>.json`/`.md` carry one attempt each,
+  and `selection.json` is the authoritative stage→selected-attempt map. Historical runs remain
+  readable; version-1 evidence is read-only under the new engine.
+- Consequential operations (full run, worker regeneration, synthesis rerun) are bound to a preflight
+  snapshot digest and consume a one-shot durable approval. A replayed or mismatched approval is
+  refused before any provider request.
+- Cost accounting distinguishes cumulative spend across all attempts from the derived selected-attempt
+  spend; the selected figure is derived at read time and is the authority. Synthesis freshness is
+  mechanically classified against the current selection and output bytes.
+- The engine remains independently usable headlessly: `bots5 validate/run/status/inspect` keep their
+  shape and exit codes, with `inspect --attempt`, `regenerate`, and `rerun-synthesis` added.
 
 ### Concurrency and events
 

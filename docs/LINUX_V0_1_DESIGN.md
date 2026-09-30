@@ -6,13 +6,20 @@ independently validated, committed, and landed on `main`; Slice B is
 recorded **1038 passed, 1 skipped** and full T4 recorded **1238 passed, 1 skipped**, exit `0`, with the
 sealed candidate unchanged. Independent adversarial review and final oracle both returned PASS; their
 authorized model substitution reduced reviewer diversity and remains a recorded evidence limitation.
-Phase 9 Slices C and D — Backup v1 with independent verification, and whole-installation staged
-restart restore — are likewise implemented, validated, and landed. **Phase 9 Slice E — native
-desktop integration for the landed Phase 9 capabilities and the Phase 9 technical-closure record —
-is implemented in the current pre-commit candidate; final Git/OrgMem landing identity is a later
-administrative fact.** See `LINUX_V0_1_PHASE9_SLICE_E_CLOSURE_REPORT.md` for the Phase 9 A-E
-technical contract and the current validation evidence, and
-`LINUX_V0_1_PHASE9_SLICE_B_CLOSURE_REPORT.md` for the Slice B administrative landing record.
+Phase 9 Slices C, D, and E — Backup v1 with independent verification, whole-installation staged
+restart restore, and native desktop integration with the Phase 9 technical-closure record — are
+likewise implemented, validated, and landed; **Phase 9 is closed**. Phase 10 — campaign desktop
+integration — is landed at `9762170099889ecd87d451341a15a29ce7aceae8`; see
+`LINUX_V0_1_PHASE10_CLOSURE_REPORT.md`. See `LINUX_V0_1_PHASE9_SLICE_E_CLOSURE_REPORT.md` for the
+Phase 9 A-E technical contract and its validation evidence, and
+`LINUX_V0_1_PHASE9_SLICE_B_CLOSURE_REPORT.md` for the Slice B administrative landing record. The
+SQLite ≤ 3.45.1 parser-compatibility repair is recorded in `SQLITE_COMPATIBILITY_REPAIR.md`, and CI
+v1 in `CI_V1.md`.
+
+**Phase 11 — product finishing and standalone packaging — is next in the accepted sequence and is
+not authorized by this repository state.** Its final visual/aesthetic basis is not yet adjudicated:
+the landed Draft 1 shell is current implementation truth, while `LINUX_V0_1_UI_UX_DRAFT_1.md` remains
+provisional and the later visual-design candidate is a draft.
 
 This document remains the build-facing technical contract for the first native Linux B.O.T.S. desktop
 application. Organisational Memory owns the broader decision rationale and supersession history; this
@@ -45,7 +52,7 @@ The first useful workload is persistent multi-chat with:
 - per-request/chat inspection and provenance;
 - readable transcript export plus versioned full-fidelity archive import/export;
 - explicit whole-chat destructive deletion with confirmation and loss preview;
-- a thin operational desktop surface over the existing campaign engine.
+- a thin operational desktop surface over the existing campaign engine (landed in Phase 10).
 
 Dark theme, scalable UI/text, configurable chat font, keyboard-first command palette/keybindings,
 workspace restoration, and generation attention state are v0.1 requirements.
@@ -322,6 +329,32 @@ default-off `build_runtime(destructive_restore_override=True)` operator authoriz
 halted at `PRESERVING` with no preservation record is reconciled as scratch here, and the entry point
 initiates a fresh preservation-capable restore.
 
+## Campaign desktop surface (Phase 10)
+
+Phase 10 lands the accepted "thin operational desktop surface over the existing campaign engine". The
+engine keeps campaign semantics; the desktop only projects and commands through one seam.
+
+- `core/campaign.py` is the sole desktop/campaign boundary and is Qt-free. `CampaignBridge` owns
+  zero-spend `load_job`/`validate`/`prepare_*` operations and approved dispatch; `project_run` and
+  `CampaignProjection` build read-only views from durable run files only. Providers are constructed
+  only inside an approved operation.
+- `desktop/campaign_dock.py` renders projections and issues commands through an injected bridge
+  factory; `desktop/window.py` exposes it as a dismissible bottom dock, and `bootstrap/desktop.py`
+  supplies the production factory.
+- Evidence is attempt-addressed and additive: `stages/<stage_id>.att<N>.json`/`.md` hold one attempt
+  each, and `selection.json` is the authoritative stage→selected-attempt map. Version-1 run evidence
+  remains readable and is read-only under the new engine.
+- Consequential operations (full run, worker regeneration, synthesis rerun) bind to a preflight
+  snapshot digest and consume a one-shot durable approval; a replayed or mismatched approval is
+  refused before any provider request. Cancellation is truthful and never auto-retried.
+- Cost/usage accounting distinguishes cumulative spend across all attempts from the derived
+  selected-attempt spend; synthesis freshness is mechanically classified against the current selection
+  and dependency output bytes.
+- The engine stays independently usable headlessly: `bots5 validate/run/status/inspect` keep their
+  shape and exit codes, with `inspect --attempt`, `regenerate`, and `rerun-synthesis` added.
+
+The Phase 10 landing and its accepted limitations are recorded in `LINUX_V0_1_PHASE10_CLOSURE_REPORT.md`.
+
 ## Lifecycle
 
 Startup order is: resolve paths, acquire authority lock, reconcile any interrupted whole-installation
@@ -409,9 +442,9 @@ Build through validated vertical slices:
 7. Phase 6: deterministic context and content-addressed attachments — **closed and landed**;
 8. Phase 7: search and exact navigation — **closed and landed**;
 9. Phase 8: inspection/provenance UX — **closed and landed**;
-10. Phase 9: import/export, backup, verification, and restore — **Slices A through D landed; Slice E desktop integration and Phase 9 technical closure implemented in the current pre-commit candidate**;
-11. Phase 10: campaign desktop integration;
-12. Phase 11: product finishing and standalone packaging;
+10. Phase 9: import/export, backup, verification, and restore — **closed; Slices A through E landed**;
+11. Phase 10: campaign desktop integration — **closed and landed**;
+12. Phase 11: product finishing and standalone packaging — **next; not authorized**;
 13. Phase 12: Linux v0.1 torture run and separate closure adjudication.
 
 Every phase retains inspect -> propose -> approve -> edit -> validate -> separate commit approval ->

@@ -25,8 +25,9 @@ accepted. The build-facing contract is `docs/LINUX_V0_1_DESIGN.md`.
 ### Landed status
 
 Phases **1 through 8 and Phase 9 Slices A and B are implemented, validated, committed, and landed on `main`**.
-Phase 9 Slices C and D are likewise implemented, validated, and landed, and Phase 9 Slice E — native desktop
-integration and Phase 9 technical closure — is implemented in the current pre-commit candidate.
+Phase 9 Slices C, D, and E are likewise implemented, validated, and landed, so **Phase 9 is closed**.
+**Phase 10 — campaign desktop integration — is landed** at
+`9762170099889ecd87d451341a15a29ce7aceae8`.
 
 - Phase 1: native walking skeleton, core, persistence, events, fake streaming backend.
 - Phase 2: conversation truth, immutable lineage/revisions, and deterministic fake generation.
@@ -79,21 +80,33 @@ historical checkpoints and do not override the current closure record.
   typed destructive-failure semantics — closed and landed (`infrastructure/restore_service.py`,
   `bootstrap/desktop.py`); the restore semantics are documented in `docs/LINUX_V0_1_DESIGN.md`.
 - Phase 9 Slice E: native desktop integration for the accepted Phase 9 workflows and Phase 9
-  technical closure — **implemented in the current pre-commit candidate**; recorded in
-  `docs/LINUX_V0_1_PHASE9_SLICE_E_CLOSURE_REPORT.md`. The candidate records no commit identity of its
-  own.
+  technical closure — **landed** at `0756904481ae884bb9e864e8e1e11fc4a27a72ff`; recorded in
+  `docs/LINUX_V0_1_PHASE9_SLICE_E_CLOSURE_REPORT.md`. Phase 9 is closed.
+- Phase 10: campaign desktop integration — **closed and landed** at
+  `9762170099889ecd87d451341a15a29ce7aceae8`; recorded in
+  `docs/LINUX_V0_1_PHASE10_CLOSURE_REPORT.md`.
+- SQLite ≤ 3.45.1 parser-compatibility repair — landed at
+  `dee0b3b8446d7f84bcc4e1a5af2339c5ed78383f`; recorded in
+  `docs/SQLITE_COMPATIBILITY_REPAIR.md`.
+- CI v1 — landed; current `main` is `5bb783326b5a8c68bb1e2b2719aca6070e22f225`; recorded in
+  `docs/CI_V1.md`.
 
 ### Current implementation phase
 
 **Phase 7 — search and exact navigation**, **Phase 8 — inspection/provenance UX**, **Phase 9 Slice A —
 Transcript v0.1 and strict Archive v1 export**, and **Phase 9 Slice B — validated archive import and
 durable import provenance** are closed and landed. Slice B is landed at
-`9a84d38b6ad2d3968db58f471d53bf85820656b1`. **Phase 9 Slices C and D — Backup v1 with independent
-verification, and staged restart restore — are also closed and landed** (see their bullets above and
-`docs/LINUX_V0_1_DESIGN.md`). **Phase 9 Slice E — native desktop integration and Phase 9 technical
-closure — is implemented in the current pre-commit candidate**; final Git/OrgMem landing identity is
-a later administrative fact. **Phase 10 — campaign desktop integration — is not started**, and Slice
-E landing does not authorize it.
+`9a84d38b6ad2d3968db58f471d53bf85820656b1`. **Phase 9 Slices C, D, and E are also closed and landed**,
+so **Phase 9 is closed** (see their bullets above and `docs/LINUX_V0_1_DESIGN.md`). **Phase 10 —
+campaign desktop integration — is closed and landed** at
+`9762170099889ecd87d451341a15a29ce7aceae8` (`docs/LINUX_V0_1_PHASE10_CLOSURE_REPORT.md`). The
+SQLite ≤ 3.45.1 parser-compatibility repair landed at
+`dee0b3b8446d7f84bcc4e1a5af2339c5ed78383f`, and CI v1 landed with current `main`
+`5bb783326b5a8c68bb1e2b2719aca6070e22f225` (`docs/CI_V1.md`).
+
+**Phase 11 — product finishing and standalone packaging — is next in the accepted sequence and is not
+authorized by this repository state.** Its final visual basis is not yet adjudicated (see
+§Current product target).
 
 The accepted desktop sequence remains:
 
@@ -106,9 +119,9 @@ The accepted desktop sequence remains:
 7. Phase 6: context and attachments — **closed**;
 8. Phase 7: search and exact navigation — **closed and landed**;
 9. Phase 8: inspection/provenance UX — **closed and landed**;
-10. Phase 9: import/export, backup, verification, and restore — **Slices A through D landed; Slice E desktop integration and Phase 9 technical closure implemented in the current pre-commit candidate**;
-11. Phase 10: campaign desktop integration;
-12. Phase 11: product finishing and standalone packaging;
+10. Phase 9: import/export, backup, verification, and restore — **closed; Slices A through E landed**;
+11. Phase 10: campaign desktop integration — **closed and landed**;
+12. Phase 11: product finishing and standalone packaging — **next; not authorized**;
 13. Phase 12: Linux v0.1 torture run and separate closure adjudication.
 
 Every phase retains inspect -> propose -> approve -> edit -> validate -> separate commit approval ->
@@ -120,8 +133,10 @@ Linux v0.1 remains a real native Linux desktop application centred on persistent
 lineage, concurrent streaming generation, deterministic context construction, reusable attachments,
 search, provenance/inspection, backup/recovery, and a thin operational campaign surface.
 
-The provisional Draft 1 UI authority remains `docs/LINUX_V0_1_UI_UX_DRAFT_1.md`; it is intentionally not
-promoted to final UI design authority merely because later backend phases have landed.
+The landed Draft 1 shell is current implementation truth. `docs/LINUX_V0_1_UI_UX_DRAFT_1.md` remains a
+provisional design document, and the later visual-design candidate is a draft; neither is promoted to
+final design authority here. The final visual/aesthetic basis for Phase 11 is not yet adjudicated and
+remains a separate human decision.
 
 ## Deferred beyond Linux v0.1
 

@@ -6,7 +6,9 @@ This repository now contains two related but distinct surfaces:
 
 1. the closed manifest-driven campaign harness (V0/V0.2); and
 2. the native Linux desktop product, implemented and landed through Linux v0.1
-   Phase 8; Phase 9 import/export, backup, verification, and restore is current.
+   Phase 9 closure (Slices A–E) and Phase 10 campaign desktop integration. Phase 11 —
+   product finishing and standalone packaging — is next in the accepted sequence and is not
+   authorized.
 
 Do not apply old V0 non-goals to the desktop product without checking `LINUX_V0_1_DESIGN.md` and the
 current roadmap.
@@ -97,15 +99,37 @@ Phase 7 was accepted, committed, and pushed at `6ccdaf01ce880cf5f00fca55209c2a99
 supplied closure was **1,065 passed, 1 expected provider skip, 0 failed**, with no provider/network
 activity. Phase 8 is now landed at `f72e0ea6e10694972f3b3455d973651629de448a`; its separate final
 T4 gate recorded **1082 passed, 1 skipped, 3124 warnings in 3946.05s (1:05:46)**, exit `0`.
-Phase 9 is the current implementation phase. The complete repository suite remains a separate
-pre-commit closure gate.
+Phase 9 is closed and Phase 10 is landed. The complete repository suite remains a separate
+pre-commit closure gate; CI v1 runs it authoritatively (see §Continuous integration).
 
 Phase 8 inspection semantics belong to the core: use `BotsApplication.inspect_chat()` and the typed
 `InspectionProjection`; Qt is presentation only. The additive migration is
 `0011_phase8_inspector_state` after `0010_phase7_search_navigation`. Preserve request-time provenance,
 metadata-only attachment inspection, exact active/historical branch identity, and honest unavailable
-or unsupported states. Phase 9 import/export, backup, verification, and restore is not implemented by
-Phase 8.
+or unsupported states. Phase 8 does not itself implement the Phase 9 import/export, backup,
+verification, and restore surfaces; those landed in Phase 9, and Phase 10 added the campaign desktop
+surface over the headless engine.
+
+## Continuous integration
+
+CI v1 (`.github/workflows/t4.yml`, with correctness logic in `scripts/ci/`) is the authoritative T4
+gate. It is dispatch-only: a workflow dispatch names the exact expected commit SHA and fails closed
+if the checkout differs. It shards the canonical pytest inventory across standard GitHub-hosted Linux
+runners, reconciles the raw per-shard evidence mechanically, and returns one aggregate result bound
+to the candidate SHA.
+
+- The population floor and the permitted-skip allow-list are policy and are read from the default
+  branch (`tools/scripts/ci/*`), never from the commit under test; a trusted run records
+  `trusted_tools: "true"`. If trusted tooling is unavailable, the run fails closed rather than
+  judging a candidate with the candidate's own verifier.
+- `scripts/ci/t4_baseline_inventory.txt` is the reviewed node-ID population floor. The gate fails if
+  any reviewed test is missing; adding tests is allowed, and removing one requires a deliberate
+  baseline update. Do not treat any particular current population count as a permanent future count.
+- The workflow is documented in `scripts/ci/README.md`; the authoritative run identity, counts, and
+  the limitations of the CI evidence are recorded in `docs/CI_V1.md`.
+
+CI does not change the deterministic-test rules above: ordinary automated tests must not contact a
+provider or spend money.
 
 ## Campaign manifest schema
 

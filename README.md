@@ -8,9 +8,8 @@ inspectable state, durable evidence, and human-controlled consequential actions.
 The original campaign harness baseline is closed and preserved. V0.2 adds the built-in
 `local_openai` provider while preserving the bounded manifest-driven execution model.
 
-Linux v0.1 is implemented and independently validated through **Phase 9 Slice D**, and **Phase 9
-Slice E — native desktop integration and Phase 9 technical closure — is implemented in the
-current pre-commit candidate**:
+Linux v0.1 is implemented, validated, and landed through **Phase 9 closure (Slices A–E)** and
+**Phase 10 — native desktop surface over the headless campaign engine**:
 
 1. native walking skeleton;
 2. conversation truth, immutable lineage/revisions, and deterministic fake generation;
@@ -32,6 +31,11 @@ current pre-commit candidate**:
 13. Phase 9 Slice E native desktop integration for the landed Phase 9 workflows — export, import,
     continuation resolution, backup creation/verification, and the whole-installation restore
     handoff — plus the Phase 9 technical-closure record.
+14. Phase 10 native campaign desktop surface over the headless campaign engine: the Qt-free
+    `CampaignBridge`/`CampaignProjection` seam, a native campaign dock, attempt-addressed evidence
+    with `selection.json`, one-shot preflight approval binding, truthful cancellation, cumulative
+    versus selected cost accounting, worker regeneration, synthesis rerun with mechanical staleness,
+    and headless CLI parity (`inspect --attempt`, `regenerate`, `rerun-synthesis`).
 
 The landed Phase 6 implementation is commit
 `20847c7a49e26679d0d3dfe99798a2c211bec436`. Its final reserved acceptance gates were
@@ -60,21 +64,30 @@ handling/healing, and branch-aware imported continuation. Final current-byte val
 T4 with the candidate unchanged. See `docs/LINUX_V0_1_PHASE9_SLICE_B_CLOSURE_REPORT.md`.
 
 Phase 9 Slice C — Backup v1 and independent verification — and Phase 9 Slice D — whole-installation
-staged restart restore — are likewise accepted and landed. Phase 9 Slice E — native desktop
-integration and Phase 9 technical closure — is implemented in the current pre-commit candidate;
-`docs/LINUX_V0_1_PHASE9_SLICE_E_CLOSURE_REPORT.md` is its closure record. The candidate records no
-commit identity of its own: final Git/OrgMem landing identity is a later administrative fact.
-Phase 10 is not started and Slice E landing does not authorize it.
+staged restart restore — are likewise accepted and landed. Phase 9 is closed: Slice E — native
+desktop integration and Phase 9 technical closure — landed at
+`0756904481ae884bb9e864e8e1e11fc4a27a72ff`, and `docs/LINUX_V0_1_PHASE9_SLICE_E_CLOSURE_REPORT.md`
+is its closure record. Phase 10 — campaign desktop integration — subsequently landed at
+`9762170099889ecd87d451341a15a29ce7aceae8`; `docs/LINUX_V0_1_PHASE10_CLOSURE_REPORT.md` is its
+closure and landing record. A SQLite ≤ 3.45.1 parser-compatibility repair landed at
+`dee0b3b8446d7f84bcc4e1a5af2339c5ed78383f` (`docs/SQLITE_COMPATIBILITY_REPAIR.md`), and CI v1
+landed with current `main` `5bb783326b5a8c68bb1e2b2719aca6070e22f225` (`docs/CI_V1.md`).
+
+**Phase 11 — product finishing and standalone packaging — is next in the accepted sequence and is
+not authorized by this repository state.**
 
 The build-facing Linux v0.1 contract remains `docs/LINUX_V0_1_DESIGN.md`. The cumulative Phase 6
 implementation history remains in `docs/LINUX_V0_1_PHASE6_IMPLEMENTATION_REPORT.md` and the later
 phase implementation reports. Their earlier candidate-status statements are historical evidence;
 the applicable phase closure reports record current landing authority. Phase 7 and Phase 8 do not
-change the landed Phase 6 disposition. The Phase 9 Slice A and Slice B closure reports record the
-current interchange/export/import landing boundaries.
+change the landed Phase 6 disposition. The Phase 9 Slice A and Slice B closure reports record their
+historical interchange/export/import landing boundaries, the Slice E closure report records Phase 9
+technical closure, and `docs/LINUX_V0_1_PHASE10_CLOSURE_REPORT.md` records the Phase 10 landing.
 
-The provisional UI authority remains `docs/LINUX_V0_1_UI_UX_DRAFT_1.md`; it has not been promoted to
-final design authority.
+The landed Draft 1 shell is current implementation truth. `docs/LINUX_V0_1_UI_UX_DRAFT_1.md` remains
+a provisional design document, and the later visual-design candidate is a draft; neither is promoted
+to final design authority here. The final visual/aesthetic basis for Phase 11 is therefore not yet
+adjudicated and remains a separate human decision.
 
 ## Campaign harness
 
@@ -218,4 +231,8 @@ Key records include:
 - `docs/LINUX_V0_1_PHASE8_CLOSURE_REPORT.md` — authoritative Phase 8 closure and landing record;
 - `docs/LINUX_V0_1_PHASE9_SLICE_A_CLOSURE_REPORT.md` — authoritative Phase 9 Slice A closure and landing record;
 - `docs/LINUX_V0_1_PHASE9_SLICE_B_CLOSURE_REPORT.md` — authoritative Phase 9 Slice B closure and landing record;
+- `docs/LINUX_V0_1_PHASE9_SLICE_E_CLOSURE_REPORT.md` — Phase 9 technical-closure record;
+- `docs/LINUX_V0_1_PHASE10_CLOSURE_REPORT.md` — authoritative Phase 10 closure and landing record;
+- `docs/CI_V1.md` — CI v1 authoritative T4 reference and its stated limitations;
+- `docs/SQLITE_COMPATIBILITY_REPAIR.md` — SQLite ≤ 3.45.1 parser-compatibility repair record;
 - `docs/LINUX_V0_1_DESIGN.md` — accepted Linux v0.1 build-facing contract.
