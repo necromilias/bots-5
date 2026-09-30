@@ -1,0 +1,9 @@
+corpus size: 56340
+baseline expr bytes: 369321 candidate expr bytes: 10835
+baseline true count: 14280 candidate true count: 14280
+PREDICATE: identical verdicts on all 56340 corpus values
+json documents: 604
+json_tree matched: baseline 510 candidate 510
+JSON_TREE: identical key verdicts
+python-forbidden missed by candidate SQL (sample): 0
+FAILURES: none

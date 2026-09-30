@@ -1,0 +1,11 @@
+{
+  "corpus_size": 56340,
+  "baseline_true": 14280,
+  "candidate_true": 14280,
+  "only_baseline": [],
+  "only_candidate": [],
+  "json_docs": 604,
+  "json_only_baseline": [],
+  "json_only_candidate": [],
+  "failures": []
+}

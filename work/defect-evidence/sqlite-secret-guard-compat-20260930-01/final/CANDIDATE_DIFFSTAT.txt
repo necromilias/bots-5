@@ -1,0 +1,3 @@
+ src/bots5/core/secrets.py                      | 79 +++++++++++++++++++-------
+ src/bots5/infrastructure/persistence/sqlite.py |  8 +--
+ 2 files changed, 61 insertions(+), 26 deletions(-)

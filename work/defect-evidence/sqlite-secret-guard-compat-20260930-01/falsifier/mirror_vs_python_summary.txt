@@ -1,0 +1,6 @@
+cases=97443
+mirror_disagree=0
+mirror_baseline_vs_python=19927 fp=19927
+mirror_candidate_vs_python=19927 fp=19927
+sqlish_mirror_mismatch=0
+sql_equivalence_failures=0

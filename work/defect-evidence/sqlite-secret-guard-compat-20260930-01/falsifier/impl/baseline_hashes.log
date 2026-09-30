@@ -1,0 +1,11 @@
+bots5 source: /home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/work/baseline-t0/src/bots5/__init__.py
+baseline declared entries: 44 derived: 44
+baseline's own declared-vs-derived mismatches: {}
+objects whose SQL differs candidate-vs-baseline: 4
+  DIFF phase5_capability_fact_provenance_validate_insert
+  DIFF phase5_capability_fact_provenance_validate_update
+  DIFF phase5_model_catalogue_metadata_validate_insert
+  DIFF phase5_model_catalogue_metadata_validate_update
+differs as expected: True
+all trigger names present: True
+total triggers in baseline db: 121

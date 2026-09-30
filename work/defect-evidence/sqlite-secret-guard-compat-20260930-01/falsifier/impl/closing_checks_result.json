@@ -1,0 +1,17 @@
+{
+  "cli": {
+    "sqlite3-3450100": {
+      "returncode": 0,
+      "stdout": "",
+      "stderr": "",
+      "ok": true
+    },
+    "sqlite3-3460000": {
+      "returncode": 0,
+      "stdout": "",
+      "stderr": "",
+      "ok": true
+    }
+  },
+  "baseline_db_open_by_candidate": "RuntimeError: current Phase 5 schema trigger is not migration-authoritative: phase5_model_catalogue_metadata_validate_insert"
+}

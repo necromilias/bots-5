@@ -1,0 +1,68 @@
+{
+  "metadata_insert_benign": {
+    "rc": 0,
+    "aborted": false,
+    "message": ""
+  },
+  "metadata_insert_forbidden": {
+    "rc": 19,
+    "aborted": true,
+    "message": "Phase 5 model catalogue metadata is malformed"
+  },
+  "metadata_insert_sep_insertion": {
+    "rc": 19,
+    "aborted": true,
+    "message": "Phase 5 model catalogue metadata is malformed"
+  },
+  "metadata_insert_unicode_fold": {
+    "rc": 19,
+    "aborted": true,
+    "message": "Phase 5 model catalogue metadata is malformed"
+  },
+  "metadata_insert_nul": {
+    "rc": 19,
+    "aborted": true,
+    "message": "Phase 5 model catalogue metadata is malformed"
+  },
+  "metadata_insert_benign_fold": {
+    "rc": 0,
+    "aborted": false,
+    "message": ""
+  },
+  "metadata_update_benign": {
+    "rc": 0,
+    "aborted": false,
+    "message": ""
+  },
+  "metadata_update_forbidden": {
+    "rc": 19,
+    "aborted": true,
+    "message": "Phase 5 model catalogue metadata is malformed"
+  },
+  "provenance_insert_benign": {
+    "rc": 0,
+    "aborted": false,
+    "message": ""
+  },
+  "provenance_insert_forbidden": {
+    "rc": 19,
+    "aborted": true,
+    "message": "Phase 5 capability provenance is malformed"
+  },
+  "provenance_insert_illegal_field": {
+    "rc": 19,
+    "aborted": true,
+    "message": "Phase 5 capability provenance is malformed"
+  },
+  "provenance_update_benign": {
+    "rc": 0,
+    "aborted": false,
+    "message": ""
+  },
+  "provenance_update_forbidden": {
+    "rc": 19,
+    "aborted": true,
+    "message": "Phase 5 capability provenance is malformed"
+  }
+}
+BEHAVIOR_345 OK

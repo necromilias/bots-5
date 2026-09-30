@@ -1,0 +1,136 @@
+diff --git a/src/bots5/core/secrets.py b/src/bots5/core/secrets.py
+index 9f9cf42..c4c0ac6 100644
+--- a/src/bots5/core/secrets.py
++++ b/src/bots5/core/secrets.py
+@@ -28,12 +28,6 @@ _FORBIDDEN_SECRET_KEYS = frozenset(
+     }
+ )
+ 
+-_ASCII_NON_ALNUM_CODES = tuple(
+-    code
+-    for code in range(128)
+-    if not chr(code).isascii() or not chr(code).isalnum()
+-)
+-
+ # SQLite's built-in lower() is ASCII-only.  These are the non-ASCII Unicode
+ # code points whose Python casefold() contributes ASCII alphanumeric text to
+ # normalize_secret_key(); the remaining non-ASCII code points are treated as
+@@ -71,35 +65,76 @@ def is_forbidden_secret_key(value: object) -> bool:
+     return isinstance(value, str) and normalize_secret_key(value) in _FORBIDDEN_SECRET_KEYS
+ 
+ 
++_FORBIDDEN_KEY_SQL_ALIAS = "_bots5_normalized_key"
++_CASE_FOLD_STAGE_LIMIT = 10
++
++
+ def secret_key_forbidden_sql_expression(column: str) -> str:
+     """Build the SQLite equivalent of the normalized forbidden-key predicate.
+ 
+     SQLite connections used by raw-DML probes do not have Python UDFs installed,
+-    so the migration-owned triggers inline the same normalization policy. The
+-    residual non-ASCII check treats Unicode separators as removed for the
++    so the migration-owned triggers inline the same normalization policy.
++
++    Two properties keep the generated SQL shallow enough for the fixed
++    one-hundred-entry LEMON parser stack used by SQLite before 3.46.0:
++
++    * Separator removal is not materialised.  Every forbidden key is a run of
++      ASCII letters, so deleting an ASCII non-alphanumeric character can change
++      neither a key's per-letter occurrence counts nor whether an ASCII
++      alphanumeric character survives the residual check.  Counts and residuals
++      are therefore computed on the case-folded text directly.
++    * The Unicode case-fold replacements are applied in stages, each stage in
++      its own nested derived table, so no single expression nests deeply.
++
++    The residual non-ASCII check treats Unicode separators as removed for the
+     forbidden-key vocabulary while preserving benign keys such as ``apricotKey``.
+     """
+-    expression = f"lower(CAST({column} AS TEXT))"
+-    for code, folded in _UNICODE_CASEFOLD_ASCII_MAP:
+-        expression = f"replace({expression}, char({code}), '{folded}')"
+-    for code in _ASCII_NON_ALNUM_CODES:
+-        expression = f"replace({expression}, char({code}), '')"
+-    forbidden = ", ".join(f"'{key}'" for key in sorted(_FORBIDDEN_SECRET_KEYS))
+-    unicode_variants = []
+-    for key in sorted(_FORBIDDEN_SECRET_KEYS):
+-        residual = expression
++    replacements = [
++        (code, f"'{folded}'") for code, folded in _UNICODE_CASEFOLD_ASCII_MAP
++    ]
++    stages = [
++        replacements[index : index + _CASE_FOLD_STAGE_LIMIT]
++        for index in range(0, len(replacements), _CASE_FOLD_STAGE_LIMIT)
++    ]
++    staged = f"SELECT lower(CAST({column} AS TEXT)) AS _bots5_casefold_0"
++    for depth, stage in enumerate(stages, start=1):
++        expression = f"_bots5_casefold_{depth - 1}"
++        for code, folded in stage:
++            expression = f"replace({expression}, char({code}), {folded})"
++        staged = (
++            f"SELECT {expression} AS _bots5_casefold_{depth} "
++            f"FROM ({staged}) AS _bots5_casefold_stage_{depth - 1}"
++        )
++
++    folded_column = f"_bots5_casefold_{len(stages)}"
++    residuals = []
++    for index, key in enumerate(sorted(_FORBIDDEN_SECRET_KEYS)):
++        residual = folded_column
+         for character in sorted(set(key)):
+             residual = f"replace({residual}, '{character}', '')"
++        residuals.append(f"{residual} AS _bots5_residual_{index}")
++    normalized = (
++        f"SELECT {folded_column} AS {_FORBIDDEN_KEY_SQL_ALIAS}, "
++        + ", ".join(residuals)
++        + f" FROM ({staged}) AS _bots5_casefold_stage_{len(stages)}"
++    )
++
++    forbidden = ", ".join(f"'{key}'" for key in sorted(_FORBIDDEN_SECRET_KEYS))
++    conditions = [f"{_FORBIDDEN_KEY_SQL_ALIAS} IN ({forbidden})"]
++    for index, key in enumerate(sorted(_FORBIDDEN_SECRET_KEYS)):
+         counts = " AND ".join(
+-            f"length({expression}) - length(replace({expression}, '{character}', '')) = {key.count(character)}"
++            f"length({_FORBIDDEN_KEY_SQL_ALIAS}) - "
++            f"length(replace({_FORBIDDEN_KEY_SQL_ALIAS}, '{character}', '')) = {key.count(character)}"
+             for character in sorted(set(key))
+         )
+-        unicode_variants.append(
+-            f"({counts} AND {residual} NOT GLOB '*[A-Za-z0-9]*')"
++        conditions.append(
++            f"({counts} AND _bots5_residual_{index} NOT GLOB '*[A-Za-z0-9]*')"
+         )
+     return (
+-        f"(instr(CAST({column} AS TEXT), char(0)) > 0 OR "
+-        f"{expression} IN ({forbidden}) OR {' OR '.join(unicode_variants)})"
++        f"(instr(CAST({column} AS TEXT), char(0)) > 0 OR EXISTS ("
++        f"SELECT 1 FROM ({normalized}) AS _bots5_normalized WHERE "
++        + " OR ".join(conditions)
++        + "))"
+     )
+ 
+ 
+diff --git a/src/bots5/infrastructure/persistence/sqlite.py b/src/bots5/infrastructure/persistence/sqlite.py
+index 4af85e5..cd2b19a 100644
+--- a/src/bots5/infrastructure/persistence/sqlite.py
++++ b/src/bots5/infrastructure/persistence/sqlite.py
+@@ -642,8 +642,8 @@ _PHASE5_SCHEMA_SHA256 = {
+     "phase5_attempt_attribution_update": "5ea29ad477a2081800047acbb1e1ea322696884cd0780113d5c06f2f4d9a6f4b",
+     "phase5_capability_fact_identity_insert": "21315d4401a57ed45a28d8ddc8a45630ea892c7f9a9c890ebd039d1b63361d12",
+     "phase5_capability_fact_identity_update": "772df4718eb7099e0581a3a647cd8151e9050bbb8f4ae071a9dbc699600e84b4",
+-    "phase5_capability_fact_provenance_validate_insert": "86502b0c61f5294c73127de6b33adc546c3353f0d56a87ba3a3b4fd97f9cff65",
+-    "phase5_capability_fact_provenance_validate_update": "983ea07f11c1711bc86c827554ff873ae298e386790ac43070c149f4f7d1a532",
++    "phase5_capability_fact_provenance_validate_insert": "831fea2f41765985d349d4dc87bab9bd9d6e440be0b03f914c36703eda70f5f8",
++    "phase5_capability_fact_provenance_validate_update": "5bc95210f6f6d0c6c18231bfd632bfc1cc585b68058e68caa8630c15adbedfb2",
+     "phase5_capability_fact_truth_validate_insert": "330a734e65207119ceddc23e7824134a7ce66ed4aeb4aec9dda787cfd44e0fed",
+     "phase5_capability_fact_truth_validate_update": "21e3223add32399c4b72706f227bf422857079263d55100006c1516beedc114d",
+     "phase5_capability_observation_truth_validate_insert": "146b616421603ec063f1918bec89805635bd1a9170da4248b05faa82ad696f35",
+@@ -657,8 +657,8 @@ _PHASE5_SCHEMA_SHA256 = {
+     "phase5_chat_model_settings_validate_update": "e21dcb1d4f6874f82f7b6ca2dbae7760c855b0c31dfd6013282db795814d558a",
+     "phase5_model_catalogue_delete_referenced": "7ac64a45e6a37191416ef98f719420bc2008c394841229f8b5db1abcc96a4f3d",
+     "phase5_model_catalogue_identity_referenced": "eee48120fe3e5999788eb72e09a1a5b7686bdc4b9efbb59a4fac0a1327e38cad",
+-    "phase5_model_catalogue_metadata_validate_insert": "d2e4be011c79316ccc454513ba3ec33dfb9963f3f589d688595570d22622ab7d",
+-    "phase5_model_catalogue_metadata_validate_update": "ce11f19de46b477924cda9d2235c1673df56c9620dae28ecf6c7223bf39ffcc7",
++    "phase5_model_catalogue_metadata_validate_insert": "86686f757da51fd58140d221537cb0f53f75406d7d4062433b126942e5dad683",
++    "phase5_model_catalogue_metadata_validate_update": "87dde170a31c36cd52a493e21ed627d25bdeb16d3d48b667a6aade5ae17c3ccc",
+     "phase5_model_settings_validate_insert": "dbddc795705bba4ea94d4eb12389af11f0f358f9169c6d8057b40fd0cd9af710",
+     "phase5_model_settings_validate_update": "22592e9b57cc26092e7039c8aa9592c11ffbb12eecbf9891748be90dc0a35003",
+     "phase5_provider_connection_catalogue_revision_guard": "dbf71eddfb7504e3a06b3573b962a4eed40e16b25685e2d9492405176e2cfe3d",

@@ -28,6 +28,12 @@ _FORBIDDEN_SECRET_KEYS = frozenset(
     }
 )
 
+_ASCII_NON_ALNUM_CODES = tuple(
+    code
+    for code in range(128)
+    if not chr(code).isascii() or not chr(code).isalnum()
+)
+
 # SQLite's built-in lower() is ASCII-only.  These are the non-ASCII Unicode
 # code points whose Python casefold() contributes ASCII alphanumeric text to
 # normalize_secret_key(); the remaining non-ASCII code points are treated as
@@ -65,76 +71,35 @@ def is_forbidden_secret_key(value: object) -> bool:
     return isinstance(value, str) and normalize_secret_key(value) in _FORBIDDEN_SECRET_KEYS
 
 
-_FORBIDDEN_KEY_SQL_ALIAS = "_bots5_normalized_key"
-_CASE_FOLD_STAGE_LIMIT = 10
-
-
 def secret_key_forbidden_sql_expression(column: str) -> str:
     """Build the SQLite equivalent of the normalized forbidden-key predicate.
 
     SQLite connections used by raw-DML probes do not have Python UDFs installed,
-    so the migration-owned triggers inline the same normalization policy.
-
-    Two properties keep the generated SQL shallow enough for the fixed
-    one-hundred-entry LEMON parser stack used by SQLite before 3.46.0:
-
-    * Separator removal is not materialised.  Every forbidden key is a run of
-      ASCII letters, so deleting an ASCII non-alphanumeric character can change
-      neither a key's per-letter occurrence counts nor whether an ASCII
-      alphanumeric character survives the residual check.  Counts and residuals
-      are therefore computed on the case-folded text directly.
-    * The Unicode case-fold replacements are applied in stages, each stage in
-      its own nested derived table, so no single expression nests deeply.
-
-    The residual non-ASCII check treats Unicode separators as removed for the
+    so the migration-owned triggers inline the same normalization policy. The
+    residual non-ASCII check treats Unicode separators as removed for the
     forbidden-key vocabulary while preserving benign keys such as ``apricotKey``.
     """
-    replacements = [
-        (code, f"'{folded}'") for code, folded in _UNICODE_CASEFOLD_ASCII_MAP
-    ]
-    stages = [
-        replacements[index : index + _CASE_FOLD_STAGE_LIMIT]
-        for index in range(0, len(replacements), _CASE_FOLD_STAGE_LIMIT)
-    ]
-    staged = f"SELECT lower(CAST({column} AS TEXT)) AS _bots5_casefold_0"
-    for depth, stage in enumerate(stages, start=1):
-        expression = f"_bots5_casefold_{depth - 1}"
-        for code, folded in stage:
-            expression = f"replace({expression}, char({code}), {folded})"
-        staged = (
-            f"SELECT {expression} AS _bots5_casefold_{depth} "
-            f"FROM ({staged}) AS _bots5_casefold_stage_{depth - 1}"
-        )
-
-    folded_column = f"_bots5_casefold_{len(stages)}"
-    residuals = []
-    for index, key in enumerate(sorted(_FORBIDDEN_SECRET_KEYS)):
-        residual = folded_column
+    expression = f"lower(CAST({column} AS TEXT))"
+    for code, folded in _UNICODE_CASEFOLD_ASCII_MAP:
+        expression = f"replace({expression}, char({code}), '{folded}')"
+    for code in _ASCII_NON_ALNUM_CODES:
+        expression = f"replace({expression}, char({code}), '')"
+    forbidden = ", ".join(f"'{key}'" for key in sorted(_FORBIDDEN_SECRET_KEYS))
+    unicode_variants = []
+    for key in sorted(_FORBIDDEN_SECRET_KEYS):
+        residual = expression
         for character in sorted(set(key)):
             residual = f"replace({residual}, '{character}', '')"
-        residuals.append(f"{residual} AS _bots5_residual_{index}")
-    normalized = (
-        f"SELECT {folded_column} AS {_FORBIDDEN_KEY_SQL_ALIAS}, "
-        + ", ".join(residuals)
-        + f" FROM ({staged}) AS _bots5_casefold_stage_{len(stages)}"
-    )
-
-    forbidden = ", ".join(f"'{key}'" for key in sorted(_FORBIDDEN_SECRET_KEYS))
-    conditions = [f"{_FORBIDDEN_KEY_SQL_ALIAS} IN ({forbidden})"]
-    for index, key in enumerate(sorted(_FORBIDDEN_SECRET_KEYS)):
         counts = " AND ".join(
-            f"length({_FORBIDDEN_KEY_SQL_ALIAS}) - "
-            f"length(replace({_FORBIDDEN_KEY_SQL_ALIAS}, '{character}', '')) = {key.count(character)}"
+            f"length({expression}) - length(replace({expression}, '{character}', '')) = {key.count(character)}"
             for character in sorted(set(key))
         )
-        conditions.append(
-            f"({counts} AND _bots5_residual_{index} NOT GLOB '*[A-Za-z0-9]*')"
+        unicode_variants.append(
+            f"({counts} AND {residual} NOT GLOB '*[A-Za-z0-9]*')"
         )
     return (
-        f"(instr(CAST({column} AS TEXT), char(0)) > 0 OR EXISTS ("
-        f"SELECT 1 FROM ({normalized}) AS _bots5_normalized WHERE "
-        + " OR ".join(conditions)
-        + "))"
+        f"(instr(CAST({column} AS TEXT), char(0)) > 0 OR "
+        f"{expression} IN ({forbidden}) OR {' OR '.join(unicode_variants)})"
     )
 
 

@@ -1,0 +1,26 @@
+...F...                                                                  [100%]
+=================================== FAILURES ===================================
+_____ test_generated_predicate_stays_within_the_fixed_parser_stack_budget ______
+
+    def test_generated_predicate_stays_within_the_fixed_parser_stack_budget():
+        """Regression guard for the SQLite 3.45.1 parser-stack overflow.
+    
+        The pre-repair generator produced a 369,679-character expression nesting 98
+        parentheses, which SQLite 3.45.1 rejected with "parser stack overflow" while
+        preparing ``CREATE TRIGGER``. This assertion fails against that implementation.
+        """
+        expression = secret_key_forbidden_sql_expression("key")
+>       assert _nesting_depth(expression) <= _MAX_GENERATED_NESTING
+E       assert 98 <= 24
+E        +  where 98 = _nesting_depth("(instr(CAST(key AS TEXT), char(0)) > 0 OR replace(replace(replace(replace(replace(replace(replace(replace(replace(rep...125), ''), char(126), ''), char(127), ''), 'e', ''), 'k', ''), 'n', ''), 'o', ''), 't', '') NOT GLOB '*[A-Za-z0-9]*'))")
+
+tests/test_secret_key_sql_conformance.py:191: AssertionError
+=============================== warnings summary ===============================
+tests/test_secret_key_sql_conformance.py::test_generated_predicate_never_misses_a_forbidden_key
+  /home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/.venv314/lib/python3.14/site-packages/pytest_asyncio/plugin.py:1216: DeprecationWarning: 'asyncio.get_event_loop_policy' is deprecated and slated for removal in Python 3.16
+    return asyncio.get_event_loop_policy()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_secret_key_sql_conformance.py::test_generated_predicate_stays_within_the_fixed_parser_stack_budget
+1 failed, 6 passed, 1 warning in 3.73s

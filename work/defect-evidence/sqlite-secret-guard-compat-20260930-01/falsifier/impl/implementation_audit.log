@@ -1,0 +1,118 @@
+marker/message audit: {
+  "phase5_capability_fact_provenance_validate_insert": {
+    "markers_present": true,
+    "declared_markers": [
+      "before insert on capability_facts",
+      "json_tree(new.provenance_json)",
+      "phase 5 capability provenance is malformed"
+    ],
+    "abort_message": "Phase 5 capability provenance is malformed",
+    "length": 12112
+  },
+  "phase5_capability_fact_provenance_validate_update": {
+    "markers_present": true,
+    "declared_markers": [
+      "before update of provenance_json on capability_facts",
+      "json_tree(new.provenance_json)",
+      "phase 5 capability provenance is malformed"
+    ],
+    "abort_message": "Phase 5 capability provenance is malformed",
+    "length": 12131
+  },
+  "phase5_model_catalogue_metadata_validate_insert": {
+    "markers_present": true,
+    "declared_markers": [
+      "before insert on model_catalogue_entries",
+      "json_tree(new.metadata_json)",
+      "phase 5 model catalogue metadata is malformed"
+    ],
+    "abort_message": "Phase 5 model catalogue metadata is malformed",
+    "length": 11222
+  },
+  "phase5_model_catalogue_metadata_validate_update": {
+    "markers_present": true,
+    "declared_markers": [
+      "before update of metadata_json on model_catalogue_entries",
+      "json_tree(new.metadata_json)",
+      "phase 5 model catalogue metadata is malformed"
+    ],
+    "abort_message": "Phase 5 model catalogue metadata is malformed",
+    "length": 11239
+  }
+}
+authoritative open invoked validators: {'schema': 1, 'behavior': 1}
+expression shape: {
+  "bytes": 10867,
+  "nesting_depth": 16,
+  "replace_calls": 185,
+  "stages": 3,
+  "has_ascii_nonalnum_constant": false,
+  "alias_": "_bots5_normalized_key",
+  "stage_limit": 10
+}
+stage-limit robustness: {
+  "1": {
+    "stages": 20,
+    "nesting": 25,
+    "missed_forbidden": [],
+    "error": null
+  },
+  "2": {
+    "stages": 11,
+    "nesting": 16,
+    "missed_forbidden": [],
+    "error": null
+  },
+  "3": {
+    "stages": 8,
+    "nesting": 14,
+    "missed_forbidden": [],
+    "error": null
+  },
+  "5": {
+    "stages": 5,
+    "nesting": 13,
+    "missed_forbidden": [],
+    "error": null
+  },
+  "9": {
+    "stages": 4,
+    "nesting": 16,
+    "missed_forbidden": [],
+    "error": null
+  },
+  "10": {
+    "stages": 3,
+    "nesting": 16,
+    "missed_forbidden": [],
+    "error": null
+  },
+  "18": {
+    "stages": 3,
+    "nesting": 24,
+    "missed_forbidden": [],
+    "error": null
+  },
+  "19": {
+    "stages": 2,
+    "nesting": 24,
+    "missed_forbidden": [],
+    "error": null
+  },
+  "20": {
+    "stages": 2,
+    "nesting": 24,
+    "missed_forbidden": [],
+    "error": null
+  },
+  "25": {
+    "stages": 2,
+    "nesting": 24,
+    "missed_forbidden": [],
+    "error": null
+  }
+}
+per-row correlation: {'benign': 'accepted', 'token': 'rejected', 'apricotKey': 'accepted', 'password': 'rejected', 'key': 'accepted', 'secret': 'rejected'}
+per-row correlation OK: True
+alias collision probe (expect ['token']): ['token']
+wrote /home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/work/defect-evidence/sqlite-secret-guard-compat-20260930-01/falsifier/impl/implementation_audit.json

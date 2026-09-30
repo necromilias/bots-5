@@ -1,0 +1,11 @@
+objects in _PHASE5_SCHEMA_OBJECTS: 44
+objects found in fresh sqlite_master: 44
+entries in _PHASE5_SCHEMA_SHA256: 44
+MISMATCH COUNT: 0
+declared-but-not-checked: []
+checked-but-not-declared: []
+--- four repaired trigger hashes (derived) ---
+phase5_capability_fact_provenance_validate_insert 831fea2f41765985d349d4dc87bab9bd9d6e440be0b03f914c36703eda70f5f8 match
+phase5_capability_fact_provenance_validate_update 5bc95210f6f6d0c6c18231bfd632bfc1cc585b68058e68caa8630c15adbedfb2 match
+phase5_model_catalogue_metadata_validate_insert 86686f757da51fd58140d221537cb0f53f75406d7d4062433b126942e5dad683 match
+phase5_model_catalogue_metadata_validate_update 87dde170a31c36cd52a493e21ed627d25bdeb16d3d48b667a6aade5ae17c3ccc match

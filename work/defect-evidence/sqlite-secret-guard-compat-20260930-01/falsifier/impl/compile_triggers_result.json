@@ -1,0 +1,48 @@
+{
+  "candidate_345": {
+    "version": "3.45.1",
+    "phase5_capability_fact_provenance_validate_insert": {
+      "rc": 0,
+      "ok": true,
+      "error": ""
+    },
+    "phase5_capability_fact_provenance_validate_update": {
+      "rc": 0,
+      "ok": true,
+      "error": ""
+    },
+    "phase5_model_catalogue_metadata_validate_insert": {
+      "rc": 0,
+      "ok": true,
+      "error": ""
+    },
+    "phase5_model_catalogue_metadata_validate_update": {
+      "rc": 0,
+      "ok": true,
+      "error": ""
+    }
+  },
+  "baseline_345": {
+    "version": "3.45.1",
+    "phase5_capability_fact_provenance_validate_insert": {
+      "rc": 1,
+      "ok": false,
+      "error": "parser stack overflow"
+    },
+    "phase5_capability_fact_provenance_validate_update": {
+      "rc": 1,
+      "ok": false,
+      "error": "parser stack overflow"
+    },
+    "phase5_model_catalogue_metadata_validate_insert": {
+      "rc": 1,
+      "ok": false,
+      "error": "parser stack overflow"
+    },
+    "phase5_model_catalogue_metadata_validate_update": {
+      "rc": 1,
+      "ok": false,
+      "error": "parser stack overflow"
+    }
+  }
+}

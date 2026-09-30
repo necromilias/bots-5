@@ -1,0 +1,128 @@
+{
+ "docs": 1507,
+ "keys": 6927,
+ "diffs": 0,
+ "python_disagreements": 95,
+ "samples": [
+  [
+   "{\"\\ud83d\\ude42\": [1.5, {\"as_n\": \"\", \"edw\": 1.5, \"setaevlcreu\": 1.5, \"pkst1ri\": 1}, {\"!i\\u1e9al\": 0, \"se\": false}, [\"x\", true, 0, -5, \"x\"]], \"\\u1e9ae0\\ufb03er1a\": [[\"x\"], null], \".\": {}}",
+   1,
+   1,
+   false
+  ],
+  [
+   "[{\"opssward\": [], \"erlvcetasue\": []}, 1]",
+   2,
+   2,
+   false
+  ],
+  [
+   "{\"etselaevcur\": null}",
+   1,
+   1,
+   false
+  ],
+  [
+   "[1, {\"etseavrlceu\": 1.5}]",
+   1,
+   1,
+   false
+  ],
+  [
+   "[false, [], true, {\"pyakie\": [null], \"\\u0130!\": 1.5, \"\\\\u0000CBewwo\": \"password\"}]",
+   1,
+   1,
+   false
+  ],
+  [
+   "[{\"pkiaey\": -5}, []]",
+   1,
+   1,
+   false
+  ],
+  [
+   "{\"\\ud83d\\ude42XC\": {\"ueaiyvaepkl\": 0}, \"Yrie.ecs\": {}, \"X\\u00df\\ud83d\\ude42r_e\\\\u0000\": \"x\"}",
+   1,
+   1,
+   false
+  ],
+  [
+   "{\"npr__\": [{}, [false, 1.5, 1, \"password\", true], null, [\"x\", null, \"x\"]], \"ke \": false, \"\\u212al\\u0130\\\\u0000 \": [], \"avpiekaleuy\": [false]}",
+   1,
+   1,
+   false
+  ],
+  [
+   "{\"krneohefstre\": 1, \"ta-a\": false, \"ksfenroerthe\": {\"Y\\u212aBt9.\": [], \"n\\u212attX\": 1}}",
+   2,
+   2,
+   false
+  ],
+  [
+   "[[-5, [\"password\", 1.5, 0], [0, null, 0], {\"-ltwe\\u00e90\": false, \"\": false, \"ee\": null, \"nwa\\ud83d\\ude42p\": \"\"}, {\"enleicctstre\": false, \"apike\\u00dfyv!a lu e!\": null, \"asktensccoe\": \"x\", \"\": null}], [[]]]",
+   2,
+   2,
+   false
+  ],
+  [
+   "{\"ecvsuleraet\": [\"password\", [1, null, \"password\", true], [\"password\", null, 1, null, \"x\"]], \"se\\u017fcret\": \"password\"}",
+   1,
+   1,
+   false
+  ],
+  [
+   "[{\"pkyaei\": [\"\", \"password\"], \"X9e_s\": {\"\": 1, \"\\u00e9\\u00dfX\\u00dfs\": 1}}, \"\", 1.5, [], 1.5]",
+   1,
+   1,
+   false
+  ],
+  [
+   "[[{\"s_tXkye \": -5}, [-5, \"\", -5, true, 1], {\"cr\": null, \"keipya\": \"\", \"A\\u00dfwysw\": 1.5}, [false]], [[], [], {\"\": 1.5, \"0 Xc\\ud83d\\ude42nd\\ufb03\": false, \"ne\": \"password\"}, \"password\"]]",
+   1,
+   1,
+   false
+  ],
+  [
+   "[[[\"password\", \"password\"], 1, [1.5, 0], {\".\\u00e9\\u00e9\": 1, \"\\u00e9\": true, \"payeki\": 1.5, \"\": 1.5}, [\"\", false]], {\"ert\\\\u0000i-\": [\"x\", 1.5]}, \"password\", true]",
+   1,
+   1,
+   false
+  ],
+  [
+   "{\"siltetneccer\": true, \"\": false}",
+   1,
+   1,
+   false
+  ],
+  [
+   "[{\"t-crt\": {\"\": null}, \"\\u017fc\\u1e9aa\": [0, 0, \"x\", -5], \"SECSSRET_VALU_E\": 1, \"neacecsotsk\": {}}, 0]",
+   1,
+   1,
+   false
+  ],
+  [
+   "{\"sraodswp\": \"password\", \"c\": [\"x\", 0, [\"password\"], [0, false, -5]]}",
+   1,
+   1,
+   false
+  ],
+  [
+   "{\"rXnacc\": -5, \"ct0Y\": null, \"ekton\": null, \"creset\": [[null], true, [\"x\"], \"password\"]}",
+   2,
+   2,
+   false
+  ],
+  [
+   "[{\"sesnccaokte\": {\"nedsc\": 0}, \"r.r\": {\"cl\\u00dfie\\u017fntse c_ret\": 0}, \"p-_9-tp\": [\"password\", null, false, \"x\"]}, [{}, null, -5], null]",
+   1,
+   1,
+   false
+  ],
+  [
+   "{\" io0\": {}, \"naektpoi\": {\"teneacsckos\": [\"\", true], \"en.\\u00dfiik!\": false}, \"api_k\\u017fe!y\": [{\"nacscesotke\": false, \"l\": -5}, {\"ZdeZ\\u00e9\": 0, \"0nA!oie\": 1, \"irihatzoutaon\": \"x\"}], \"\": [[], 1.5, 0]}",
+   4,
+   4,
+   false
+  ]
+ ]
+}

@@ -1,0 +1,76 @@
+........................................................................ [  4%]
+........................................................................ [  9%]
+........................................................................ [ 14%]
+........................................................................ [ 19%]
+.........................................................s.............. [ 23%]
+........................................................................ [ 28%]
+........................................................................ [ 33%]
+........................................................................ [ 38%]
+........................................................................ [ 42%]
+........................................................................ [ 47%]
+........................................................................ [ 52%]
+........................................................................ [ 57%]
+........................................................................ [ 61%]
+........................................................................ [ 66%]
+........................................................................ [ 71%]
+........................................................................ [ 76%]
+........................................................................ [ 80%]
+........................................................................ [ 85%]
+........................................................................ [ 90%]
+........................................................................ [ 95%]
+........................................................................ [100%]
+=============================== warnings summary ===============================
+tests/test_audit_blockers.py::test_unexpected_orchestration_error_persists_terminal_failed_run
+  /home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/.venv314/lib/python3.14/site-packages/pytest_asyncio/plugin.py:1216: DeprecationWarning: 'asyncio.get_event_loop_policy' is deprecated and slated for removal in Python 3.16
+    return asyncio.get_event_loop_policy()
+
+tests/test_desktop_draft1.py: 2649 warnings
+tests/test_phase4.py: 389 warnings
+tests/test_phase7_desktop.py: 89 warnings
+tests/test_phase9_desktop_slice_e.py: 10706 warnings
+tests/test_phase9_restore.py: 294 warnings
+  /home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/.venv314/lib/python3.14/site-packages/qasync/__init__.py:489: DeprecationWarning: 'asyncio.iscoroutinefunction' is deprecated and slated for removal in Python 3.16; use inspect.iscoroutinefunction() instead
+    if asyncio.iscoroutinefunction(callback):
+
+tests/test_phase9_import_queue.py: 24 warnings
+  /home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/.venv314/lib/python3.14/site-packages/pytest_asyncio/plugin.py:874: DeprecationWarning: 'asyncio.get_event_loop_policy' is deprecated and slated for removal in Python 3.16
+    _restore_event_loop_policy(asyncio.get_event_loop_policy()),
+
+tests/test_phase9_import_queue.py: 24 warnings
+  /home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/.venv314/lib/python3.14/site-packages/pytest_asyncio/plugin.py:772: DeprecationWarning: 'asyncio.get_event_loop_policy' is deprecated and slated for removal in Python 3.16
+    old_loop_policy = asyncio.get_event_loop_policy()
+
+tests/test_phase9_import_queue.py: 24 warnings
+  /home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/.venv314/lib/python3.14/site-packages/pytest_asyncio/plugin.py:777: DeprecationWarning: 'asyncio.set_event_loop_policy' is deprecated and slated for removal in Python 3.16
+    asyncio.set_event_loop_policy(policy)
+
+tests/test_phase9_import_queue.py: 24 warnings
+  /home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/.venv314/lib/python3.14/site-packages/pytest_asyncio/plugin.py:1183: DeprecationWarning: 'asyncio.get_event_loop_policy' is deprecated and slated for removal in Python 3.16
+    loop = asyncio.get_event_loop_policy().new_event_loop()
+
+tests/test_phase9_import_queue.py: 24 warnings
+  /home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/.venv314/lib/python3.14/site-packages/pytest_asyncio/plugin.py:889: DeprecationWarning: 'asyncio.get_event_loop_policy' is deprecated and slated for removal in Python 3.16
+    policy = asyncio.get_event_loop_policy()
+
+tests/test_phase9_import_queue.py: 24 warnings
+  /home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/.venv314/lib/python3.14/site-packages/pytest_asyncio/plugin.py:794: DeprecationWarning: 'asyncio.set_event_loop_policy' is deprecated and slated for removal in Python 3.16
+    asyncio.set_event_loop_policy(old_loop_policy)
+
+tests/test_phase9_import_queue.py: 24 warnings
+  /home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/.venv314/lib/python3.14/site-packages/pytest_asyncio/plugin.py:942: DeprecationWarning: 'asyncio.get_event_loop_policy' is deprecated and slated for removal in Python 3.16
+    policy = asyncio.get_event_loop_policy()
+
+tests/test_phase9_import_queue.py: 24 warnings
+  /home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/.venv314/lib/python3.14/site-packages/pytest_asyncio/plugin.py:966: DeprecationWarning: 'asyncio.set_event_loop_policy' is deprecated and slated for removal in Python 3.16
+    asyncio.set_event_loop_policy(previous_policy)
+
+tests/test_phase9_import_queue.py: 24 warnings
+  /home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/.venv314/lib/python3.14/site-packages/pytest_asyncio/plugin.py:978: DeprecationWarning: 'asyncio.get_event_loop_policy' is deprecated and slated for removal in Python 3.16
+    policy = asyncio.get_event_loop_policy()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+1511 passed, 1 skipped, 14344 warnings in 979.58s (0:16:19)
+Task was destroyed but it is pending!
+task: <Task pending name='Task-3541' coro=<RestoreHandoffCoordinator.run() running at /home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/src/bots5/desktop/phase9.py:981> wait_for=<Future pending cb=[Task.task_wakeup()]> cb=[set.discard()]>
+Task was destroyed but it is pending!
+task: <Task pending name='Task-3986' coro=<RestoreHandoffCoordinator.run() running at /home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/src/bots5/desktop/phase9.py:981> wait_for=<Future pending cb=[Task.task_wakeup()]> cb=[set.discard()]>

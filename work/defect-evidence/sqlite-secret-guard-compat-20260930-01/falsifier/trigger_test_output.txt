@@ -1,0 +1,13 @@
+docs: 135
+baseline(3.50) vs candidate(3.50) trigger diffs: 0
+baseline-vs-python MISSED secrets (SQL accepted, python forbidden): 0
+baseline-vs-python OVER-REJECTIONS (python benign, SQL rejected): 4
+   OVER '{"nekto":1}'
+   OVER '{"enotk":1}'
+   OVER '{"pa\\u1e98ssord":1}'
+   OVER '{"password\\u0000x":1}'
+python sqlite version 3.50.4
+3.45.1 candidate trigger CREATE OK; replay rows 135
+candidate(3.50) vs candidate(3.45.1) diffs: 0
+3.45.1 baseline trigger CREATE: False
+wrote trigger_results.json

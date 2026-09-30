@@ -1,0 +1,8 @@
+.......                                                                  [100%]
+=============================== warnings summary ===============================
+tests/test_secret_key_sql_conformance.py::test_generated_predicate_never_misses_a_forbidden_key
+  /home/mick/Documents/Codex/2026-09-03/bots-5-linux-v0.1-phase1/.venv314/lib/python3.14/site-packages/pytest_asyncio/plugin.py:1216: DeprecationWarning: 'asyncio.get_event_loop_policy' is deprecated and slated for removal in Python 3.16
+    return asyncio.get_event_loop_policy()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+7 passed, 1 warning in 1.03s
