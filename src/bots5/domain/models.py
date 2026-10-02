@@ -4,6 +4,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from decimal import Decimal
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # R-15: SearchFilters imports .models, so the domain window-state model
+    # references it only under typing to keep the import graph acyclic.
+    from .search import SearchFilters
 
 
 class MessageRole(StrEnum):
@@ -20,6 +26,25 @@ class MessageState(StrEnum):
     INCOMPLETE = "incomplete"
     TRUNCATED = "truncated"
     ABORTED = "aborted"
+    # Phase 11 fork R-11 (lossless message deletion): a deleted message becomes a
+    # tombstone that keeps its lineage and sequence, so a transcript can still
+    # show that something was removed without losing structural continuity.
+    # The Phase 9 `messages_validate_insert` trigger enumerates the allowed
+    # states, so this value is owned by the 0014 tombstone revision and by the
+    # phase9_schema exact-DDL checker -- it is not a model-only change.
+    DELETED = "deleted"
+
+
+class ChatSort(StrEnum):
+    """Alternate sort orders for the chat list.
+
+    RECENT (default): Pins float to top, then by last activity (updated_at DESC, id DESC).
+    CREATION: Newest first by creation time (created_at DESC, id DESC).
+    TITLE: Case-insensitive ascending title, id DESC tiebreak, locale-free.
+    """
+    RECENT = "recent"
+    CREATION = "creation"
+    TITLE = "title"
 
 
 class AttemptState(StrEnum):
@@ -39,10 +64,45 @@ class Chat:
     head_message_id: str | None = None
     revision: int = 0
     archived_at: datetime | None = None
+    # Phase 11 M3 (F4/F5): organisation metadata.  A chat is in AT MOST ONE
+    # folder (flat, no nesting) and carries at most one floating pin.  Both
+    # fields default to "unorganised" so every pre-M3 construction site keeps
+    # its exact meaning.
+    folder_id: str | None = None
+    is_pinned: bool = False
 
     def __post_init__(self) -> None:
         if self.revision < 0:
             raise ValueError("chat revision must be nonnegative")
+
+
+@dataclass(frozen=True, slots=True)
+class Folder:
+    """Phase 11 M3 (F4): one flat organisation folder."""
+
+    id: str
+    name: str
+    created_at: datetime
+    sequence: int
+
+    def __post_init__(self) -> None:
+        if self.sequence < 1:
+            raise ValueError("folder sequence must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class ChatDeletionInventory:
+    """Phase 11 M3 (F7): the loss inventory for one whole-chat deletion.
+
+    Read-only projection computed BEFORE a deletion is admitted, so the
+    deliberate confirmation dialog can state exactly what is lost.
+    """
+
+    chat_id: str
+    title: str
+    message_count: int
+    attachment_count: int
+    generation_attempt_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,12 +209,27 @@ class WorkspaceWindowState:
     inspector_open: bool = False
     inspector_message_id: str | None = None
     inspector_leaf_message_id: str | None = None
+    # Phase 11 M4b: restored presentation plane (0016_phase11_workspace_state).
+    maximized: bool = False
+    transcript_scroll_position: int | None = None
+    # Phase 11 fork R-15: faithful search-state restore plane
+    # (0018_phase11_search_state).  The full SearchFilters value object is
+    # carried so every one of its thirteen fields survives a restart; the
+    # open/closed panel state and the result pagination cursor round-trip
+    # alongside it.  All four are advisory presentation state and default to
+    # "nothing restored".
+    search_open: bool = False
+    search_query: str | None = None
+    search_filters: SearchFilters | None = None
+    search_cursor: str | None = None
 
     def __post_init__(self) -> None:
         if not self.window_id:
             raise ValueError("workspace window id must not be empty")
         if self.ordinal < 0:
             raise ValueError("workspace window ordinal must be nonnegative")
+        if self.transcript_scroll_position is not None and self.transcript_scroll_position < 0:
+            raise ValueError("workspace transcript scroll position must be nonnegative")
         if self.geometry is not None:
             if len(self.geometry) != 4 or not all(isinstance(value, int) for value in self.geometry):
                 raise ValueError("workspace geometry must contain four integers")

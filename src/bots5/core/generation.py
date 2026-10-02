@@ -7,6 +7,8 @@ from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict
 
+from bots5.domain.generation_settings_registry import GenerationSettingsPayload
+
 
 class GenerationRequest(BaseModel):
     model_config = ConfigDict(frozen=True)
@@ -36,6 +38,12 @@ class GenerationRequest(BaseModel):
     manual_overrides: dict[str, object] | None = None
     omitted_settings: dict[str, str] | None = None
     timeout_seconds: float | None = None
+    # Phase 11 scope amendment: typed, validated, capability-resolved
+    # generation settings.  Only capability-confirmed settings are populated;
+    # the model forbids unknown fields so adapters can never forward
+    # unchecked dictionaries into a provider payload.
+    generation_settings: GenerationSettingsPayload | None = None
+    generation_setting_states: dict[str, str] | None = None
     # Phase 6: already-built adapter-owned request material.  Providers must
     # use this verbatim; the field is optional for Phase 1-5 compatibility.
     system_prompt: str | None = None

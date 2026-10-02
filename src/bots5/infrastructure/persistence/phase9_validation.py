@@ -118,6 +118,12 @@ def _validate_composed_native_graph(connection) -> None:
             MessageState.SENT.value,
             MessageState.FAILED.value,
             MessageState.ABORTED.value,
+            # The 0014 tombstone migration admits 'deleted' for BOTH roles, so the
+            # startup validator must accept it too.  Without this, persisting a
+            # user-message tombstone leaves a database that this same validator
+            # refuses on the next open - the schema would admit a state the
+            # integrity boundary rejects.
+            MessageState.DELETED.value,
         }:
             _fail(f"user message {message_id} has invalid state {row['state']}")
         if row["role"] == MessageRole.ASSISTANT.value and row["state"] not in {

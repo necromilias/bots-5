@@ -595,10 +595,12 @@ def _archive_snapshot(attempt: GenerationAttempt, user_content: str | None = Non
     version = parsed.get("snapshot_version")
     if version is not None and (type(version) is not int or type(version) is bool):
         return {"status": "unsupported"}
-    if version not in {None, 2, 3}:
+    # Phase 11 scope amendment: v4 is the additive generation-settings
+    # snapshot.  It projects the complete normalized settings evidence.
+    if version not in {None, 2, 3, 4}:
         return {"status": "unsupported"}
     try:
-        if version in {2, 3}:
+        if version in {2, 3, 4}:
             from bots5.infrastructure.persistence.phase3_validation import validate_request_snapshot
             validated = validate_request_snapshot(
                 attempt_id=attempt.id, chat_id=attempt.chat_id,
@@ -632,6 +634,8 @@ def _archive_snapshot(attempt: GenerationAttempt, user_content: str | None = Non
             if version == 3:
                 result["settings_revisions"] = validated.get("settings_revisions")
                 result["context"] = _safe_context(validated)
+            if version == 4:
+                result["generation_settings"] = validated.get("generation_settings")
             return result
         from bots5.infrastructure.persistence.phase3_validation import is_phase3_record, validate_request_snapshot
         if is_phase3_record(backend_id=attempt.backend_id, provider_id=attempt.provider_id, snapshot=parsed):

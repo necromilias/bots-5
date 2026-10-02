@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 
 class BackendType(StrEnum):
@@ -201,6 +201,12 @@ def validate_capability_value(key: str, state: CapabilityState, value: object) -
         raise ValueError("unsupported or unknown capability must not carry a limit")
 
 PHASE5_SNAPSHOT_VERSION = 2
+#: Phase 11 scope amendment: additive request-snapshot version carrying the
+#: closed ``generation_settings`` evidence object on top of the frozen v2
+#: contract.  Emitted only when at least one registry-driven (extended)
+#: setting is configured, so plain v2 requests are byte-identical to the
+#: pre-amendment behaviour.
+PHASE11_SNAPSHOT_VERSION = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,10 +290,29 @@ class ResolvedCapability:
 
 @dataclass(frozen=True, slots=True)
 class GenerationSettings:
+    """Generation settings at one persistence scope.
+
+    The four legacy fields keep their exact pre-amendment contract (frozen
+    columns, validation and evidence schema).  Additional normalized settings
+    from the Phase 11 registry ride ``extra`` — a closed, registry-validated
+    mapping, never a free-form escape hatch.
+    """
+
     temperature: float | None = None
     max_output_tokens: int | None = None
     reasoning_effort: Literal["none"] | None = None
     timeout_seconds: float | None = None
+    extra: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Freeze the extra mapping defensively so a resolved settings object
+        # cannot be mutated through a shared reference.
+        object.__setattr__(self, "extra", dict(self.extra))
+
+    def with_extra(self, extra: Mapping[str, object]) -> "GenerationSettings":
+        merged = dict(self.extra)
+        merged.update({key: value for key, value in extra.items() if value is not None})
+        return replace(self, extra=merged)
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,14 +322,25 @@ class ResolvedGenerationSettings:
     reasoning_effort: Literal["none"] | None
     timeout_seconds: float | None
     provenance: dict[str, str]
+    extra: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "extra", dict(self.extra))
 
     def as_dict(self) -> dict[str, object]:
+        """Legacy evidence view: exactly the four frozen pre-amendment keys."""
         return {
             "temperature": self.temperature,
             "max_output_tokens": self.max_output_tokens,
             "reasoning_effort": self.reasoning_effort,
             "timeout_seconds": self.timeout_seconds,
         }
+
+    def as_full_dict(self) -> dict[str, object]:
+        """Complete normalized view including registry-driven settings."""
+        result = self.as_dict()
+        result.update(self.extra)
+        return result
 
 
 @dataclass(frozen=True, slots=True)

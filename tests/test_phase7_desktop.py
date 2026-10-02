@@ -19,6 +19,7 @@ from bots5.core.errors import (
     SearchStaleIndex,
     SearchUnavailable,
 )
+from bots5.core.events import CoreEvent
 from bots5.desktop.window import MainWindow
 from bots5.domain.models import Chat, Message, MessageRole, MessageState
 from bots5.domain.search import (
@@ -580,6 +581,48 @@ def test_stale_cursor_expires_only_pagination_and_fresh_search_remains_available
             assert application.search_calls[-1][3] is None
             assert panel.status_label.property("condition") == "VALID"
             assert panel.search_button.isEnabled()
+        finally:
+            await _dispose(window)
+
+    _run_qasync(qt_application, scenario())
+
+
+def test_chat_title_changed_event_propagates_new_title_to_header_and_rail():
+    """A-1a propagation: a chat_title_changed event refreshes header and rail titles."""
+    qt_application = QApplication.instance() or QApplication([])
+
+    async def scenario() -> None:
+        application = FakeSearchApplication()
+        window = MainWindow(application)
+        try:
+            window.show()
+            await asyncio.sleep(0)
+            window._current_chat_id = application.chat.id
+            window._current_chat = application.chat
+            window._chat_ids = [application.chat.id]
+            window.rail.set_chats((application.chat,), application.chat.id)
+            window._sync_chat_header(application.chat)
+
+            renamed = replace(application.chat, title="Renamed desktop chat")
+            application.chat = renamed
+            await window._handle_event(
+                CoreEvent(
+                    event_id="rename-event",
+                    sequence=1,
+                    kind="chat_title_changed",
+                    occurred_at=NOW,
+                    payload={
+                        "chat_id": renamed.id,
+                        "title": "Renamed desktop chat",
+                    },
+                )
+            )
+
+            # Feature-positive: the header and the rail both carry the renamed
+            # title, and the window tracks the renamed chat as current.
+            assert window.chat_title.text() == "Renamed desktop chat"
+            assert window.rail.chat_list.item(0).text() == "Renamed desktop chat"
+            assert window._current_chat is renamed
         finally:
             await _dispose(window)
 

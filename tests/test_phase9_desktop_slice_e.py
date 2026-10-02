@@ -24,12 +24,14 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt, QThread
+from PySide6.QtCore import QPoint, Qt, QThread
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QAbstractButton,
     QApplication,
     QFileDialog,
+    QListWidgetItem,
+    QMenu,
     QMessageBox,
     QPushButton,
 )
@@ -45,6 +47,7 @@ from bots5.core.import_queue import (
     QueuedImportDisplay,
 )
 from bots5.desktop.phase9 import Phase9ProgressBridge
+import bots5.desktop.widgets as widgets_module
 from bots5.desktop.widgets import continuation_readiness_needs_resolution
 from bots5.desktop.window import MainWindow
 from bots5.domain.models import MessageRole
@@ -73,7 +76,14 @@ def _run_qasync(qt_application: QApplication, operation) -> None:
         event_loop.run_until_complete(operation)
 
 
-async def _wait_until(predicate, *, timeout: float = 2.0, what: str = "state") -> None:
+async def _wait_until(predicate, *, timeout: float = 15.0, what: str = "state") -> None:
+    # The bound is generous on purpose: these proofs drive real async desktop
+    # work (store writes, backup verification, restore handoff) and run inside
+    # the full-suite process, where cumulative load can delay an otherwise
+    # correct transition well past a couple of seconds. The bound only limits
+    # how long a genuinely absent state is awaited; every assertion is
+    # unchanged, and call sites that need a tighter or looser bound still pass
+    # an explicit timeout.
     deadline = asyncio.get_running_loop().time() + timeout
     while not predicate():
         if asyncio.get_running_loop().time() >= deadline:
@@ -1142,6 +1152,42 @@ def test_phase9_ui_inventory_exposes_no_destructive_override_or_cleanup_surface(
             dock.show()
             await asyncio.sleep(0)
 
+            # The rail context menu is constructed on demand only, so this
+            # inventory proof must force its construction here: otherwise the
+            # additive "Rename Title…"/"Duplicate Chat…" entries never exist as
+            # QActions and the scans below silently miss them.  The substituted
+            # menu class dismisses instead of blocking in exec(), and the real
+            # QMenu (parented to the chat list) stays behind for the scan.
+            rail_item = QListWidgetItem("Inventory chat")
+            rail_item.setData(Qt.ItemDataRole.UserRole, "inventory-chat-id")
+            window.rail.chat_list.addItem(rail_item)
+
+            class _InventoryContextMenu(QMenu):
+                def exec(self, *args, **kwargs):  # noqa: ANN002, ANN003
+                    return None  # dismiss the on-demand menu; nothing is invoked
+
+            original_menu_class = widgets_module.QMenu
+            chat_list = window.rail.chat_list
+            chat_list.itemAt = lambda pos: rail_item
+            try:
+                widgets_module.QMenu = _InventoryContextMenu
+                window.rail._show_chat_context_menu(QPoint(0, 0))
+            finally:
+                widgets_module.QMenu = original_menu_class
+                del chat_list.itemAt
+
+            constructed_menus = chat_list.findChildren(QMenu)
+            assert len(constructed_menus) == 1
+            menu_entries = [
+                action.text() for action in constructed_menus[0].actions() if action.text()
+            ]
+            # The on-demand menu carries the two landed Phase 9 export entries
+            # and the two additive Phase 11 A-1 entries.
+            assert "Export Transcript…" in menu_entries
+            assert "Export Archive…" in menu_entries
+            assert "Rename Title…" in menu_entries
+            assert "Duplicate Chat…" in menu_entries
+
             forbidden = (
                 "override",
                 "destructive",
@@ -1177,8 +1223,9 @@ def test_phase9_ui_inventory_exposes_no_destructive_override_or_cleanup_surface(
                 "importQueueClearHistoryButton",
             }
 
-            # The chat rail carries the two additive export context actions
-            # and nothing else Phase 9 related.
+            # The chat rail carries the on-demand context menu with the two
+            # additive export context actions (plus the A-1 entries above) and
+            # nothing else Phase 9 related.
             assert window.rail.chat_list.contextMenuPolicy() is Qt.ContextMenuPolicy.CustomContextMenu
         finally:
             await _dispose(window)

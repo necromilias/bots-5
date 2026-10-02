@@ -74,8 +74,8 @@ from tests._authority_test_support import upgrade_to
 
 
 REPO = Path(__file__).resolve().parents[1]
-HEAD = "0009_phase6_context_attachments"
-CURRENT_HEAD = "0012_phase9_archive_import"
+HEAD = "0018_phase11_search_state"
+CURRENT_HEAD = "0019_phase11_generation_settings"
 PRIOR_REVISIONS = (
     "0001_desktop_state",
     "0002_conversation_lineage",
@@ -85,6 +85,12 @@ PRIOR_REVISIONS = (
     "0006_phase4_workspace",
     "0007_phase5_provider_model_configuration",
     "0008_catalogue_refresh_outcomes",
+    "0009_phase6_context_attachments",
+    "0010_phase7_search_navigation",
+    "0011_phase8_inspector_state",
+    "0012_phase9_archive_import",
+    "0013_phase11_organisation",
+    "0014_phase11_message_tombstone",
 )
 ALL_REVISIONS = PRIOR_REVISIONS + (HEAD,)
 PRIOR_MIGRATION_SHA256 = {

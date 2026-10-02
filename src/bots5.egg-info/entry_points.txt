@@ -1,0 +1,3 @@
+[console_scripts]
+bots5 = bots5.cli:main
+bots5-desktop = bots5.bootstrap.desktop:main

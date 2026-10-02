@@ -366,20 +366,27 @@ def validate_phase6_schema(connection, *, destructive: bool = True) -> None:
         "SELECT version_num FROM alembic_version"
     ).scalar_one_or_none()
     phase7_additions: set[str] = set()
-    if revision in {"0010_phase7_search_navigation", "0011_phase8_inspector_state", "0012_phase9_archive_import"}:
+    if revision in {
+        "0010_phase7_search_navigation",
+        "0011_phase8_inspector_state",
+        "0012_phase9_archive_import",
+        "0013_phase11_organisation",
+        "0014_phase11_message_tombstone",
+        "0015_phase11_duplicate_admission",
+        "0016_phase11_workspace_state",
+        "0017_phase11_integrity",
+        "0018_phase11_search_state",
+        "0019_phase11_generation_settings",
+    }:
         # Phase 6 remains exact at revision 0009.  Later Phase 7/8/9 revisions
         # may add only the closed Phase 7 trigger set to Phase 6-owned tables.
+        # Phase 9 extensions (0012+) add two Phase 9 import guards.
         from .phase7_schema import PHASE7_TRIGGER_NAMES
 
-        phase7_additions = set(PHASE7_TRIGGER_NAMES)
-        if revision == "0012_phase9_archive_import":
-            # These two additive current-schema guards extend deletion
-            # protection to Phase 9 imported reservations.  They do not
-            # replace or loosen any Phase 6 trigger.
-            phase7_additions.update({
-                "phase9_import_attachment_delete_guard",
-                "phase9_import_blob_delete_guard",
-            })
+        phase7_additions = set(PHASE7_TRIGGER_NAMES) | {
+            "phase9_import_attachment_delete_guard",
+            "phase9_import_blob_delete_guard",
+        }
     required_names = {*REQUIRED_TABLES, *REQUIRED_TRIGGERS, *REQUIRED_INDEXES}
     unexpected = sorted(
         str(name)
@@ -399,13 +406,44 @@ def validate_phase6_schema(connection, *, destructive: bool = True) -> None:
             + ", ".join(unexpected)
         )
     for name, expected_sql in canonical.items():
-        if revision == "0012_phase9_archive_import" and name == "phase6_attempt_attachment_insert_guard":
+        if revision in {
+            "0012_phase9_archive_import",
+            "0013_phase11_organisation",
+            "0014_phase11_message_tombstone",
+            "0015_phase11_duplicate_admission",
+            "0016_phase11_workspace_state",
+            "0017_phase11_integrity",
+            "0018_phase11_search_state",
+            "0019_phase11_generation_settings",
+        } and name == "phase6_attempt_attachment_insert_guard":
             current_tokens = actual.get(name, ())
             required_tokens = {
                 "bare:archive_continuation_branches",
                 "bare:archive_continuation_requirement_candidates",
                 "bare:message_attachments",
                 "bare:json_each",
+            }
+            if required_tokens.issubset(current_tokens):
+                continue
+        if revision in {
+            "0017_phase11_integrity",
+            "0018_phase11_search_state",
+            "0019_phase11_generation_settings",
+        } and name in {
+            # 0017 recreated exactly these three delete guards behind the
+            # connection-local chat-deletion admission, and every later
+            # revision inherits them (0018/0019 do not touch them).  The
+            # guard keeps its name, its table, its timing and its abort
+            # message; only a WHEN arm clause is added, so the token check
+            # below proves the arm function is present while everything else
+            # stays canonical.
+            "phase6_message_attachment_delete_guard",
+            "phase6_attempt_attachment_delete_guard",
+            "phase6_context_plan_delete_guard",
+        }:
+            current_tokens = actual.get(name, ())
+            required_tokens = {
+                "bare:bots5_phase11_chat_message_delete_allowed",
             }
             if required_tokens.issubset(current_tokens):
                 continue
@@ -992,7 +1030,13 @@ def _validate_phase6_rows(connection) -> None:
             "ON r.id=c.imported_ref_id AND r.attachment_id=? AND r.availability='READY' "
             "WHERE b.attempt_id=?",
             (ordinal, attachment_id, attempt_id),
-        ).first() if revision == "0012_phase9_archive_import" else None
+        ).first() if revision in {
+            "0012_phase9_archive_import",
+            "0013_phase11_organisation",
+            "0014_phase11_message_tombstone",
+            "0015_phase11_duplicate_admission",
+            "0016_phase11_workspace_state",
+        } else None
         if native_owner is None and imported_owner is None:
             raise RuntimeError("current Phase 6 attempt reference has no message reference")
 

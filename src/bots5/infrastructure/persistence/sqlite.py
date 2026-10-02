@@ -19,6 +19,7 @@ from threading import RLock
 from sqlalchemy import Engine, create_engine, delete, event, func, insert, select, text, update
 from sqlalchemy.pool import NullPool
 from sqlalchemy.exc import DBAPIError, IntegrityError
+from datetime import UTC, datetime
 from uuid6 import uuid7
 
 from bots5.core.errors import (
@@ -39,6 +40,9 @@ from bots5.domain.models import (
     Attachment,
     AttachmentBlob,
     Chat,
+    ChatDeletionInventory,
+    ChatSort,
+    Folder,
     GenerationAttempt,
     Message,
     MessageRole,
@@ -77,6 +81,10 @@ from .schema import (
     capability_overrides,
     chat_model_generation_config,
     chat_model_selection,
+    chat_drafts,
+    dock_layout,
+    keybinding_overrides,
+    font_scale_settings,
     catalogue_refresh_state,
     chats,
     generation_attempts,
@@ -128,6 +136,10 @@ from .transition_guard import (
     clear_phase9_import_graph,
     arm_phase9_attachment_healing,
     clear_phase9_attachment_healing,
+    arm_phase11_duplicate_messages,
+    clear_phase11_duplicate_messages,
+    arm_phase11_chat_deletion,
+    clear_phase11_chat_deletion,
 )
 from .phase5_store import (
     Phase5StoreMixin,
@@ -144,6 +156,15 @@ from .phase7_schema import (
     SEARCH_SCHEMA_VERSION,
     SEARCH_TOKENIZER_VERSION,
     validate_phase7_schema,
+)
+from .migration_runner import (
+    _PHASE11_DUPLICATE_HEAD,
+    _PHASE11_GENERATION_SETTINGS_HEAD,
+    _PHASE11_INTEGRITY_HEAD,
+    _PHASE11_ORG_HEAD,
+    _PHASE11_SEARCH_HEAD,
+    _PHASE11_TOMBSTONE_HEAD,
+    _PHASE11_WORKSPACE_HEAD,
 )
 from .phase7_validation import validate_phase7_rebuild
 from .search import (
@@ -266,6 +287,21 @@ _PHASE4_WORKSPACE_NOT_NULL = {
 }
 _PHASE8_REVISION = "0011_phase8_inspector_state"
 _PHASE9_REVISION = "0012_phase9_archive_import"
+# Every revision at or beyond Phase 9 carries the Phase 7 search-visible tables.
+# Omitting a head here silently skips search-state seeding on open, which leaves
+# the in-memory source revision at 0 while the database holds the real counter.
+_PHASE9_OR_LATER_REVISIONS = frozenset(
+    {
+        _PHASE9_REVISION,
+        _PHASE11_ORG_HEAD,
+        _PHASE11_TOMBSTONE_HEAD,
+        _PHASE11_DUPLICATE_HEAD,
+        _PHASE11_WORKSPACE_HEAD,
+        _PHASE11_INTEGRITY_HEAD,
+        _PHASE11_SEARCH_HEAD,
+        _PHASE11_GENERATION_SETTINGS_HEAD,
+    }
+)
 _PHASE8_WORKSPACE_COLUMN_TYPES = {
     "inspector_open": "BOOLEAN",
     "inspector_message_id": "VARCHAR(64)",
@@ -1100,7 +1136,10 @@ def _validate_open_connection(
     allow_repairable_search_index_version: bool = False,
 ) -> None:
     """Validate the exact authoritative schema and destructive guard behavior."""
-    phase7 = expected_revision in {PHASE7_REVISION, _PHASE8_REVISION, _PHASE9_REVISION}
+    # Phase 7 search-visible mutations are used by all revisions from Phase 7 onwards
+    phase7 = expected_revision in (
+        {PHASE7_REVISION, _PHASE8_REVISION} | _PHASE9_OR_LATER_REVISIONS
+    )
     if phase7:
         arm_phase7_source_mutation(connection, "phase7 schema validation")
     try:
@@ -1109,17 +1148,23 @@ def _validate_open_connection(
         ).scalar_one_or_none()
         if revision != expected_revision:
             raise RuntimeError("current database revision is not authoritative")
-        if expected_revision != _PHASE9_REVISION:
+        if expected_revision not in _PHASE9_OR_LATER_REVISIONS:
             integrity = __import__("bots5.infrastructure.persistence.migrations.versions.0003_integrity_boundaries", fromlist=["_validate_existing_state"])
             integrity._validate_existing_state(connection)
         _validate_phase4_schema(connection)
-        if expected_revision in {_PHASE8_REVISION, _PHASE9_REVISION}:
+        if expected_revision in ({_PHASE8_REVISION} | _PHASE9_OR_LATER_REVISIONS):
             _validate_phase8_schema(connection)
         _validate_phase5_schema(connection)
         _validate_phase5_trigger_behavior(connection)
         validate_phase6_schema(connection, destructive=destructive_phase6)
-        if expected_revision == _PHASE9_REVISION:
-            validate_phase9_schema(connection)
+        if expected_revision in _PHASE9_OR_LATER_REVISIONS:
+            # The frozen 0014 tombstone migration hardcodes its messages_validate_insert text and so
+            # predates the 0015 duplicate-admission term in the canonical DDL.  Row validation still
+            # applies there; only the head-vs-frozen exact-DDL equality is skipped.
+            validate_phase9_schema(
+                connection,
+                exact_ddl=expected_revision != _PHASE11_TOMBSTONE_HEAD,
+            )
     finally:
         if phase7:
             clear_phase7_source_mutation(connection)
@@ -1135,6 +1180,9 @@ def _validate_open_connection(
 
 def _chat(row) -> Chat:
     archived_at = getattr(row, "archived_at", None)
+    # Phase 11 M3 (F4/F5): organisation columns exist from 0013 onwards.
+    # getattr defaults keep rows read from historical pre-0013 shapes valid.
+    raw_pinned = getattr(row, "is_pinned", 0)
     return Chat(
         id=row.id,
         title=row.title,
@@ -1143,6 +1191,8 @@ def _chat(row) -> Chat:
         head_message_id=row.head_message_id,
         revision=int(row.revision),
         archived_at=None if archived_at is None else parse_utc(archived_at),
+        folder_id=getattr(row, "folder_id", None),
+        is_pinned=bool(raw_pinned),
     )
 
 
@@ -1232,6 +1282,143 @@ def _message_values(message: Message) -> dict[str, object]:
     }
 
 
+# --- Phase 11 fork R-15: faithful search-state restore plane -----------------
+#
+# The complete SearchFilters value object is encoded under explicit keys, one
+# per field.  Decoding requires EVERY key to be present: a partially restored
+# filter set silently changes what a re-run search returns, so a payload that
+# lost a field is rejected as malformed instead of accepted as-is.  The
+# SearchFilters constructor owns the two domain invariants (non-empty chat_id,
+# non-inverted time range) and any violation surfaces as StateError, so the
+# caller's presentation-corruption fallback applies rather than a silent
+# acceptance of an impossible filter set.
+
+_SEARCH_FILTERS_JSON_VERSION = 1
+
+_SEARCH_FILTERS_JSON_KEYS = frozenset(
+    {
+        "version",
+        "chat_id",
+        "document_kinds",
+        "roles",
+        "message_states",
+        "backend_ids",
+        "provider_ids",
+        "models",
+        "connection_ids",
+        "model_entry_ids",
+        "active_branch_only",
+        "include_archived",
+        "after",
+        "before",
+    }
+)
+
+
+def _encode_search_filters(filters: SearchFilters) -> str:
+    payload = {
+        "version": _SEARCH_FILTERS_JSON_VERSION,
+        "chat_id": filters.chat_id,
+        "document_kinds": [value.value for value in filters.document_kinds],
+        "roles": [value.value for value in filters.roles],
+        "message_states": [value.value for value in filters.message_states],
+        "backend_ids": list(filters.backend_ids),
+        "provider_ids": list(filters.provider_ids),
+        "models": list(filters.models),
+        "connection_ids": list(filters.connection_ids),
+        "model_entry_ids": list(filters.model_entry_ids),
+        "active_branch_only": filters.active_branch_only,
+        "include_archived": filters.include_archived,
+        "after": None if filters.after is None else utc_iso(filters.after),
+        "before": None if filters.before is None else utc_iso(filters.before),
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _decode_search_filters_json_element(
+    value: object, name: str
+) -> str:
+    if type(value) is not str:
+        raise StateError(f"workspace search filters field is malformed: {name}")
+    return value
+
+
+def _decode_search_filters(payload: object) -> SearchFilters | None:
+    if payload is None:
+        return None
+    try:
+        decoded = json.loads(payload)
+    except (TypeError, ValueError) as exc:
+        raise StateError("workspace search filters are not valid JSON") from exc
+    if not isinstance(decoded, dict) or set(decoded) != _SEARCH_FILTERS_JSON_KEYS:
+        raise StateError("workspace search filters payload is incomplete")
+    if decoded["version"] != _SEARCH_FILTERS_JSON_VERSION:
+        raise StateError("workspace search filters payload version is unsupported")
+    try:
+        chat_id = decoded["chat_id"]
+        if chat_id is not None:
+            _decode_search_filters_json_element(chat_id, "chat_id")
+        document_kinds = tuple(
+            SearchDocumentKind(
+                _decode_search_filters_json_element(value, "document_kinds")
+            )
+            for value in decoded["document_kinds"]
+        )
+        roles = tuple(
+            MessageRole(_decode_search_filters_json_element(value, "roles"))
+            for value in decoded["roles"]
+        )
+        message_states = tuple(
+            MessageState(
+                _decode_search_filters_json_element(value, "message_states")
+            )
+            for value in decoded["message_states"]
+        )
+        string_fields: dict[str, tuple[str, ...]] = {}
+        for name in (
+            "backend_ids",
+            "provider_ids",
+            "models",
+            "connection_ids",
+            "model_entry_ids",
+        ):
+            string_fields[name] = tuple(
+                _decode_search_filters_json_element(value, name)
+                for value in decoded[name]
+            )
+        for name in ("active_branch_only", "include_archived"):
+            if type(decoded[name]) is not bool:
+                raise StateError(
+                    f"workspace search filters field is malformed: {name}"
+                )
+        bounds: dict[str, datetime | None] = {}
+        for name in ("after", "before"):
+            value = decoded[name]
+            bounds[name] = None if value is None else parse_utc(
+                _decode_search_filters_json_element(value, name)
+            )
+        filters = SearchFilters(
+            chat_id=chat_id,
+            document_kinds=document_kinds,
+            roles=roles,
+            message_states=message_states,
+            backend_ids=string_fields["backend_ids"],
+            provider_ids=string_fields["provider_ids"],
+            models=string_fields["models"],
+            connection_ids=string_fields["connection_ids"],
+            model_entry_ids=string_fields["model_entry_ids"],
+            active_branch_only=decoded["active_branch_only"],
+            include_archived=decoded["include_archived"],
+            after=bounds["after"],
+            before=bounds["before"],
+        )
+    except StateError:
+        raise
+    except (KeyError, TypeError, ValueError) as exc:
+        raise StateError("workspace search filters payload is malformed") from exc
+    return filters
+
+
 def _workspace_window(row) -> WorkspaceWindowState:
     mapping = row._mapping
     geometry_value = mapping["geometry_json"]
@@ -1262,6 +1449,18 @@ def _workspace_window(row) -> WorkspaceWindowState:
             inspector_open=bool(mapping.get("inspector_open", False)),
             inspector_message_id=mapping.get("inspector_message_id"),
             inspector_leaf_message_id=mapping.get("inspector_leaf_message_id"),
+            maximized=bool(mapping.get("maximized", False)),
+            transcript_scroll_position=(
+                None
+                if mapping.get("transcript_scroll_position") is None
+                else int(mapping["transcript_scroll_position"])
+            ),
+            search_open=bool(mapping.get("search_open", False)),
+            search_query=mapping.get("search_query"),
+            search_filters=_decode_search_filters(
+                mapping.get("search_filters_json")
+            ),
+            search_cursor=mapping.get("search_cursor"),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise StateError("workspace window state is malformed") from exc
@@ -2138,7 +2337,7 @@ class SQLiteAppStateStore(Phase5StoreMixin):
             lease.assert_live()
             with engine.begin() as connection:
                 revision = connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one_or_none()
-                if revision != _PHASE9_REVISION:
+                if revision not in _PHASE9_OR_LATER_REVISIONS:
                     integrity = __import__("bots5.infrastructure.persistence.migrations.versions.0003_integrity_boundaries", fromlist=["_validate_existing_state"])
                     integrity._validate_existing_state(connection)
                 column_info = {
@@ -2201,7 +2400,7 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     _validate_phase5_schema(connection)
                     _validate_phase5_trigger_behavior(connection)
                     validate_phase6_schema(connection)
-                if revision in {_PHASE8_REVISION, _PHASE9_REVISION}:
+                if revision in ({_PHASE8_REVISION} | _PHASE9_OR_LATER_REVISIONS):
                     _validate_open_connection(
                         connection,
                         expected_revision=revision,
@@ -4806,7 +5005,7 @@ class SQLiteAppStateStore(Phase5StoreMixin):
             revision = connection.exec_driver_sql(
                 "SELECT version_num FROM alembic_version"
             ).scalar_one_or_none()
-            if revision != _PHASE9_REVISION:
+            if revision not in _PHASE9_OR_LATER_REVISIONS:
                 raise StateError("Phase 9 persistence schema is not current")
             validate_phase6_schema(connection)
             validate_phase9_schema(connection)
@@ -4915,6 +5114,794 @@ class SQLiteAppStateStore(Phase5StoreMixin):
             )
         assert result_chat is not None
         return result_chat
+
+    def rename_chat(
+        self,
+        chat_id: str,
+        title: str,
+        *,
+        expected_revision: int | None = None,
+    ) -> Chat:
+        """Rename a chat title with CAS and a Phase 7 search receipt (F16).
+
+        Mirrors the landed ``archive_chat`` CAS + Phase 7 search-receipt
+        pattern: the ``phase7_chat_update_source`` trigger covers ``title``,
+        so a real rename must arm and consume exactly one Phase 7 source
+        mutation and accept its receipt, or the index silently stales and the
+        next start refuses.  The rename is metadata only: it must not bump
+        ``chats.revision`` (``chats_revision_monotonic`` forbids that outside
+        a head advance) and must not bump ``updated_at`` (A-1a-F1: rename is
+        not activity).  Titles are stripped once and must not be empty after
+        the strip (A-1a-F2).
+        """
+        self._ensure_open()
+        if not chat_id:
+            raise StateError("chat id must not be empty")
+        if type(title) is not str:
+            raise StateError("chat title must be a string")
+        stripped = title.strip()
+        if not stripped:
+            raise StateError("chat title must not be empty")
+        result_chat: Chat | None = None
+        source_revision: int | None = None
+        with self._authority.transition():
+            with self._search_transaction("rename chat source transaction") as connection:
+                row = connection.execute(select(chats).where(chats.c.id == chat_id)).first()
+                if row is None:
+                    raise StateError(f"chat not found: {chat_id}")
+                current = _chat(row)
+                if expected_revision is not None and current.revision != expected_revision:
+                    raise RevisionConflict(f"chat revision changed: {chat_id}")
+                if current.title == stripped:
+                    # Same-title rename: no chat column changes, so the Phase 7
+                    # source trigger cannot fire and no receipt is owed.
+                    result_chat = current
+                else:
+                    self._arm_phase7_source_mutation(connection, "rename chat")
+                    try:
+                        # CAS on the revision: the title update deliberately
+                        # leaves revision and updated_at untouched.
+                        update_result = connection.execute(
+                            update(chats)
+                            .where(
+                                chats.c.id == chat_id,
+                                chats.c.revision == current.revision,
+                            )
+                            .values(title=stripped)
+                        )
+                        if update_result.rowcount != 1:
+                            raise RevisionConflict(f"chat revision changed: {chat_id}")
+                        source_revision = self._require_phase7_source_consumed(connection)
+                    finally:
+                        clear_phase7_source_mutation(connection)
+                    result_chat = replace(current, title=stripped)
+        if source_revision is not None:
+            self._accept_search_receipt(
+                SearchReceipt(source_revision, frozenset({f"chat:{chat_id}"}))
+            )
+        assert result_chat is not None
+        return result_chat
+
+    def duplicate_chat(
+        self,
+        chat_id: str,
+        *,
+        clock,
+        ids,
+        include_full_branch_tree: bool = False,
+        title: str | None = None,
+    ) -> tuple[Chat, tuple[Message, ...]]:
+        """Duplicate a chat with its messages.
+        
+        Messages are copied with fresh ids, preserving role/state/content/sequence/revision.
+        Assistant messages are duplicated WITHOUT generation attempts.
+        Attachments are shared (content-addressed).
+        
+        Running generations (assistant messages in 'streaming' state) are refused.
+        generation_attempts, attempt_attachments, and context_plans are NOT copied.
+        """
+        self._ensure_open()
+        if not chat_id:
+            raise StateError("chat id must not be empty")
+        
+        now = clock.now()
+        new_chat_id = ids.new()
+        
+        # Read source chat
+        with self._engine.connect() as conn:
+            source_row = conn.execute(
+                select(chats).where(chats.c.id == chat_id)
+            ).first()
+            if source_row is None:
+                raise StateError(f"chat not found: {chat_id}")
+            source_chat = _chat(source_row)
+        
+        # Determine messages to copy
+        if include_full_branch_tree:
+            source_messages = self.list_messages(chat_id)
+        else:
+            source_messages = self.list_branch_messages(chat_id)
+        
+        # Check for running generations (streaming assistant messages) - refuse
+        for msg in source_messages:
+            if msg.role == MessageRole.ASSISTANT and msg.state == MessageState.STREAMING:
+                raise StateError(f"cannot duplicate chat with running generation: message {msg.id} is in streaming state")
+        
+        # Build id mappings.  Lineage ids are remapped consistently per source
+        # lineage (not per message): every revision of one source lineage must
+        # share ONE fresh lineage id in the copy, because the landed
+        # messages_revision_consistency trigger rejects a copied lineage
+        # revision whose in-lineage predecessor carries a different lineage id.
+        old_id_to_new: dict[str, str] = {}
+        for msg in source_messages:
+            old_id_to_new[msg.id] = ids.new()
+        old_lineage_to_new: dict[str, str] = {}
+        for msg in source_messages:
+            source_lineage = msg.lineage_id or msg.id
+            if source_lineage not in old_lineage_to_new:
+                old_lineage_to_new[source_lineage] = ids.new()
+
+        # Build new messages with remapped ids
+        new_messages: list[Message] = []
+        for msg in source_messages:
+            new_msg_id = old_id_to_new[msg.id]
+            new_parent_id = old_id_to_new.get(msg.parent_id) if msg.parent_id else None
+            new_supersedes_id = old_id_to_new.get(msg.supersedes_id) if msg.supersedes_id else None
+            new_lineage_id = old_lineage_to_new[msg.lineage_id or msg.id]
+            
+            new_messages.append(
+                Message(
+                    id=new_msg_id,
+                    chat_id=new_chat_id,
+                    parent_id=new_parent_id,
+                    sequence=msg.sequence,
+                    role=msg.role,
+                    state=msg.state,
+                    content=msg.content,
+                    created_at=msg.created_at,
+                    lineage_id=new_lineage_id,
+                    revision=msg.revision,
+                    supersedes_id=new_supersedes_id,
+                )
+            )
+        
+        # Build rows for arm_phase11_duplicate_messages
+        # (id, chat_id, parent_id, sequence, role, state, content, created_at, lineage_id, revision, supersedes_id)
+        # The trigger sees the SERIALISED column values, so the arm must carry exactly what
+        # _message_values will write (utc_iso timestamps and the lineage_id fallback).
+        # Arming raw dataclass attributes can never match NEW.* in the trigger.
+        duplicate_rows = tuple(
+            (
+                values["id"],
+                values["chat_id"],
+                values["parent_id"],
+                values["sequence"],
+                values["role"],
+                values["state"],
+                values["content"],
+                values["created_at"],
+                values["lineage_id"],
+                values["revision"],
+                values["supersedes_id"],
+            )
+            for values in (_message_values(message) for message in new_messages)
+        )
+        
+        # Copy attachment mappings
+        source_to_dup_attachment_ids: dict[str, str] = {}
+        
+        # Compute all document keys for search receipt
+        all_keys = frozenset({f"chat:{new_chat_id}"} | {f"message:{msg.id}" for msg in new_messages})
+        
+        # Perform writes in one transaction with search source
+        result_chat: Chat | None = None
+        
+        with self._authority.transition():
+            with self._search_source_transaction("duplicate chat", all_keys) as connection:
+                # Arm duplication admission guard
+                arm_phase11_duplicate_messages(connection, duplicate_rows)
+                try:
+                    # Create new chat
+                    connection.execute(
+                        insert(chats).values(
+                            id=new_chat_id,
+                            title=title if title else f"{source_chat.title} (copy)",
+                            created_at=utc_iso(now),
+                            updated_at=utc_iso(now),
+                            head_message_id=None,
+                            revision=0,
+                            archived_at=None,
+                        )
+                    )
+                    
+                    # Copy chat_model_selection (verbatim row under the fresh
+                    # chat id; the table is keyed by chat_id and has no id
+                    # column, and selection_required/revision/updated_at are
+                    # NOT NULL or CHECK-bound).
+                    model_selection = connection.execute(
+                        select(chat_model_selection).where(chat_model_selection.c.chat_id == chat_id)
+                    ).first()
+                    if model_selection is not None:
+                        connection.execute(
+                            insert(chat_model_selection).values(
+                                chat_id=new_chat_id,
+                                model_entry_id=model_selection.model_entry_id,
+                                selection_required=model_selection.selection_required,
+                                revision=model_selection.revision,
+                                updated_at=model_selection.updated_at,
+                            )
+                        )
+                    
+                    # Copy chat_model_generation_config (verbatim row under the
+                    # fresh chat id; the table is keyed by (chat_id,
+                    # model_entry_id) and has no id column, and revision and
+                    # updated_at are NOT NULL).
+                    model_config = connection.execute(
+                        select(chat_model_generation_config).where(chat_model_generation_config.c.chat_id == chat_id)
+                    ).first()
+                    if model_config is not None:
+                        connection.execute(
+                            insert(chat_model_generation_config).values(
+                                chat_id=new_chat_id,
+                                model_entry_id=model_config.model_entry_id,
+                                temperature=model_config.temperature,
+                                max_output_tokens=model_config.max_output_tokens,
+                                reasoning_effort=model_config.reasoning_effort,
+                                timeout_seconds=model_config.timeout_seconds,
+                                revision=model_config.revision,
+                                updated_at=model_config.updated_at,
+                            )
+                        )
+                    
+                    # Copy message_attachments
+                    source_attachments = connection.execute(
+                        select(message_attachments).where(
+                            message_attachments.c.message_id.in_([m.id for m in source_messages])
+                        )
+                    ).fetchall()
+                    for sa in source_attachments:
+                        new_msg_id = old_id_to_new[sa.message_id]
+                        connection.execute(
+                            insert(message_attachments).values(
+                                id=ids.new(),
+                                message_id=new_msg_id,
+                                attachment_id=sa.attachment_id,
+                                ordinal=sa.ordinal,
+                            )
+                        )
+                        source_to_dup_attachment_ids[sa.attachment_id] = sa.attachment_id
+                    
+                    # Process messages with duplication guard armed
+                    current_chat = Chat(
+                        id=new_chat_id,
+                        title="",
+                        created_at=now,
+                        updated_at=now,
+                        head_message_id=None,
+                        revision=0,
+                        archived_at=None,
+                    )
+                    
+                    for msg in new_messages:
+                        # Insert directly at final state (no streaming intermediate, no attempts).
+                        # The duplicate admission authorises the copied state, but the
+                        # active-head parent guard still requires the ordinary 'start' arm.
+                        arm_transition(
+                            connection, msg.id, None, "start", user_message_id=msg.id
+                        )
+                        try:
+                            connection.execute(
+                                insert(messages).values(**_message_values(msg))
+                            )
+                        finally:
+                            clear_transition(connection)
+                        
+                        # Advance chat head
+                        current_chat = replace(
+                            current_chat,
+                            head_message_id=msg.id,
+                            revision=current_chat.revision + 1,
+                            updated_at=msg.created_at,
+                        )
+                        self._advance_chat(connection, current_chat, msg.id, None)
+                finally:
+                    # Clear duplication admission guard
+                    clear_phase11_duplicate_messages(connection)
+        
+        # Read back the new chat and messages
+        with self._engine.connect() as conn:
+            new_chat_row = conn.execute(
+                select(chats).where(chats.c.id == new_chat_id)
+            ).first()
+            assert new_chat_row is not None
+            result_chat = _chat(new_chat_row)
+            new_messages_final = tuple(_message(m) for m in conn.execute(
+                select(messages).where(messages.c.chat_id == new_chat_id).order_by(messages.c.sequence)
+            ).fetchall())
+        
+        assert result_chat is not None
+        return result_chat, new_messages_final
+
+    # ------------------------------------------------------------------
+    # Phase 11 M3 (F4/F5/F7): folders, pins, tombstones, whole-chat deletion.
+    #
+    # Folder and pin operations follow the landed rename_chat pattern: they
+    # are metadata only (no revision bump, no updated_at bump), they validate
+    # their inputs once, and folder_id/is_pinned are deliberately NOT covered
+    # by the phase7_chat_update_source trigger so no search receipt is owed.
+    # The deletion operations follow the landed archive/duplicate pattern:
+    # one armed Phase 7 source mutation consumed inside the authoritative
+    # transaction, and exactly one accepted receipt afterwards.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validated_folder_name(name: object) -> str:
+        if type(name) is not str:
+            raise StateError("folder name must be a string")
+        stripped = name.strip()
+        if not stripped:
+            raise StateError("folder name must not be empty")
+        if len(stripped) > 200:
+            raise StateError("folder name is too long")
+        return stripped
+
+    def create_folder(self, name: str, *, clock, ids) -> Folder:
+        """Create one flat organisation folder (F4)."""
+        self._ensure_open()
+        stripped = self._validated_folder_name(name)
+        now = clock.now()
+        folder_id = ids.new()
+        with self._authority.transition(), self._engine.begin() as connection:
+            duplicate = connection.exec_driver_sql(
+                "SELECT count(*) FROM folders WHERE lower(name) = lower(?)",
+                (stripped,),
+            ).scalar_one()
+            if duplicate:
+                raise StateError(f"folder already exists: {stripped}")
+            next_sequence = int(
+                connection.exec_driver_sql(
+                    "SELECT coalesce(max(sequence), 0) FROM folders"
+                ).scalar_one()
+            )
+            folder = Folder(
+                id=folder_id,
+                name=stripped,
+                created_at=now,
+                sequence=next_sequence + 1,
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO folders (id, name, created_at, sequence) VALUES (?, ?, ?, ?)",
+                (folder.id, folder.name, utc_iso(folder.created_at), folder.sequence),
+            )
+        return folder
+
+    def rename_folder(self, folder_id: str, name: str) -> Folder:
+        """Rename one folder (F4). Folder renames are metadata only."""
+        self._ensure_open()
+        if not folder_id:
+            raise StateError("folder id must not be empty")
+        stripped = self._validated_folder_name(name)
+        with self._authority.transition(), self._engine.begin() as connection:
+            row = connection.exec_driver_sql(
+                "SELECT id, name, created_at, sequence FROM folders WHERE id = ?",
+                (folder_id,),
+            ).first()
+            if row is None:
+                raise StateError(f"folder not found: {folder_id}")
+            duplicate = connection.exec_driver_sql(
+                "SELECT count(*) FROM folders WHERE lower(name) = lower(?) AND id <> ?",
+                (stripped, folder_id),
+            ).scalar_one()
+            if duplicate:
+                raise StateError(f"folder already exists: {stripped}")
+            connection.exec_driver_sql(
+                "UPDATE folders SET name = ? WHERE id = ?",
+                (stripped, folder_id),
+            )
+            return Folder(
+                id=str(row[0]),
+                name=stripped,
+                created_at=parse_utc(str(row[2])),
+                sequence=int(row[3]),
+            )
+
+    def delete_folder(self, folder_id: str) -> None:
+        """Delete one folder, UNFILING every member chat (F4).
+
+        Chats are never deleted here: deleting a folder only unsets
+        ``folder_id`` on its members.  The store performs the unfile itself
+        and the frozen 0013 ``phase11_folder_delete_unfiles_members`` trigger
+        backstops it at the schema level.
+        """
+        self._ensure_open()
+        if not folder_id:
+            raise StateError("folder id must not be empty")
+        with self._authority.transition(), self._engine.begin() as connection:
+            row = connection.exec_driver_sql(
+                "SELECT 1 FROM folders WHERE id = ?",
+                (folder_id,),
+            ).first()
+            if row is None:
+                raise StateError(f"folder not found: {folder_id}")
+            connection.exec_driver_sql(
+                "UPDATE chats SET folder_id = NULL WHERE folder_id = ?",
+                (folder_id,),
+            )
+            connection.exec_driver_sql(
+                "DELETE FROM folders WHERE id = ?",
+                (folder_id,),
+            )
+
+    def list_folders(self) -> tuple[Folder, ...]:
+        """List every folder in creation order (F4)."""
+        self._ensure_open()
+        with self._authority.operation(), self._engine.connect() as connection:
+            rows = connection.exec_driver_sql(
+                "SELECT id, name, created_at, sequence FROM folders "
+                "ORDER BY sequence ASC, id DESC"
+            ).fetchall()
+        return tuple(
+            Folder(
+                id=str(row[0]),
+                name=str(row[1]),
+                created_at=parse_utc(str(row[2])),
+                sequence=int(row[3]),
+            )
+            for row in rows
+        )
+
+    def set_chat_folder(self, chat_id: str, folder_id: str | None) -> Chat:
+        """Move one chat into a folder, or unfile it with None (F4).
+
+        Exactly ONE optional folder per chat; there is no nesting.  Folder
+        moves are metadata only: no revision bump and no updated_at bump.
+        """
+        self._ensure_open()
+        if not chat_id:
+            raise StateError("chat id must not be empty")
+        if folder_id is not None and (type(folder_id) is not str or not folder_id):
+            raise StateError("chat folder id must be a non-empty string or None")
+        result_chat: Chat | None = None
+        with self._authority.transition(), self._engine.begin() as connection:
+            chat_row = connection.execute(
+                select(chats).where(chats.c.id == chat_id)
+            ).first()
+            if chat_row is None:
+                raise StateError(f"chat not found: {chat_id}")
+            current = _chat(chat_row)
+            if folder_id is not None:
+                folder_row = connection.exec_driver_sql(
+                    "SELECT 1 FROM folders WHERE id = ?",
+                    (folder_id,),
+                ).first()
+                if folder_row is None:
+                    raise StateError(f"folder not found: {folder_id}")
+            if current.folder_id == folder_id:
+                result_chat = current
+            else:
+                update_result = connection.execute(
+                    update(chats)
+                    .where(
+                        chats.c.id == chat_id,
+                        chats.c.revision == current.revision,
+                    )
+                    .values(folder_id=folder_id)
+                )
+                if update_result.rowcount != 1:
+                    raise RevisionConflict(f"chat revision changed: {chat_id}")
+                result_chat = replace(current, folder_id=folder_id)
+        assert result_chat is not None
+        return result_chat
+
+    def set_chat_pinned(self, chat_id: str, pinned: bool) -> Chat:
+        """Set or clear the floating pin on one chat (F5).
+
+        The pin floats above the recency ordering (``is_pinned DESC`` first)
+        and is cleared by the frozen 0013 trigger when the chat is archived.
+        Pinning is metadata only: no revision bump and no updated_at bump.
+        """
+        self._ensure_open()
+        if not chat_id:
+            raise StateError("chat id must not be empty")
+        if type(pinned) is not bool:
+            raise StateError("chat pin state must be a boolean")
+        result_chat: Chat | None = None
+        with self._authority.transition(), self._engine.begin() as connection:
+            chat_row = connection.execute(
+                select(chats).where(chats.c.id == chat_id)
+            ).first()
+            if chat_row is None:
+                raise StateError(f"chat not found: {chat_id}")
+            current = _chat(chat_row)
+            if current.is_pinned == pinned:
+                result_chat = current
+            else:
+                update_result = connection.execute(
+                    update(chats)
+                    .where(
+                        chats.c.id == chat_id,
+                        chats.c.revision == current.revision,
+                    )
+                    .values(is_pinned=1 if pinned else 0)
+                )
+                if update_result.rowcount != 1:
+                    raise RevisionConflict(f"chat revision changed: {chat_id}")
+                result_chat = replace(current, is_pinned=pinned)
+        assert result_chat is not None
+        return result_chat
+
+    def describe_chat_deletion(self, chat_id: str) -> ChatDeletionInventory:
+        """Compute the F7 loss inventory for one chat WITHOUT deleting it."""
+        self._ensure_open()
+        if not chat_id:
+            raise StateError("chat id must not be empty")
+        with self._authority.operation(), self._engine.connect() as connection:
+            chat_row = connection.exec_driver_sql(
+                "SELECT title FROM chats WHERE id = ?",
+                (chat_id,),
+            ).first()
+            if chat_row is None:
+                raise StateError(f"chat not found: {chat_id}")
+            message_count = int(
+                connection.exec_driver_sql(
+                    "SELECT count(*) FROM messages WHERE chat_id = ?",
+                    (chat_id,),
+                ).scalar_one()
+            )
+            attachment_count = int(
+                connection.exec_driver_sql(
+                    "SELECT count(*) FROM message_attachments AS link "
+                    "JOIN messages AS m ON m.id = link.message_id "
+                    "WHERE m.chat_id = ?",
+                    (chat_id,),
+                ).scalar_one()
+            )
+            attempt_count = int(
+                connection.exec_driver_sql(
+                    "SELECT count(*) FROM generation_attempts WHERE chat_id = ?",
+                    (chat_id,),
+                ).scalar_one()
+            )
+        return ChatDeletionInventory(
+            chat_id=chat_id,
+            title=str(chat_row[0]),
+            message_count=message_count,
+            attachment_count=attachment_count,
+            generation_attempt_count=attempt_count,
+        )
+
+    def delete_message(self, chat_id: str, message_id: str) -> Message:
+        """Tombstone one message (F7, lossless per-message deletion).
+
+        The row KEEPS its identity, lineage, sequence and revision; only the
+        state becomes ``'deleted'`` and the content is given up (empty).  The
+        0017 trigger set admits exactly this shape and nothing else for a
+        settled message, and the tombstone is final: no later update can
+        revive it.  Streaming messages are refused — a message that is still
+        being generated is not deletable mid-flight.  The state/content
+        change is search-visible, so exactly one Phase 7 source mutation is
+        armed, consumed and receipted.
+        """
+        self._ensure_open()
+        if not chat_id or not message_id:
+            raise StateError("chat id and message id must not be empty")
+        result_message: Message | None = None
+        source_revision: int | None = None
+        with self._authority.transition():
+            with self._search_transaction("delete message source transaction") as connection:
+                chat_row = connection.execute(
+                    select(chats.c.id).where(chats.c.id == chat_id)
+                ).first()
+                if chat_row is None:
+                    raise StateError(f"chat not found: {chat_id}")
+                row = connection.execute(
+                    select(messages).where(
+                        messages.c.id == message_id,
+                        messages.c.chat_id == chat_id,
+                    )
+                ).first()
+                if row is None:
+                    raise StateError(f"message not found in chat: {message_id}")
+                current = _message(row)
+                if current.state is MessageState.STREAMING:
+                    raise StateError(
+                        "message is still generating and cannot be deleted"
+                    )
+                if current.state is MessageState.DELETED:
+                    raise StateError("message is already deleted")
+                self._arm_phase7_source_mutation(connection, "delete message")
+                try:
+                    try:
+                        update_result = connection.execute(
+                            update(messages)
+                            .where(messages.c.id == message_id)
+                            .values(state=MessageState.DELETED.value, content="")
+                        )
+                    except DBAPIError as exc:
+                        if (
+                            "terminal message is immutable" in str(exc)
+                            or "message lifecycle transition is invalid" in str(exc)
+                        ):
+                            # Fail closed on schemas without the 0017
+                            # tombstone admission instead of leaking a raw
+                            # DB error.
+                            raise StateError(
+                                "message deletion is unavailable on this "
+                                "schema revision; migrate to "
+                                "0017_phase11_integrity"
+                            ) from exc
+                        raise
+                    if update_result.rowcount != 1:
+                        raise StateError(f"message not found in chat: {message_id}")
+                    source_revision = self._require_phase7_source_consumed(connection)
+                finally:
+                    clear_phase7_source_mutation(connection)
+                result_message = replace(
+                    current,
+                    state=MessageState.DELETED,
+                    content="",
+                )
+        if source_revision is not None:
+            self._accept_search_receipt(
+                SearchReceipt(
+                    source_revision,
+                    frozenset({f"chat:{chat_id}", f"message:{message_id}"}),
+                )
+            )
+        assert result_message is not None
+        return result_message
+
+    def delete_chat(self, chat_id: str, *, expected_revision: int | None = None) -> None:
+        """Delete one whole chat and everything hanging off it (F7).
+
+        This is the destructive half of F7 and it is deliberately total: the
+        chat row, its messages, attempts, attachment LINK rows, context plans,
+        model selection and draft are removed; content-addressed attachment
+        blobs survive for the ordinary GC because they may be shared with
+        other chats.  Callers must present the loss inventory from
+        ``describe_chat_deletion`` for the deliberate confirmation FIRST.
+        Refusals: unknown chats, stale CAS revisions, chats with a running
+        generation, and chats referenced by archive import provenance (the
+        RESTRICT foreign keys protect that provenance).
+
+        The physical removal order is dependency-safe: attachment links and
+        context plans first, then attempts, then messages leaf-ward (a parent
+        or superseded message is only removed after every remaining row that
+        references it is gone, because the FK actions would otherwise UPDATE a
+        surviving row), then the chat row itself.
+        """
+        self._ensure_open()
+        if not chat_id:
+            raise StateError("chat id must not be empty")
+        source_revision: int | None = None
+        with self._authority.transition():
+            with self._search_transaction("delete chat source transaction") as connection:
+                chat_row = connection.execute(
+                    select(chats).where(chats.c.id == chat_id)
+                ).first()
+                if chat_row is None:
+                    raise StateError(f"chat not found: {chat_id}")
+                current = _chat(chat_row)
+                if expected_revision is not None and current.revision != expected_revision:
+                    raise RevisionConflict(f"chat revision changed: {chat_id}")
+                streaming = connection.execute(
+                    select(messages.c.id)
+                    .where(
+                        messages.c.chat_id == chat_id,
+                        messages.c.state == MessageState.STREAMING.value,
+                    )
+                    .limit(1)
+                ).first()
+                if streaming is not None:
+                    raise StateError(
+                        "cannot delete a chat with a running generation"
+                    )
+                running_attempt = connection.execute(
+                    select(generation_attempts.c.id)
+                    .where(
+                        generation_attempts.c.chat_id == chat_id,
+                        generation_attempts.c.state == AttemptState.RUNNING.value,
+                    )
+                    .limit(1)
+                ).first()
+                if running_attempt is not None:
+                    raise StateError(
+                        "cannot delete a chat with a running generation"
+                    )
+                message_ids = tuple(
+                    str(row[0])
+                    for row in connection.execute(
+                        select(messages.c.id).where(messages.c.chat_id == chat_id)
+                    ).fetchall()
+                )
+                attempt_ids = tuple(
+                    str(row[0])
+                    for row in connection.execute(
+                        select(generation_attempts.c.id).where(
+                            generation_attempts.c.chat_id == chat_id
+                        )
+                    ).fetchall()
+                )
+                document_keys = frozenset(
+                    {f"chat:{chat_id}"} | {f"message:{mid}" for mid in message_ids}
+                )
+                self._arm_phase7_source_mutation(connection, "delete chat")
+                # The chat-deletion admission is what lets the frozen-message
+                # cascade through: without it every message delete aborts.
+                arm_phase11_chat_deletion(connection, chat_id)
+                try:
+                    # Clear the head FIRST, under the advance admission, so
+                    # deleting the head message never fires the
+                    # chats.head_message_id SET NULL action (the
+                    # chats_head_update_guard would abort it mid-deletion).
+                    arm_transition(connection, None, chat_id, "advance")
+                    try:
+                        connection.exec_driver_sql(
+                            "UPDATE chats SET head_message_id = NULL WHERE id = ?",
+                            (chat_id,),
+                        )
+                    finally:
+                        clear_transition(connection)
+                    for attempt_id in attempt_ids:
+                        connection.exec_driver_sql(
+                            "DELETE FROM context_plans WHERE attempt_id = ?",
+                            (attempt_id,),
+                        )
+                        connection.exec_driver_sql(
+                            "DELETE FROM attempt_attachments WHERE attempt_id = ?",
+                            (attempt_id,),
+                        )
+                    connection.exec_driver_sql(
+                        "DELETE FROM generation_attempts WHERE chat_id = ?",
+                        (chat_id,),
+                    )
+                    for message_id in message_ids:
+                        connection.exec_driver_sql(
+                            "DELETE FROM message_attachments WHERE message_id = ?",
+                            (message_id,),
+                        )
+                    # Remove messages leaf-ward: a message is only removable
+                    # once no surviving message parents or supersedes it, so
+                    # the FK actions never UPDATE a surviving row (which the
+                    # identity-immutability trigger would abort).
+                    remaining = set(message_ids)
+                    while remaining:
+                        removable = {
+                            mid
+                            for mid in remaining
+                            if not connection.exec_driver_sql(
+                                "SELECT 1 FROM messages WHERE chat_id = ? "
+                                "AND (parent_id = ? OR supersedes_id = ?) LIMIT 1",
+                                (chat_id, mid, mid),
+                            ).first()
+                        }
+                        if not removable:
+                            raise StateError(
+                                "chat message graph is cyclic and cannot be deleted"
+                            )
+                        for mid in sorted(removable):
+                            connection.exec_driver_sql(
+                                "DELETE FROM messages WHERE id = ?",
+                                (mid,),
+                            )
+                        remaining -= removable
+                    delete_result = connection.execute(
+                        delete(chats).where(chats.c.id == chat_id)
+                    )
+                    if delete_result.rowcount != 1:
+                        raise StateError(f"chat not found: {chat_id}")
+                    source_revision = self._require_phase7_source_consumed(connection)
+                except DBAPIError as exc:
+                    if "FOREIGN KEY constraint failed" in str(exc):
+                        raise StateError(
+                            "chat is referenced by archive import provenance "
+                            "and cannot be deleted"
+                        ) from exc
+                    raise
+                finally:
+                    clear_phase11_chat_deletion(connection)
+        if source_revision is not None:
+            self._accept_search_receipt(SearchReceipt(source_revision, document_keys))
 
     def admit_import_continuation_choice(
         self, chat_id: str, base_key: str, *, expected_choice_revision: int,
@@ -6364,12 +7351,43 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     )
                 raise StateError("durable attachment representation is malformed")
 
-    def list_chats(self) -> tuple[Chat, ...]:
+    def _supports_pin_ordering(self) -> bool:
+        """Whether the open database carries the Phase 11 ``is_pinned`` column.
+
+        Historical fixtures are built at revisions predating 0013, where the
+        column does not exist, so the pin ordering term is only emitted when the
+        live schema actually has it.  The probe is cached per store instance.
+        """
+        cached = getattr(self, "_pin_ordering_supported", None)
+        if cached is None:
+            self._ensure_open()
+            with self._engine.connect() as connection:
+                columns = {
+                    row[1]
+                    for row in connection.exec_driver_sql(
+                        "PRAGMA table_info(chats)"
+                    ).fetchall()
+                }
+            cached = "is_pinned" in columns
+            self._pin_ordering_supported = cached
+        return cached
+
+    def list_chats(self, sort: ChatSort | None = None) -> tuple[Chat, ...]:
         self._ensure_open()
+        order = ChatSort.RECENT if sort is None else sort
+        # The design requires pins to float under ALL sorts (F18: "with pins floating
+        # under all sorts"; section 4.9: "Pins float under ALL sorts").  The pin term was
+        # previously applied only in the default branch, so pinned chats sank below
+        # unpinned ones under the creation and title sorts.
+        pin_ordering = (text("is_pinned DESC"),) if self._supports_pin_ordering() else ()
+        if order is ChatSort.TITLE:
+            ordering = pin_ordering + (func.lower(chats.c.title).asc(), chats.c.id.desc())
+        elif order is ChatSort.CREATION:
+            ordering = pin_ordering + (chats.c.created_at.desc(), chats.c.id.desc())
+        else:
+            ordering = pin_ordering + (chats.c.updated_at.desc(), chats.c.id.desc())
         with self._engine.connect() as connection:
-            rows = connection.execute(
-                select(chats).order_by(chats.c.updated_at.desc(), chats.c.id.desc())
-            ).fetchall()
+            rows = connection.execute(select(chats).order_by(*ordering)).fetchall()
         return tuple(_chat(row) for row in rows)
 
     def read_chat_export_source(self, chat_id: str, *, attachment_policy):
@@ -9251,6 +10269,9 @@ class SQLiteAppStateStore(Phase5StoreMixin):
     def save_workspace_window(self, state: WorkspaceWindowState) -> None:
         self._ensure_open()
         geometry_json = None if state.geometry is None else json.dumps(list(state.geometry))
+        search_filters_json = (
+            None if state.search_filters is None else _encode_search_filters(state.search_filters)
+        )
         with self.mutation_transition(), self._engine.begin() as connection:
             connection.execute(
                 delete(workspace_windows).where(
@@ -9268,6 +10289,12 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                     inspector_open=state.inspector_open,
                     inspector_message_id=state.inspector_message_id,
                     inspector_leaf_message_id=state.inspector_leaf_message_id,
+                    maximized=state.maximized,
+                    transcript_scroll_position=state.transcript_scroll_position,
+                    search_open=state.search_open,
+                    search_query=state.search_query,
+                    search_filters_json=search_filters_json,
+                    search_cursor=state.search_cursor,
                     updated_at=utc_iso(state.updated_at),
                 )
             )
@@ -9277,6 +10304,115 @@ class SQLiteAppStateStore(Phase5StoreMixin):
         with self.mutation_transition(), self._engine.begin() as connection:
             connection.execute(
                 delete(workspace_windows).where(workspace_windows.c.window_id == window_id)
+            )
+            # Also delete associated dock layout
+            connection.execute(
+                delete(dock_layout).where(dock_layout.c.window_id == window_id)
+            )
+
+    def get_chat_draft(self, chat_id: str) -> str:
+        self._ensure_open()
+        with self._engine.connect() as connection:
+            result = connection.execute(
+                select(chat_drafts.c.draft_text).where(chat_drafts.c.chat_id == chat_id)
+            ).scalar_one_or_none()
+            return result if result is not None else ""
+
+    def save_chat_draft(self, chat_id: str, draft_text: str) -> None:
+        self._ensure_open()
+        now = utc_iso(datetime.now(UTC))
+        with self.mutation_transition(), self._engine.begin() as connection:
+            # Delete first, then insert (simple upsert for SQLite)
+            connection.execute(delete(chat_drafts).where(chat_drafts.c.chat_id == chat_id))
+            connection.execute(
+                insert(chat_drafts).values(chat_id=chat_id, draft_text=draft_text or "", updated_at=now)
+            )
+
+    def get_dock_layout(self, window_id: str) -> bytes | None:
+        self._ensure_open()
+        with self._engine.connect() as connection:
+            result = connection.execute(
+                select(dock_layout.c.dock_state_blob).where(dock_layout.c.window_id == window_id)
+            ).scalar_one_or_none()
+            return result
+
+    def save_dock_layout(self, window_id: str, dock_state_blob: bytes) -> None:
+        self._ensure_open()
+        now = utc_iso(datetime.now(UTC))
+        with self.mutation_transition(), self._engine.begin() as connection:
+            connection.execute(delete(dock_layout).where(dock_layout.c.window_id == window_id))
+            connection.execute(
+                insert(dock_layout).values(window_id=window_id, dock_state_blob=dock_state_blob, updated_at=now)
+            )
+
+    def get_keybinding_override(self, action_id: str) -> str:
+        self._ensure_open()
+        with self._engine.connect() as connection:
+            result = connection.execute(
+                select(keybinding_overrides.c.shortcut).where(keybinding_overrides.c.action_id == action_id)
+            ).scalar_one_or_none()
+            return result if result is not None else ""
+
+    def save_keybinding_override(self, action_id: str, shortcut: str, conflict_detected: bool = False) -> None:
+        self._ensure_open()
+        now = utc_iso(datetime.now(UTC))
+        with self.mutation_transition(), self._engine.begin() as connection:
+            connection.execute(delete(keybinding_overrides).where(keybinding_overrides.c.action_id == action_id))
+            connection.execute(
+                insert(keybinding_overrides).values(
+                    action_id=action_id, shortcut=shortcut or "", conflict_detected=conflict_detected, updated_at=now
+                )
+            )
+
+    def reset_keybinding_overrides(self) -> None:
+        self._ensure_open()
+        with self.mutation_transition(), self._engine.begin() as connection:
+            connection.execute(delete(keybinding_overrides))
+
+    def get_font_scale_settings(self) -> tuple[float, str | None, str | None, str | None, float]:
+        self._ensure_open()
+        with self._engine.connect() as connection:
+            result = connection.execute(
+                select(
+                    font_scale_settings.c.scale_factor,
+                    font_scale_settings.c.ui_font_family,
+                    font_scale_settings.c.transcript_font_family,
+                    font_scale_settings.c.code_font_family,
+                    font_scale_settings.c.base_font_size_pt,
+                ).where(font_scale_settings.c.id == "1")
+            ).fetchone()
+            if result:
+                return (
+                    float(result[0]),
+                    result[1],
+                    result[2],
+                    result[3],
+                    float(result[4]),
+                )
+            return (1.0, None, None, None, 11.0)
+
+    def save_font_scale_settings(
+        self,
+        scale_factor: float,
+        ui_font_family: str | None,
+        transcript_font_family: str | None,
+        code_font_family: str | None,
+        base_font_size_pt: float,
+    ) -> None:
+        self._ensure_open()
+        now = utc_iso(datetime.now(UTC))
+        with self.mutation_transition(), self._engine.begin() as connection:
+            connection.execute(delete(font_scale_settings))
+            connection.execute(
+                insert(font_scale_settings).values(
+                    id="1",
+                    scale_factor=scale_factor,
+                    ui_font_family=ui_font_family,
+                    transcript_font_family=transcript_font_family,
+                    code_font_family=code_font_family,
+                    base_font_size_pt=base_font_size_pt,
+                    updated_at=now,
+                )
             )
 
     @property
@@ -9370,6 +10506,19 @@ _SQLITE_OPERATION_METHODS = (
     "list_workspace_windows",
     "save_workspace_window",
     "delete_workspace_window",
+    # Phase 11 M3 (F4/F5/F7): folders, pins and deletion.  Every public
+    # mutating operation must appear here so it receives the callee-owned
+    # logical grant; a missing entry is the recorded authority-boundary
+    # defect class A-2.
+    "create_folder",
+    "rename_folder",
+    "delete_folder",
+    "list_folders",
+    "set_chat_folder",
+    "set_chat_pinned",
+    "describe_chat_deletion",
+    "delete_message",
+    "delete_chat",
 )
 
 _PHASE5_OPERATION_METHODS = (
@@ -9399,6 +10548,19 @@ _PHASE5_OPERATION_METHODS = (
     "get_chat_model_generation_settings",
     "get_chat_model_generation_config",
     "set_chat_model_generation_settings",
+    # Phase 11 scope amendment: registry-driven (extra) generation settings.
+    # Every public mutating operation must appear here so it receives the
+    # callee-owned logical grant; a missing entry is the recorded
+    # authority-boundary defect class A-2.
+    "get_application_generation_settings_extra",
+    "get_application_generation_settings_extra_config",
+    "set_application_generation_settings_extra",
+    "get_model_generation_settings_extra",
+    "set_model_generation_settings_extra",
+    "get_chat_model_generation_settings_extra",
+    "set_chat_model_generation_settings_extra",
+    "list_generation_setting_capability_overrides",
+    "set_generation_setting_capability_override",
     "get_chat_model_selection",
     "set_chat_model_selection",
 )

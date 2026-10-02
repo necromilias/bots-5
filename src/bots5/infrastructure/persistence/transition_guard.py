@@ -39,6 +39,11 @@ def install_transition_guard(dbapi_connection: Any, connection_record: Any | Non
         "phase9_import_operation": None,
         "phase9_import_ids": frozenset(),
         "phase9_import_messages": {},
+        "phase11_duplicate_messages": {},
+        # Phase 11 M3 (F7): a chat-deletion admission names the ONLY chat whose
+        # message rows the cascade may remove.  It is deliberately not a
+        # general raw-DML escape hatch and is cleared with the transaction.
+        "phase11_chat_deletions": frozenset(),
         "phase9_import_message_sources": {},
         "phase9_import_chats": {},
         "phase9_import_links": frozenset(),
@@ -403,6 +408,21 @@ def install_transition_guard(dbapi_connection: Any, connection_record: Any | Non
         ),
     )
     dbapi_connection.create_function(
+        "bots5_duplicate_message_allowed", 11,
+        lambda identifier, chat_id, parent_id, sequence, role, message_state, content,
+        created_at, lineage_id, revision, supersedes_id: int(
+            isinstance(identifier, str)
+            and state["phase11_duplicate_messages"].get(identifier)
+            == (chat_id, parent_id, sequence, role, message_state, content, created_at, lineage_id, revision, supersedes_id)
+        ),
+    )
+    dbapi_connection.create_function(
+        "bots5_phase11_chat_message_delete_allowed", 1,
+        lambda chat_id: int(
+            isinstance(chat_id, str) and chat_id in state["phase11_chat_deletions"]
+        ),
+    )
+    dbapi_connection.create_function(
         "bots5_phase9_import_chat_allowed", 7,
         lambda identifier, title, created_at, updated_at, head_id, revision, archived_at: int(
             isinstance(identifier, str)
@@ -742,6 +762,60 @@ def clear_phase9_import_graph(connection: Any) -> None:
         state["phase9_import_nodes"] = []
         state["phase9_import_branches"] = {}
         state["phase9_object_derivations"] = {}
+        state["phase11_duplicate_messages"] = {}
+
+
+def arm_phase11_duplicate_messages(
+    connection: Any, rows: tuple[tuple[object, ...], ...]
+) -> None:
+    """Arm one duplication transaction's message inserts.
+
+    Every row is the full message identity and content tuple for a message
+    that duplicate_chat is about to insert: (id, chat_id, parent_id,
+    sequence, role, state, content, created_at, lineage_id, revision,
+    supersedes_id).  The trigger call has no way to introduce an arbitrary
+    row once the arm exists.
+    """
+    state = connection.info.get(_STATE_KEY)
+    if state is None:
+        raise RuntimeError("SQLite transition guard is not installed")
+    if state["phase11_duplicate_messages"]:
+        raise RuntimeError("SQLite duplication arm is already armed")
+    values = {str(row[0]): tuple(row[1:]) for row in rows}
+    if len(values) != len(rows):
+        raise RuntimeError("SQLite duplication grant is contradictory")
+    state["phase11_duplicate_messages"] = values
+
+
+def clear_phase11_duplicate_messages(connection: Any) -> None:
+    state = connection.info.get(_STATE_KEY)
+    if state is not None:
+        state["phase11_duplicate_messages"] = {}
+
+
+def arm_phase11_chat_deletion(connection: Any, chat_id: str) -> None:
+    """Admit the removal of exactly one chat's message rows (Phase 11 F7).
+
+    The 0017 ``messages_delete_immutable`` trigger consults this arm, so a
+    whole-chat deletion (whose ``chats`` delete cascades into ``messages``)
+    can complete while every delete that is NOT part of an admitted chat
+    deletion is still refused.  The arm is connection-local and must be
+    cleared with the transaction, exactly like the duplication arm above.
+    """
+    if not isinstance(chat_id, str) or not chat_id:
+        raise RuntimeError("phase 11 chat-deletion arm requires a chat id")
+    state = connection.info.get(_STATE_KEY)
+    if state is None:
+        raise RuntimeError("SQLite transition guard is not installed")
+    if state["phase11_chat_deletions"]:
+        raise RuntimeError("SQLite chat-deletion arm is already armed")
+    state["phase11_chat_deletions"] = frozenset({chat_id})
+
+
+def clear_phase11_chat_deletion(connection: Any) -> None:
+    state = connection.info.get(_STATE_KEY)
+    if state is not None:
+        state["phase11_chat_deletions"] = frozenset()
 
 
 def arm_phase9_object_derivations(

@@ -16,6 +16,9 @@ from bots5.domain.models import (
     AttemptState,
     ChatActivity,
     Chat,
+    ChatDeletionInventory,
+    ChatSort,
+    Folder,
     GenerationAttempt,
     Message,
     MessageRole,
@@ -456,6 +459,12 @@ class BotsApplication:
         inspector_open: bool = False,
         inspector_message_id: str | None = None,
         inspector_leaf_message_id: str | None = None,
+        maximized: bool = False,
+        transcript_scroll_position: int | None = None,
+        search_open: bool = False,
+        search_query: str | None = None,
+        search_filters: SearchFilters | None = None,
+        search_cursor: str | None = None,
     ) -> WorkspaceWindowState:
         self._ensure_open()
         state = WorkspaceWindowState(
@@ -469,6 +478,12 @@ class BotsApplication:
             inspector_open=inspector_open,
             inspector_message_id=inspector_message_id,
             inspector_leaf_message_id=inspector_leaf_message_id,
+            maximized=maximized,
+            transcript_scroll_position=transcript_scroll_position,
+            search_open=search_open,
+            search_query=search_query,
+            search_filters=search_filters,
+            search_cursor=search_cursor,
         )
         self._store.save_workspace_window(state)
         return state
@@ -477,6 +492,60 @@ class BotsApplication:
     async def delete_workspace_window(self, window_id: str) -> None:
         self._ensure_open()
         self._store.delete_workspace_window(window_id)
+
+    @_tracked_command
+    async def get_chat_draft(self, chat_id: str) -> str:
+        self._ensure_open()
+        return self._store.get_chat_draft(chat_id)
+
+    @_tracked_command
+    async def save_chat_draft(self, chat_id: str, draft_text: str) -> None:
+        self._ensure_open()
+        self._store.save_chat_draft(chat_id, draft_text)
+
+    @_tracked_command
+    async def get_dock_layout(self, window_id: str) -> bytes | None:
+        self._ensure_open()
+        return self._store.get_dock_layout(window_id)
+
+    @_tracked_command
+    async def save_dock_layout(self, window_id: str, dock_state_blob: bytes) -> None:
+        self._ensure_open()
+        self._store.save_dock_layout(window_id, dock_state_blob)
+
+    @_tracked_command
+    async def get_keybinding_override(self, action_id: str) -> str:
+        self._ensure_open()
+        return self._store.get_keybinding_override(action_id)
+
+    @_tracked_command
+    async def save_keybinding_override(
+        self, action_id: str, shortcut: str, conflict_detected: bool = False
+    ) -> None:
+        self._ensure_open()
+        self._store.save_keybinding_override(action_id, shortcut, conflict_detected)
+
+    @_tracked_command
+    async def reset_keybinding_overrides(self) -> None:
+        self._ensure_open()
+        self._store.reset_keybinding_overrides()
+
+    @_tracked_command
+    async def get_font_scale_settings(self) -> tuple[float, str | None, str | None, str | None, float]:
+        self._ensure_open()
+        return self._store.get_font_scale_settings()
+
+    @_tracked_command
+    async def save_font_scale_settings(
+        self,
+        scale_factor: float,
+        ui_font_family: str | None,
+        transcript_font_family: str | None,
+        code_font_family: str | None,
+        base_font_size_pt: float,
+    ) -> None:
+        self._ensure_open()
+        self._store.save_font_scale_settings(scale_factor, ui_font_family, transcript_font_family, code_font_family, base_font_size_pt)
 
     @_tracked_command
     async def create_backup(
@@ -570,9 +639,169 @@ class BotsApplication:
         return chat
 
     @_tracked_command
-    async def list_chats(self) -> tuple[Chat, ...]:
+    async def rename_chat(
+        self, chat_id: str, title: str, *, expected_revision: int | None = None
+    ) -> Chat:
+        """Rename a chat title with CAS and Phase 7 search receipt."""
         self._ensure_open()
-        return self._store.list_chats()
+        chat = self._store.rename_chat(chat_id, title, expected_revision=expected_revision)
+        await self._events.publish(
+            "chat_title_changed",
+            chat_id=chat.id,
+            title=chat.title,
+        )
+        self._ensure_open()
+        return chat
+
+    @_tracked_command
+    async def duplicate_chat(
+        self,
+        chat_id: str,
+        *,
+        include_full_branch_tree: bool = False,
+        title: str | None = None,
+    ) -> tuple[Chat, tuple[Message, ...]]:
+        """Duplicate a chat with its messages."""
+        self._ensure_open()
+        new_chat, new_messages = self._store.duplicate_chat(
+            chat_id,
+            clock=self._clock,
+            ids=self._ids,
+            include_full_branch_tree=include_full_branch_tree,
+            title=title,
+        )
+        await self._events.publish(
+            "chat_duplicated",
+            chat_id=new_chat.id,
+            source_chat_id=chat_id,
+            title=new_chat.title,
+        )
+        self._ensure_open()
+        return new_chat, new_messages
+
+    # ------------------------------------------------------------------
+    # Phase 11 M3 (F4/F5/F7): folders, pins and deletion.  Every command
+    # follows the landed rename_chat/duplicate_chat pattern: one tracked
+    # command scope, one store operation, one published event, and a
+    # post-scope open re-check before the result is handed back.
+    # ------------------------------------------------------------------
+
+    @_tracked_command
+    async def create_folder(self, name: str) -> Folder:
+        """Create one flat organisation folder (F4)."""
+        self._ensure_open()
+        folder = self._store.create_folder(name, clock=self._clock, ids=self._ids)
+        await self._events.publish(
+            "folder_created",
+            folder_id=folder.id,
+            name=folder.name,
+        )
+        self._ensure_open()
+        return folder
+
+    @_tracked_command
+    async def rename_folder(self, folder_id: str, name: str) -> Folder:
+        """Rename one organisation folder (F4)."""
+        self._ensure_open()
+        folder = self._store.rename_folder(folder_id, name)
+        await self._events.publish(
+            "folder_renamed",
+            folder_id=folder.id,
+            name=folder.name,
+        )
+        self._ensure_open()
+        return folder
+
+    @_tracked_command
+    async def delete_folder(self, folder_id: str) -> None:
+        """Delete one folder; members are unfiled, never deleted (F4)."""
+        self._ensure_open()
+        self._store.delete_folder(folder_id)
+        await self._events.publish("folder_deleted", folder_id=folder_id)
+        self._ensure_open()
+
+    @_tracked_command
+    async def list_folders(self) -> tuple[Folder, ...]:
+        self._ensure_open()
+        return self._store.list_folders()
+
+    @_tracked_command
+    async def set_chat_folder(
+        self,
+        chat_id: str,
+        folder_id: str | None,
+    ) -> Chat:
+        """Move one chat into a folder, or unfile it with None (F4)."""
+        self._ensure_open()
+        chat = self._store.set_chat_folder(chat_id, folder_id)
+        await self._events.publish(
+            "chat_folder_changed",
+            chat_id=chat.id,
+            folder_id=chat.folder_id,
+        )
+        self._ensure_open()
+        return chat
+
+    @_tracked_command
+    async def set_chat_pinned(
+        self,
+        chat_id: str,
+        pinned: bool,
+    ) -> Chat:
+        """Set or clear the floating pin on one chat (F5)."""
+        self._ensure_open()
+        chat = self._store.set_chat_pinned(chat_id, pinned)
+        await self._events.publish(
+            "chat_pin_changed",
+            chat_id=chat.id,
+            is_pinned=chat.is_pinned,
+        )
+        self._ensure_open()
+        return chat
+
+    @_tracked_command
+    async def describe_chat_deletion(self, chat_id: str) -> ChatDeletionInventory:
+        """Compute the F7 loss inventory for the deliberate confirmation."""
+        self._ensure_open()
+        return self._store.describe_chat_deletion(chat_id)
+
+    @_tracked_command
+    async def delete_message(self, chat_id: str, message_id: str) -> Message:
+        """Tombstone one message (F7): state 'deleted', content gone."""
+        self._ensure_open()
+        message = self._store.delete_message(chat_id, message_id)
+        await self._events.publish(
+            "message_deleted",
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+        self._ensure_open()
+        return message
+
+    @_tracked_command
+    async def delete_chat(
+        self,
+        chat_id: str,
+        *,
+        expected_revision: int | None = None,
+    ) -> None:
+        """Delete one whole chat (F7). Requires the loss-inventory confirmation first."""
+        self._ensure_open()
+        self._store.delete_chat(chat_id, expected_revision=expected_revision)
+        await self._events.publish(
+            "chat_deleted",
+            chat_id=chat_id,
+        )
+        self._ensure_open()
+
+    @_tracked_command
+    async def list_chats(
+        self,
+        *,
+        sort: domain.ChatSort | None = None,
+    ) -> tuple[Chat, ...]:
+        self._ensure_open()
+        return self._store.list_chats(sort=sort)
 
     @_tracked_command
     async def open_chat(
@@ -741,7 +970,7 @@ class BotsApplication:
                 for item in values if item.payload is not None
             },
             attachment_policy=attachment_policy, chat_configuration=source.chat_configuration,
-            application_version="0.1.0", migration_revision="0012_phase9_archive_import",
+            application_version="0.1.0", migration_revision="0016_phase11_workspace_state",
             context_plans=source.context_plans,
             **({
                 "object_provenance": source.object_provenance,
@@ -1271,6 +1500,7 @@ class BotsApplication:
         settings,
         *,
         expected_revision: int | None = None,
+        expected_extra_revision: int | None = None,
         expected_model_entry_id: str | None = None,
     ):
         self._ensure_open()
@@ -1288,7 +1518,8 @@ class BotsApplication:
 
         _validate_settings(settings)
         revision = self._store.set_chat_model_generation_settings(
-            chat_id, selection.model_entry_id, settings, expected_revision=expected_revision
+            chat_id, selection.model_entry_id, settings, expected_revision=expected_revision,
+            expected_extra_revision=expected_extra_revision,
         )
         await self._events.publish(
             "chat_model_generation_settings_changed",
@@ -1299,7 +1530,7 @@ class BotsApplication:
         return await self.resolve_chat_generation_settings(chat_id)
 
     @_tracked_command
-    async def set_application_generation_settings(self, settings, *, expected_revision: int | None = None):
+    async def set_application_generation_settings(self, settings, *, expected_revision: int | None = None, expected_extra_revision: int | None = None):
         self._ensure_open()
         if self._configuration is None:
             raise StateError("provider/model configuration is unavailable")
@@ -1307,7 +1538,8 @@ class BotsApplication:
 
         _validate_settings(settings)
         revision = self._store.set_application_generation_settings(
-            settings, expected_revision=expected_revision
+            settings, expected_revision=expected_revision,
+            expected_extra_revision=expected_extra_revision,
         )
         await self._events.publish("application_generation_settings_changed", revision=revision)
         return revision
@@ -1550,11 +1782,11 @@ class BotsApplication:
         return revision
 
     @_tracked_command
-    async def set_model_defaults(self, model_entry_id: str, settings, *, expected_revision: int | None = None):
+    async def set_model_defaults(self, model_entry_id: str, settings, *, expected_revision: int | None = None, expected_extra_revision: int | None = None):
         self._ensure_open()
         if self._configuration is None:
             raise StateError("provider/model configuration is unavailable")
-        revision = self._configuration.set_model_defaults(model_entry_id, settings, expected_revision=expected_revision)
+        revision = self._configuration.set_model_defaults(model_entry_id, settings, expected_revision=expected_revision, expected_extra_revision=expected_extra_revision)
         await self._events.publish("model_generation_settings_changed", model_entry_id=model_entry_id, revision=revision)
         return revision
 
@@ -1571,6 +1803,30 @@ class BotsApplication:
         if self._configuration is None:
             return None, None
         return self._store.get_model_generation_config(model_entry_id)
+
+    @_tracked_command
+    async def model_generation_settings_extra(self, model_entry_id: str):
+        """Registry-driven (extra) defaults for one model with their revision."""
+        self._ensure_open()
+        if self._configuration is None:
+            return None, None
+        return self._store.get_model_generation_settings_extra(model_entry_id)
+
+    @_tracked_command
+    async def application_generation_settings_extra(self):
+        """Registry-driven (extra) application defaults."""
+        self._ensure_open()
+        if self._configuration is None:
+            return {}
+        return self._store.get_application_generation_settings_extra()
+
+    @_tracked_command
+    async def application_generation_settings_extra_with_revision(self):
+        """Registry-driven (extra) application defaults plus their revision."""
+        self._ensure_open()
+        if self._configuration is None:
+            return {}, 0
+        return self._store.get_application_generation_settings_extra_config()
 
     @_tracked_command
     async def application_generation_config(self):
@@ -1596,11 +1852,42 @@ class BotsApplication:
         return self._store.list_capability_overrides(model_entry_id)
 
     @_tracked_command
+    async def generation_setting_capability_overrides(self, model_entry_id: str):
+        """Manual per-setting capability overrides for the extended keys."""
+        self._ensure_open()
+        if self._configuration is None:
+            return ()
+        return self._store.list_generation_setting_capability_overrides(model_entry_id)
+
+    @_tracked_command
     async def model_capabilities(self, model_entry_id: str):
         self._ensure_open()
         if self._configuration is None:
             return ()
         return self._configuration.resolve_capabilities(model_entry_id)
+
+    @_tracked_command
+    async def generation_setting_capabilities(self, model_entry_id: str):
+        """Per-setting capability resolution for the Tune surface.
+
+        Returns the extended registry capability keys (never the frozen Phase
+        5 catalogue keys) resolved under the existing precedence rules.
+        """
+        self._ensure_open()
+        if self._configuration is None:
+            return {}
+        return self._configuration.resolve_generation_setting_capabilities(model_entry_id)
+
+    @_tracked_command
+    async def chat_generation_settings_extra_override(self, chat_id: str):
+        """Return (extra override values, extra revision) for the selected model."""
+        self._ensure_open()
+        if self._configuration is None:
+            return None, None
+        selection = self._configuration.get_selection(chat_id)
+        if selection.model_entry_id is None:
+            return None, None
+        return self._store.get_chat_model_generation_settings_extra(chat_id, selection.model_entry_id)
 
     def _new_assistant(
         self,

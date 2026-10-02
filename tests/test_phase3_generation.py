@@ -108,7 +108,7 @@ def test_phase3_outcome_columns_are_additive_and_nullable(tmp_path: Path):
         with store.command_admission():
             with store.engine.connect() as connection:
                 assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-                    "0012_phase9_archive_import"
+                    "0019_phase11_generation_settings"
                 )
     finally:
         store.close()

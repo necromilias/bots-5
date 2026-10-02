@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
 from functools import wraps
-from typing import Any
+from typing import Any, Mapping
 
 from bots5.domain.provider import (
     BackendType,
@@ -23,12 +23,31 @@ from bots5.domain.provider import (
     ModelCatalogueEntry,
     ModelSelection,
     PHASE5_SNAPSHOT_VERSION,
+    PHASE11_SNAPSHOT_VERSION,
     PreparedGeneration,
     ProviderConnection,
     ProviderProfile,
     ResolvedCapability,
     ResolvedGenerationSettings,
     validate_capability_value,
+)
+from bots5.domain.generation_settings_registry import (
+    EMISSION_ORDER,
+    EXTENDED_SETTING_KEYS,
+    SETTING_DEFINITIONS_BY_KEY,
+    SETTING_STATES,
+    SETTING_CAPABILITY_KEYS,
+    STATE_EMITTED,
+    STATE_OMITTED_INVALID,
+    STATE_OMITTED_UNKNOWN,
+    STATE_OMITTED_UNSERIALIZABLE,
+    STATE_OMITTED_UNSUPPORTED,
+    STATE_UNSET,
+    PayloadFamily,
+    SettingResolution,
+    SettingsEmissionPlan,
+    GenerationSettingsPayload,
+    validate_settings_values,
 )
 from bots5.core.urls import canonical_http_base_url
 from bots5.core.secrets import SecretStore, SecretStoreError, sanitize_secret_error
@@ -105,6 +124,80 @@ def _validate_settings(settings: GenerationSettings) -> None:
         or settings.timeout_seconds <= 0
     ):
         raise StateError("timeout must be positive when configured")
+    # Registry-driven settings are validated by the closed domain registry.
+    try:
+        validate_settings_values(dict(settings.extra))
+    except ValueError as exc:
+        raise StateError(str(exc)) from None
+    if settings.reasoning_effort is not None and settings.extra.get("reasoning_effort_level") is not None:
+        raise StateError("reasoning_effort and reasoning_effort_level are mutually exclusive")
+
+
+def resolve_setting_emission_plan(
+    resolved: ResolvedGenerationSettings,
+    capabilities: Mapping[str, ResolvedCapability],
+    *,
+    family: PayloadFamily | None,
+    profile: str | None,
+) -> SettingsEmissionPlan:
+    """Decide, per normalized setting, whether it may be emitted.
+
+    A setting is emitted only when ALL of the following hold:
+
+    1. B.O.T.S. has a typed definition (guaranteed: unknown keys are refused
+       at every boundary),
+    2. its value validates (guaranteed at the persistence boundary; re-checked
+       here so a legacy row can never resurrect an invalid value),
+    3. the selected model/connection resolves it as supported,
+    4. the adapter family knows how to serialize it for this profile.
+
+    Otherwise the setting is omitted with an explicit reason.  Legacy settings
+    keep their exact pre-amendment emission vocabulary; the extended plane
+    uses the registry state vocabulary.
+    """
+    resolutions: list[SettingResolution] = []
+    payload_values: dict[str, object] = {}
+    for key in EMISSION_ORDER:
+        definition = SETTING_DEFINITIONS_BY_KEY[key]
+        if definition.legacy:
+            value = getattr(resolved, key)
+            if key == "timeout_seconds":
+                state = "unset" if value is None else "BOTS-owned deadline"
+            elif value is None:
+                state = STATE_UNSET
+            else:
+                state = STATE_EMITTED
+            resolutions.append(SettingResolution(key, value, resolved.provenance.get(key, "application"), "none" if definition.capability_key is None else capabilities.get(definition.capability_key, _UNKNOWN_CAPABILITY).state.value, state))
+            continue
+        value = resolved.extra.get(key)
+        if value is None:
+            resolutions.append(SettingResolution(key, None, "", STATE_UNSET, STATE_UNSET))
+            continue
+        capability = capabilities.get(definition.capability_key or "")
+        capability_state = "unset" if capability is None else capability.state.value
+        if capability is None or capability.state is CapabilityState.UNKNOWN:
+            resolutions.append(SettingResolution(key, value, resolved.provenance.get(key, ""), capability_state, STATE_OMITTED_UNKNOWN, "capability unknown"))
+            continue
+        if capability.state is not CapabilityState.SUPPORTED:
+            resolutions.append(SettingResolution(key, value, resolved.provenance.get(key, ""), capability_state, STATE_OMITTED_UNSUPPORTED, "not supported by the selected model or endpoint"))
+            continue
+        mapping = None if family is None else definition.serialization_for(family, profile)
+        if mapping is None:
+            resolutions.append(SettingResolution(key, value, resolved.provenance.get(key, ""), capability_state, STATE_OMITTED_UNSERIALIZABLE, "no truthful serialization for this endpoint family"))
+            continue
+        try:
+            definition.validate(value)
+            normalized = definition.normalize(value)
+        except ValueError as exc:
+            resolutions.append(SettingResolution(key, value, resolved.provenance.get(key, ""), capability_state, STATE_OMITTED_INVALID, str(exc)))
+            continue
+        payload_values[key] = normalized
+        resolutions.append(SettingResolution(key, normalized, resolved.provenance.get(key, ""), capability_state, STATE_EMITTED))
+    payload = GenerationSettingsPayload(**payload_values) if payload_values else None
+    return SettingsEmissionPlan(tuple(resolutions), payload)
+
+
+_UNKNOWN_CAPABILITY = ResolvedCapability("", CapabilityState.UNKNOWN, CapabilitySource.UNKNOWN)
 
 
 def resolve_capability(
@@ -372,14 +465,31 @@ class ProviderConfiguration:
         )
 
     @_configuration_operation
-    def set_model_defaults(self, model_entry_id: str, settings: GenerationSettings, *, expected_revision: int | None = None) -> int:
+    def set_model_defaults(self, model_entry_id: str, settings: GenerationSettings, *, expected_revision: int | None = None, expected_extra_revision: int | None = None) -> int:
         _validate_settings(settings)
-        return self.store.set_model_generation_settings(model_entry_id, settings, expected_revision=expected_revision)
+        return self.store.set_model_generation_settings(model_entry_id, settings, expected_revision=expected_revision, expected_extra_revision=expected_extra_revision)
 
     @_configuration_operation
     def set_capability_override(self, override: CapabilityOverride, *, expected_revision: int | None = None) -> CapabilityOverride:
-        if override.key not in {key.value for key in CapabilityKey}:
-            raise StateError("unknown capability key")
+        if override.key in CAPABILITY_KEYS:
+            return self._set_frozen_capability_override(override, expected_revision=expected_revision)
+        if override.key in SETTING_CAPABILITY_KEYS:
+            # Extended per-setting overrides live in their own table so the
+            # frozen capability_overrides triggers keep their closed key set.
+            current = next(
+                (
+                    item
+                    for item in self.store.list_generation_setting_capability_overrides(override.model_entry_id)
+                    if item.key == override.key
+                ),
+                None,
+            )
+            if current is not None:
+                override = replace(override, revision=current.revision + 1, updated_at=self.clock.now())
+            return self.store.set_generation_setting_capability_override(override, expected_revision=expected_revision)
+        raise StateError("unknown capability key")
+
+    def _set_frozen_capability_override(self, override: CapabilityOverride, *, expected_revision: int | None = None) -> CapabilityOverride:
         current = next(
             (item for item in self.store.list_capability_overrides(override.model_entry_id) if item.key == override.key),
             None,
@@ -411,8 +521,14 @@ class ProviderConfiguration:
         app = self.store.get_application_generation_settings()
         model = self.store.get_model_generation_settings(model_entry_id)
         chat = self.store.get_chat_model_generation_settings(chat_id, model_entry_id)
+        # Registry-driven (extra) settings resolve through the same explicit
+        # hierarchy: application defaults -> model defaults -> chat overrides.
+        app_extra = self.store.get_application_generation_settings_extra()
+        model_extra, _model_extra_revision = self.store.get_model_generation_settings_extra(model_entry_id)
+        chat_extra, _chat_extra_revision = self.store.get_chat_model_generation_settings_extra(chat_id, model_entry_id)
         values: dict[str, object] = {}
         provenance: dict[str, str] = {}
+        extra_values: dict[str, object] = {}
         for key, default in (
             ("temperature", DEFAULT_TEMPERATURE),
             ("max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS),
@@ -433,7 +549,17 @@ class ProviderConfiguration:
                 value = default
             values[key] = value
             provenance[key] = source
-        settings = GenerationSettings(**values)
+        for key in EXTENDED_SETTING_KEYS:
+            if chat_extra is not None and chat_extra.get(key) is not None:
+                extra_values[key] = chat_extra[key]
+                provenance[key] = "chat_model"
+            elif model_extra is not None and model_extra.get(key) is not None:
+                extra_values[key] = model_extra[key]
+                provenance[key] = "model"
+            elif app_extra.get(key) is not None:
+                extra_values[key] = app_extra[key]
+                provenance[key] = "application"
+        settings = GenerationSettings(**values, extra=extra_values)
         _validate_settings(settings)
         return ResolvedGenerationSettings(
             temperature=float(settings.temperature),
@@ -441,6 +567,7 @@ class ProviderConfiguration:
             reasoning_effort=settings.reasoning_effort,
             timeout_seconds=(None if settings.timeout_seconds is None else float(settings.timeout_seconds)),
             provenance=provenance,
+            extra=dict(extra_values),
         )
 
     @_configuration_operation
@@ -469,6 +596,46 @@ class ProviderConfiguration:
             resolve_capability(facts, overrides.get(key), key)
             for key in sorted(CAPABILITY_KEYS)
         )
+
+    @_configuration_operation
+    def resolve_generation_setting_capabilities(self, model_entry_id: str) -> dict[str, ResolvedCapability]:
+        """Resolve the extended per-setting capability keys for one model.
+
+        Extended setting capability keys are additive to the frozen Phase 5
+        capability catalogue: they never appear in a Phase 5 snapshot's
+        capability fact list.  Support follows the existing precedence rules
+        (manual override over confirmed endpoint over provider metadata);
+        the absence of any fact resolves to UNKNOWN and the setting stays
+        omitted — OpenAI compatibility is never treated as evidence.
+        """
+        facts = self.store.list_capability_facts(model_entry_id)
+        model = self.store.get_model_catalogue_entry(model_entry_id)
+        connection = None if model is None else self.store.get_provider_connection(model.connection_id)
+        catalogue_revision = None if connection is None else connection.catalogue_revision
+        if catalogue_revision is not None:
+            facts = tuple(
+                fact
+                for fact in facts
+                if not (
+                    fact.source in {
+                        CapabilitySource.CONFIRMED_ENDPOINT,
+                        CapabilitySource.PROVIDER_METADATA,
+                    }
+                    and fact.source_revision is not None
+                    and fact.source_revision != catalogue_revision
+                )
+            )
+        overrides = {
+            item.key: item for item in self.store.list_capability_overrides(model_entry_id)
+        }
+        overrides.update({
+            item.key: item
+            for item in self.store.list_generation_setting_capability_overrides(model_entry_id)
+        })
+        return {
+            key: resolve_capability(facts, overrides.get(key), key)
+            for key in sorted(SETTING_CAPABILITY_KEYS)
+        }
 
     @_configuration_operation
     def phase6_capability_present(self, chat_id: str) -> bool:
@@ -531,6 +698,7 @@ class ProviderConfiguration:
                 float(values["temperature"]), int(values["max_output_tokens"]),
                 values["reasoning_effort"], values["timeout_seconds"],
                 {key: ("branch" if branch_explicit_settings[key] is not None else settings.provenance[key]) for key in values},
+                extra=settings.extra,
             )
         capabilities = self.resolve_capabilities(model.id)
         by_key = {item.key: item for item in capabilities}
@@ -577,9 +745,14 @@ class ProviderConfiguration:
             }
             for item in capabilities
         ]
+        # The frozen v2 evidence schema pins manual_overrides to the closed
+        # Phase 5 capability catalogue; extended per-setting overrides are
+        # durable in the store and reflected through the generation-settings
+        # emission states instead.
         manual_overrides = {
             item.key: {"state": item.state.value, "value": item.value, "revision": item.revision}
             for item in self.store.list_capability_overrides(model.id)
+            if item.key in CAPABILITY_KEYS
         }
         omitted = {
             "temperature": "emitted",
@@ -587,6 +760,30 @@ class ProviderConfiguration:
             "reasoning_effort": "unset" if settings.reasoning_effort is None else "emitted",
             "timeout_seconds": "unset" if settings.timeout_seconds is None else "BOTS-owned deadline",
         }
+        # Phase 11 scope amendment: per-setting capability gating for the
+        # registry-driven (extended) settings plane.  With no extended setting
+        # configured anywhere the plan stays empty and the request/snapshot
+        # contract is byte-identical to the pre-amendment v2 behaviour.
+        emission_plan: SettingsEmissionPlan | None = None
+        if settings.extra:
+            if phase6:
+                raise StateError(
+                    "extended generation settings require the OpenAI-compatible request path"
+                )
+            extended_capabilities = self.resolve_generation_setting_capabilities(model.id)
+            capability_by_key = {item.key: item for item in capabilities}
+            capability_by_key.update(extended_capabilities)
+            family = (
+                None
+                if connection.backend_type is BackendType.FAKE
+                else PayloadFamily.OPENAI_COMPATIBLE
+            )
+            emission_plan = resolve_setting_emission_plan(
+                settings,
+                capability_by_key,
+                family=family,
+                profile=connection.profile.value,
+            )
         app_settings, _default_model, application_settings_revision = self.store.get_application_generation_config()
         _model_settings, model_settings_revision = self.store.get_model_generation_config(model.id)
         _chat_settings, chat_settings_revision = self.store.get_chat_model_generation_config(chat_id, model.id)
@@ -663,11 +860,22 @@ class ProviderConfiguration:
             capability_provenance={item.key: {"source": item.source.value, **item.provenance} for item in capabilities},
             manual_overrides=manual_overrides,
             omitted_settings=omitted,
+            generation_settings=(None if emission_plan is None else emission_plan.payload),
+            generation_setting_states=(
+                None if emission_plan is None else dict(emission_plan.as_evidence()["states"])
+            ),
             timeout_seconds=settings.timeout_seconds,
             system_prompt=(None if context_plan is None else ""),
             wire_representation=(None if context_plan is None else context_plan.wire_representation),
             context_plan_digest=(None if context_plan is None else context_plan.canonical_digest),
         )
+        # The frozen Phase 5 evidence schema pins the legacy provenance to the
+        # four legacy keys; the extended plane's provenance rides the v4
+        # ``generation_settings`` evidence object instead.
+        legacy_provenance = {
+            key: settings.provenance.get(key, "application")
+            for key in ("temperature", "max_output_tokens", "reasoning_effort", "timeout_seconds")
+        }
         snapshot = {
             "snapshot_version": PHASE5_SNAPSHOT_VERSION,
             "attempt_id": attempt_id,
@@ -688,7 +896,7 @@ class ProviderConfiguration:
             "catalogue_revision": connection.catalogue_revision,
             "prompt": prompt,
             "effective_settings": settings.as_dict(),
-            "settings_provenance": settings.provenance,
+            "settings_provenance": legacy_provenance,
             "capabilities": capabilities_json,
             "capability_provenance": {
                 item.key: {"source": item.source.value, **item.provenance}
@@ -697,6 +905,11 @@ class ProviderConfiguration:
             "manual_overrides": manual_overrides,
             "omitted_settings": omitted,
         }
+        if emission_plan is not None:
+            # Additive v4 evidence: the closed v2 contract plus the complete
+            # normalized generation-settings decision record.
+            snapshot["snapshot_version"] = PHASE11_SNAPSHOT_VERSION
+            snapshot["generation_settings"] = emission_plan.as_evidence()
         if context_plan is not None:
             snapshot["settings_revisions"] = settings_revisions
             snapshot_text = phase6_snapshot(

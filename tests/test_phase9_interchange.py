@@ -45,8 +45,12 @@ def test_request_snapshot_statuses_are_closed_and_do_not_return_raw_bytes():
     assert _archive_snapshot(legacy, "prompt")["status"] == "legacy-limited"
     corrupt = GenerationAttempt(request_snapshot="{}", **base)
     assert _archive_snapshot(corrupt, "prompt") == {"status": "corrupt"}
-    unsupported = GenerationAttempt(request_snapshot='{"snapshot_version":4,"endpoint":"https://sentinel.invalid"}', **base)
+    unsupported = GenerationAttempt(request_snapshot='{"snapshot_version":99,"endpoint":"https://sentinel.invalid"}', **base)
     assert _archive_snapshot(unsupported, "prompt") == {"status": "unsupported"}
+    # A v4 snapshot (the additive generation-settings version) that violates
+    # its closed schema is corrupt, never projected raw.
+    corrupt_v4 = GenerationAttempt(request_snapshot='{"snapshot_version":4,"endpoint":"https://sentinel.invalid"}', **base)
+    assert _archive_snapshot(corrupt_v4, "prompt") == {"status": "corrupt"}
 
 
 def test_transcript_uses_head_path_and_code_fences_raw_html():

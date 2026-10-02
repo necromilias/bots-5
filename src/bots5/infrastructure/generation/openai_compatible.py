@@ -13,6 +13,7 @@ from bots5.core.generation import (
     GenerationRequest,
 )
 from bots5.core.urls import canonical_http_base_url
+from bots5.domain.generation_settings_registry import SETTING_KEY_BY_CAPABILITY_KEY
 from bots5.errors import ProviderError, ProviderHttpError, ProviderResponseError
 from bots5.providers.base import (
     CompletionRequest,
@@ -20,6 +21,32 @@ from bots5.providers.base import (
     ReasoningEffort,
     StreamingProvider,
 )
+
+
+def _setting_capability_states(
+    capabilities: object,
+) -> dict[str, str]:
+    """Project request capability facts onto normalized setting keys.
+
+    The provider boundary needs the capability state per *setting* key so it can
+    refuse an ``emitted`` state that contradicts an explicit unsupported/unknown
+    capability fact.  Unknown or malformed entries are ignored here; the
+    boundary still fails closed on missing state evidence.
+    """
+    projected: dict[str, str] = {}
+    if not isinstance(capabilities, (list, tuple)):
+        return projected
+    for item in capabilities:
+        if not isinstance(item, dict):
+            continue
+        capability_key = item.get("key")
+        state = item.get("state")
+        if not isinstance(capability_key, str) or state is None:
+            continue
+        setting_key = SETTING_KEY_BY_CAPABILITY_KEY.get(capability_key)
+        if setting_key is not None:
+            projected[setting_key] = str(state)
+    return projected
 
 
 class OpenAICompatibleStreamingBackend:
@@ -120,6 +147,14 @@ class OpenAICompatibleStreamingBackend:
             max_output_tokens=int((request.effective_settings or {}).get("max_output_tokens", self.max_output_tokens)),
             timeout_seconds=float(request.timeout_seconds or 0.0),
             reasoning_effort=(request.effective_settings or {}).get("reasoning_effort", self.reasoning_effort),
+            # Typed, capability-resolved payload settings; the adapter never
+            # reads free-form dictionaries for them.  The emitted-state
+            # evidence travels with the payload so the provider boundary can
+            # refuse anything the emission planner did not authorise.
+            generation_settings=request.generation_settings,
+            generation_setting_states=request.generation_setting_states,
+            generation_setting_capabilities=_setting_capability_states(request.capabilities),
+            generation_omitted_settings=request.omitted_settings,
         )
         metadata = CompletionStreamEvent()
         finish_reason: str | None = None

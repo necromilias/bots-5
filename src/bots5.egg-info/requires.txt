@@ -1,0 +1,17 @@
+httpx<1,>=0.27
+PySide6<7,>=6.8
+qasync<1,>=0.28
+SQLAlchemy<3,>=2
+alembic<2,>=1
+pydantic<3,>=2
+platformdirs<5,>=4
+uuid6<2027,>=2024.7.10
+keyring<26,>=25
+secretstorage<4,>=3
+markdown-it-py<4,>=3
+Pygments<3,>=2
+
+[dev]
+pytest>=8
+pytest-asyncio<1,>=0.24
+pytest-qt<5,>=4.4

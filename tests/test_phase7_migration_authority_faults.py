@@ -42,7 +42,7 @@ from tests._authority_test_support import upgrade_to
 
 
 REPO = Path(__file__).resolve().parents[1]
-HEAD = "0012_phase9_archive_import"
+HEAD = "0019_phase11_generation_settings"
 PRIOR_REVISIONS = (
     "0001_desktop_state",
     "0002_conversation_lineage",
@@ -54,6 +54,10 @@ PRIOR_REVISIONS = (
     "0008_catalogue_refresh_outcomes",
     "0009_phase6_context_attachments",
     "0010_phase7_search_navigation",
+    "0011_phase8_inspector_state",
+    "0012_phase9_archive_import",
+    "0013_phase11_organisation",
+    "0014_phase11_message_tombstone",
 )
 PRIOR_MIGRATION_SHA256 = {
     "0001_desktop_state.py": "15b7a409d35e3313db288f201e67d2e23c0a89e6f90058ad367dc879034e2da1",
@@ -145,6 +149,21 @@ def test_phase1_through_phase6_migration_bytes_are_immutable():
         for path in sorted(directory.glob("000[1-9]_*.py"))
     }
     assert actual == PRIOR_MIGRATION_SHA256
+    # Phase 11 migrations 0013-0018 are frozen by the Phase 11 mutation fence.
+    # (0017/0018 were added after the original pin; the R16 falsification found
+    # they were unpinned, so they are pinned here too.)
+    phase11_migrations = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(directory.glob("001[3-8]_*.py"))
+    }
+    assert phase11_migrations == {
+        "0013_phase11_organisation.py": "b17b05b19841a544ed6256750892068e64a13d17f725c6c08fe5fd54443bcc87",
+        "0014_phase11_message_tombstone.py": "593e48ced3d4a0bed96035cd45c28b3aff806c40018f54de5b785759ce0c5cb2",
+        "0015_phase11_duplicate_admission.py": "a651ead02b4b4d767244fd682e44bdc196c2c3c4e88e25a88d445797484ca2b4",
+        "0016_phase11_workspace_state.py": "715da72382f3539e1ed0c82d8578cdbc569539e0afbd987528d51f9a56ed774c",
+        "0017_phase11_integrity.py": "eb20ec9c287698a3c76c3f55eea8c85f35d0766f4acf4f8525e41162aac66f76",
+        "0018_phase11_search_state.py": "2e11afeeee4304929cce80293eab3a0f0805c38c58f20abef062ffde0a70ee91",
+    }
 
 
 def test_fts5_preflight_failure_leaves_original_database_and_migration_areas_untouched(

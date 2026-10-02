@@ -10,6 +10,7 @@ from bots5.core.errors import StateError
 from bots5.core.events import CoreEvent
 from bots5.domain.ids import IdFactory, Uuid7Factory
 from bots5.domain.models import ChatActivity, WorkspaceWindowState
+from bots5.domain.search import SearchFilters
 
 from .bridge import CoreEventBridge
 from .profile import DesktopSessionInfo
@@ -152,6 +153,12 @@ class DesktopSessionController(QObject):
         inspector_open: bool = False,
         inspector_message_id: str | None = None,
         inspector_leaf_message_id: str | None = None,
+        maximized: bool = False,
+        transcript_scroll_position: int | None = None,
+        search_open: bool = False,
+        search_query: str | None = None,
+        search_filters: SearchFilters | None = None,
+        search_cursor: str | None = None,
     ) -> WorkspaceWindowState:
         return await self.application.save_workspace_window(
             window_id=window_id,
@@ -163,6 +170,12 @@ class DesktopSessionController(QObject):
             inspector_open=inspector_open,
             inspector_message_id=inspector_message_id,
             inspector_leaf_message_id=inspector_leaf_message_id,
+            maximized=maximized,
+            transcript_scroll_position=transcript_scroll_position,
+            search_open=search_open,
+            search_query=search_query,
+            search_filters=search_filters,
+            search_cursor=search_cursor,
         )
 
     async def unregister_window(
@@ -176,6 +189,12 @@ class DesktopSessionController(QObject):
         inspector_open: bool = False,
         inspector_message_id: str | None = None,
         inspector_leaf_message_id: str | None = None,
+        maximized: bool = False,
+        transcript_scroll_position: int | None = None,
+        search_open: bool = False,
+        search_query: str | None = None,
+        search_filters: SearchFilters | None = None,
+        search_cursor: str | None = None,
     ) -> None:
         if window_id not in self._windows:
             return
@@ -189,6 +208,12 @@ class DesktopSessionController(QObject):
                 inspector_open=inspector_open,
                 inspector_message_id=inspector_message_id,
                 inspector_leaf_message_id=inspector_leaf_message_id,
+                maximized=maximized,
+                transcript_scroll_position=transcript_scroll_position,
+                search_open=search_open,
+                search_query=search_query,
+                search_filters=search_filters,
+                search_cursor=search_cursor,
             )
         else:
             await self.application.delete_workspace_window(window_id)

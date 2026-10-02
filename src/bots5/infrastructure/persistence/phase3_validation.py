@@ -115,7 +115,9 @@ def is_phase3_record(
     # Phase 5 uses the historical nullable provider_id column for profile
     # attribution.  Its closed snapshot marker is the compatibility boundary
     # and must prevent those rows from being reclassified as Phase 3 rows.
-    if snapshot.get("snapshot_version") == 2:
+    # The Phase 11 v4 snapshot extends the same OpenAI-compatible contract
+    # and carries the same marker.
+    if snapshot.get("snapshot_version") in (2, 4):
         return False
     return (
         provider_id is not None
@@ -149,6 +151,21 @@ def validate_request_snapshot(
         try:
             from .phase5_validation import validate_phase5_snapshot
             return validate_phase5_snapshot(
+                request_snapshot,
+                attempt_id=attempt_id,
+                chat_id=chat_id,
+                user_message_id=user_message_id,
+                backend_id=backend_id,
+                model=model,
+                provider_id=provider_id,
+                user_message_content=user_message_content,
+            )
+        except ValueError as exc:
+            raise error_type(str(exc)) from exc
+    if snapshot.get("snapshot_version") == 4:
+        try:
+            from .phase11_validation import validate_phase11_snapshot
+            return validate_phase11_snapshot(
                 request_snapshot,
                 attempt_id=attempt_id,
                 chat_id=chat_id,

@@ -54,7 +54,7 @@ def _archive(entries=None):
     return archive_v2_bytes({
         "format": "org.necromilias.bots5.chat-archive", "archive_version": 2,
         "archive_id": "v2", "created_at": NOW, "source_application_version": "0.1",
-        "source_db_migration_revision": "0012_phase9_archive_import",
+        "source_db_migration_revision": "0016_phase11_workspace_state",
         "source_chat": {"source_id": "chat", "title": "title"},
         "attachment_policy": "embedded", "self_contained": True,
         "features": sorted(FEATURES), "external_resources": [],
@@ -275,7 +275,7 @@ def missing_external_archive(
     return archive_v2_bytes({
         "format": "org.necromilias.bots5.chat-archive", "archive_version": 2,
         "archive_id": "v2-missing", "created_at": NOW, "source_application_version": "0.1",
-        "source_db_migration_revision": "0012_phase9_archive_import",
+        "source_db_migration_revision": "0016_phase11_workspace_state",
         "source_chat": {"source_id": "chat", "title": "title"},
         "attachment_policy": "external-reference", "self_contained": False,
         "features": sorted(FEATURES),

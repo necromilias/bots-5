@@ -41,6 +41,12 @@ from bots5.core.campaign import (
     POLL_MAX_INTERVAL_MS,
 )
 
+from .theme import (
+    CAMPAIGN_DOCK_PRICING_HEIGHT,
+    CAMPAIGN_DOCK_PREFLIGHT_HEIGHT,
+    CAMPAIGN_DOCK_RESULT_HEIGHT,
+)
+
 
 class CampaignViewModel:
     """Immutable view model derived from a CampaignProjection.
@@ -328,7 +334,7 @@ class CampaignDockWidget(QDockWidget):
             '"input_usd_per_1m":"...","output_usd_per_1m":"...",'
             '"rate_source":"...","observed_at":"..."}]}'
         )
-        self._pricing_input.setMaximumHeight(72)
+        self._pricing_input.setMaximumHeight(CAMPAIGN_DOCK_PRICING_HEIGHT)
         self._pricing_input.setToolTip(
             "Operator-supplied currently advertised rates, cited source, and observation time per paid route"
         )
@@ -342,7 +348,7 @@ class CampaignDockWidget(QDockWidget):
         self._preflight_text = QTextEdit(parent)
         self._preflight_text.setObjectName("campaignPreflightSummary")
         self._preflight_text.setReadOnly(True)
-        self._preflight_text.setMaximumHeight(160)
+        self._preflight_text.setMaximumHeight(CAMPAIGN_DOCK_PREFLIGHT_HEIGHT)
         section.addWidget(self._preflight_text)
 
         job_controls = QHBoxLayout()
@@ -459,7 +465,6 @@ class CampaignDockWidget(QDockWidget):
         self._integrity_warnings_label = QLabel("", parent)
         self._integrity_warnings_label.setObjectName("campaignIntegrityWarningsLabel")
         self._integrity_warnings_label.setWordWrap(True)
-        self._integrity_warnings_label.setStyleSheet("color: #b00020;")
         section.addWidget(self._integrity_warnings_label)
 
         return section
@@ -475,7 +480,7 @@ class CampaignDockWidget(QDockWidget):
         self._result_text = QTextEdit(parent)
         self._result_text.setObjectName("campaignResultText")
         self._result_text.setReadOnly(True)
-        self._result_text.setMaximumHeight(200)
+        self._result_text.setMaximumHeight(CAMPAIGN_DOCK_RESULT_HEIGHT)
         section.addWidget(self._result_text, 1)
 
         return section
@@ -487,7 +492,6 @@ class CampaignDockWidget(QDockWidget):
         self._status_label = QLabel("", parent)
         self._status_label.setObjectName("campaignStatusLabel")
         self._status_label.setWordWrap(True)
-        self._status_label.setStyleSheet("color: #3366cc;")
         section.addWidget(self._status_label)
 
         return section

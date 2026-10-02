@@ -11,7 +11,12 @@ import httpx
 
 from ..core.urls import canonical_http_base_url
 from ..errors import ProviderError, ProviderHttpError, ProviderResponseError
-from .base import CompletionRequest, CompletionResult, CompletionStreamEvent
+from .base import (
+    CompletionRequest,
+    CompletionResult,
+    CompletionStreamEvent,
+    serialize_generation_settings,
+)
 
 
 _BEARER_RE = re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+")
@@ -196,6 +201,17 @@ class OpenRouterProvider:
                 {"reasoning_effort": request.reasoning_effort}
                 if request.reasoning_effort is not None
                 else {}
+            ),
+            # OpenRouter profile: includes the profile-scoped registry
+            # mappings (for example reasoning.max_tokens) that the generic
+            # OpenAI-compatible profile omits.  Only settings carrying an
+            # explicit emitted capability state cross the boundary.
+            **serialize_generation_settings(
+                request.generation_settings,
+                states=request.generation_setting_states,
+                capabilities=request.generation_setting_capabilities,
+                omitted=request.generation_omitted_settings,
+                profile="openrouter",
             ),
         }
 

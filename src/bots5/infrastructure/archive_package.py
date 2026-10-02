@@ -64,6 +64,47 @@ _CAPABILITY_STATES = frozenset(item.value for item in CapabilityState)
 _CAPABILITY_SOURCES = frozenset({"manual", "confirmed_endpoint", "provider_metadata", "trusted_registry", "heuristic", "unknown"})
 _SETTINGS_PROVENANCE = frozenset({"application", "model", "chat_model"})
 _OMITTED_SETTINGS = frozenset({"emitted", "unset", "BOTS-owned deadline"})
+
+
+def _validate_generation_settings_evidence(value: object) -> None:
+    """Closed validation of the Phase 11 v4 generation-settings evidence.
+
+    ``states`` must cover every registry key; values and provenance must
+    agree with the states, and every value must validate against its typed
+    definition.  Unknown keys, unknown states and contradictions fail closed.
+    """
+    from bots5.domain.generation_settings_registry import (
+        SETTING_DEFINITIONS_BY_KEY,
+        SETTING_KEYS,
+        SETTING_STATES,
+    )
+
+    if type(value) is not dict or set(value) != {"values", "provenance", "states"}:
+        _fail("request generation settings evidence is malformed")
+    values, provenance, states = value["values"], value["provenance"], value["states"]
+    if type(values) is not dict or type(provenance) is not dict or type(states) is not dict:
+        _fail("request generation settings evidence is malformed")
+    if set(states) != SETTING_KEYS:
+        _fail("request generation settings states are incomplete")
+    for key, state in states.items():
+        if type(state) is not str or state not in SETTING_STATES:
+            _fail("request generation settings states are invalid")
+        definition = SETTING_DEFINITIONS_BY_KEY[key]
+        recorded = values.get(key)
+        if state == "unset":
+            if recorded is not None or key in provenance:
+                _fail("request generation settings evidence contradicts its states")
+            continue
+        if recorded is None or key not in provenance:
+            _fail("request generation settings evidence contradicts its states")
+        if type(provenance[key]) is not str or provenance[key] not in _SETTINGS_PROVENANCE | {"branch"}:
+            _fail("request generation settings provenance is invalid")
+        try:
+            definition.validate(recorded)
+        except (TypeError, ValueError):
+            _fail("request generation settings values are invalid")
+    if set(values) - set(provenance) or set(provenance) - set(values):
+        _fail("request generation settings evidence is inconsistent")
 _ENTRY_MEDIA_TYPES = {
     "domain/chat.json": "application/json",
     "domain/messages.jsonl": "application/x-ndjson",
@@ -834,11 +875,13 @@ def _validate_provenance(
         return _exact_mapping(value, {"status"}, "request-time provenance")
     if status == "available":
         version = value.get("snapshot_version")
-        if type(version) is not int or version not in {2, 3}:
+        if type(version) is not int or version not in {2, 3, 4}:
             _fail("request-time provenance version is invalid")
         expected = fields | {"settings", "settings_provenance", "capabilities", "manual_overrides", "omitted_settings"}
         if version == 3:
             expected |= {"settings_revisions", "context"}
+        if version == 4:
+            expected |= {"generation_settings"}
         row = _exact_mapping(value, expected, "available request-time provenance")
     elif status == "legacy-limited":
         row = _exact_mapping(value, fields, "legacy request-time provenance")
@@ -914,6 +957,8 @@ def _validate_provenance(
                 if revisions[key] is not None:
                     _integer(revisions[key], f"request {key} settings revision", minimum=1)
             _validate_safe_context(row["context"])
+        if row["snapshot_version"] == 4:
+            _validate_generation_settings_evidence(row["generation_settings"])
     return row
 
 

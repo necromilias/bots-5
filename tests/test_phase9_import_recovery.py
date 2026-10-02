@@ -38,7 +38,7 @@ def test_provenance_refuses_duplicate_hops_instead_of_truncating_history():
 
 def test_pregraph_recovery_is_known_no_commit_and_never_replays(tmp_path):
     database = tmp_path / "state.sqlite3"
-    upgrade_to(database, "0012_phase9_archive_import")
+    upgrade_to(database, "0014_phase11_message_tombstone")
     engine = create_engine(f"sqlite:///{database}", future=True)
     try:
         with engine.begin() as connection:

@@ -1316,3 +1316,36 @@ def test_durable_rebuilding_and_invalid_status_refuse_queries(tmp_path: Path):
             store.search("state-needle")
         rebuilt = store.rebuild_search_index()
         assert rebuilt.condition is SearchIndexCondition.VALID
+
+
+def test_renamed_chat_title_updates_chat_projection_and_navigation(tmp_path: Path):
+    """A-1a: a rename rewrites the chat document so the old title is gone, the
+    new title is found, and the found document still navigates to the chat."""
+    with _store(tmp_path / "root") as (_authority, store):
+        chat = Chat("chat-a", "oldtitle renameseed", BASE_TIME, BASE_TIME)
+        store.create_chat(chat)
+
+        renamed = store.rename_chat("chat-a", "newtitle renameseed")
+        assert renamed.title == "newtitle renameseed"
+
+        # Feature-positive: the renamed title is now the searchable chat document.
+        fresh = store.search(
+            "newtitle", filters=SearchFilters(document_kinds=(SearchDocumentKind.CHAT,))
+        )
+        assert [item.document_id for item in fresh.results] == ["chat-a"]
+        assert fresh.results[0].title == "newtitle renameseed"
+
+        # The superseded title no longer matches any chat document.
+        stale = store.search(
+            "oldtitle", filters=SearchFilters(document_kinds=(SearchDocumentKind.CHAT,))
+        )
+        assert stale.results == ()
+
+        # The found document still resolves to the live chat as an active branch.
+        navigation = store.resolve_search_result(fresh.results[0])
+        assert navigation.chat.id == "chat-a"
+        assert navigation.chat.title == "newtitle renameseed"
+        assert navigation.branch_state is SearchBranchState.ACTIVE
+
+        # The rename receipt settled: the index stayed valid throughout.
+        assert store.search_status().condition is SearchIndexCondition.VALID

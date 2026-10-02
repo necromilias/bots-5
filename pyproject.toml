@@ -19,6 +19,8 @@ dependencies = [
   "uuid6>=2024.7.10,<2027",
   "keyring>=25,<26",
   "secretstorage>=3,<4",
+  "markdown-it-py>=3,<4",
+  "Pygments>=2,<3",
 ]
 
 [project.optional-dependencies]

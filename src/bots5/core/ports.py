@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import ContextManager, Protocol
 
-from bots5.domain.models import Attachment, Chat, GenerationAttempt, Message, WorkspaceWindowState
+from bots5.domain.models import Attachment, Chat, ChatDeletionInventory, ChatSort, Folder, GenerationAttempt, Message, WorkspaceWindowState
 from bots5.domain.search import (
     SearchFilters,
     SearchNavigation,
@@ -58,7 +58,41 @@ class AppStateStore(Protocol):
     ) -> Chat:
         ...
 
-    def list_chats(self) -> tuple[Chat, ...]:
+    def create_folder(self, name: str, *, clock, ids) -> Folder:
+        """Create one flat organisation folder (Phase 11 F4)."""
+        ...
+
+    def rename_folder(self, folder_id: str, name: str) -> Folder:
+        """Rename one folder; folder renames are metadata only (F4)."""
+        ...
+
+    def delete_folder(self, folder_id: str) -> None:
+        """Delete a folder and unfile its members; never deletes chats (F4)."""
+        ...
+
+    def list_folders(self) -> tuple[Folder, ...]:
+        ...
+    def set_chat_folder(self, chat_id: str, folder_id: str | None) -> Chat:
+        """Move one chat into exactly one folder, or unfile it with None (F4)."""
+        ...
+
+    def set_chat_pinned(self, chat_id: str, pinned: bool) -> Chat:
+        """Set or clear the floating pin on one chat (F5)."""
+        ...
+
+    def describe_chat_deletion(self, chat_id: str) -> ChatDeletionInventory:
+        """Compute the loss inventory for one chat without deleting it (F7)."""
+        ...
+
+    def delete_message(self, chat_id: str, message_id: str) -> Message:
+        """Tombstone one message: state 'deleted', lineage kept, content gone (F7)."""
+        ...
+
+    def delete_chat(self, chat_id: str, *, expected_revision: int | None = None) -> None:
+        """Delete one whole chat after the deliberate loss-inventory confirmation (F7)."""
+        ...
+
+    def list_chats(self, sort: ChatSort | None = None) -> tuple[Chat, ...]:
         ...
 
     def get_chat(self, chat_id: str) -> Chat | None:
@@ -235,6 +269,40 @@ class AppStateStore(Protocol):
         ...
 
     def delete_workspace_window(self, window_id: str) -> None:
+        ...
+
+    def get_chat_draft(self, chat_id: str) -> str:
+        ...
+
+    def save_chat_draft(self, chat_id: str, draft_text: str) -> None:
+        ...
+
+    def get_dock_layout(self, window_id: str) -> bytes | None:
+        ...
+
+    def save_dock_layout(self, window_id: str, dock_state_blob: bytes) -> None:
+        ...
+
+    def get_keybinding_override(self, action_id: str) -> str:
+        ...
+
+    def save_keybinding_override(self, action_id: str, shortcut: str, conflict_detected: bool = False) -> None:
+        ...
+
+    def reset_keybinding_overrides(self) -> None:
+        ...
+
+    def get_font_scale_settings(self) -> tuple[float, str | None, str | None, str | None, float]:
+        ...
+
+    def save_font_scale_settings(
+        self,
+        scale_factor: float,
+        ui_font_family: str | None,
+        transcript_font_family: str | None,
+        code_font_family: str | None,
+        base_font_size_pt: float,
+    ) -> None:
         ...
 
     def close(self) -> None:

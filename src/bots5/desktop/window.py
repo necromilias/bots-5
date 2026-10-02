@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QAction, QClipboard
+from PySide6.QtCore import QPoint, Qt, Signal
+from PySide6.QtGui import QAction, QClipboard, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import (
+    QDialog,
     QDockWidget,
     QFileDialog,
     QFrame,
@@ -30,6 +31,7 @@ from bots5.core.errors import (
     SearchResultGone,
     SearchStaleIndex,
     SearchUnavailable,
+    StateError,
 )
 from bots5.core.events import CoreEvent
 from bots5.core.secrets import sanitize_secret_error
@@ -50,21 +52,26 @@ from .phase9 import Phase9DesktopController
 from .phase9_queue_dock import ImportQueueDockWidget
 from .profile import DesktopSessionInfo
 from .session import DesktopSessionController
-from .theme import apply_draft1_theme
+from .theme import apply_draft1_theme, build_theme_stylesheet
 from .widgets import (
     AddConnectionDialog,
     ComposerEdit,
     ContinuationBanner,
+    DeleteChatConfirmationDialog,
     InspectorPanel,
     LeftRail,
     MessageRow,
+    MoveToFolderDialog,
     SearchPanel,
     SettingsDialog,
     TopBar,
     TranscriptView,
     TuneDialog,
 )
+from .actions import ActionDefinition, ActionRegistry
 from .campaign_dock import CampaignDockWidget
+from .model_selector import ModelSelectorEntry, ModelSelectorPopup
+from .palette import CommandPaletteDialog
 
 
 _TERMINAL_EVENT_KINDS = frozenset(
@@ -81,6 +88,11 @@ _SEARCH_SOURCE_EVENT_KINDS = frozenset(
         "chat_created",
         "chat_archived",
         "chat_unarchived",
+        "chat_title_changed",
+        "chat_duplicated",
+        # Phase 11 M3 (F7): deletions are search-visible source mutations.
+        "message_deleted",
+        "chat_deleted",
         "attachment_created",
         "attachment_removed",
         "message_sent",
@@ -92,6 +104,31 @@ _SEARCH_SOURCE_EVENT_KINDS = frozenset(
         "search_index_rebuilt",
     }
 )
+
+
+def clamp_geometry_to_available_screens(
+    geometry: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    """Phase 11 M0a: clamp a restored window geometry on-screen.
+
+    The restored position is brought into the UNION of every screen's
+    available geometry while the user's stored width and height are
+    PRESERVED (correcting the fence U-10 defect that discarded the stored
+    size).  Only when the stored size itself cannot fit the union is it
+    reduced to the union's size — there is no larger honest target.
+    """
+    x, y, width, height = (int(value) for value in geometry)
+    screens = QGuiApplication.screens()
+    if not screens:
+        return (x, y, max(1, width), max(1, height))
+    union = screens[0].availableGeometry()
+    for screen in screens[1:]:
+        union = union.united(screen.availableGeometry())
+    width = max(1, min(width, union.width()))
+    height = max(1, min(height, union.height()))
+    x = min(max(x, union.left()), union.right() - width + 1)
+    y = min(max(y, union.top()), union.bottom() - height + 1)
+    return (x, y, width, height)
 
 
 class MainWindow(QMainWindow):
@@ -124,6 +161,7 @@ class MainWindow(QMainWindow):
         self._window_ordinal = window_state.ordinal if window_state is not None else None
         self._closing = False
         self._chat_ids: list[str] = []
+        self._rail_chats: tuple[Chat, ...] = ()
         self._current_chat_id: str | None = None
         self._current_chat: Chat | None = None
         self._current_messages: tuple[Message, ...] = ()
@@ -142,6 +180,13 @@ class MainWindow(QMainWindow):
         self._tune_chat_id: str | None = None
         self._settings_dialog: SettingsDialog | None = None
         self._add_connection_dialog: AddConnectionDialog | None = None
+        # Phase 11 F8: rich model-selector presentation state (session-only).
+        self._model_selector_popup: ModelSelectorPopup | None = None
+        self._model_selector_records: list[ModelSelectorEntry] = []
+        self._model_selector_selected_id: str | None = None
+        # Phase 11 M1: Action registry and palette
+        self._action_registry: ActionRegistry = ActionRegistry()
+        self._palette_dialog: CommandPaletteDialog | None = None
         self._phase5_refresh_lock = asyncio.Lock()
         self._last_phase5_event_sequence = 0
         self._last_search_query: str | None = None
@@ -151,6 +196,10 @@ class MainWindow(QMainWindow):
         # Phase 10 M2.0b: optional campaign dock
         self._campaign_bridge_factory = campaign_bridge_factory
         self._campaign_dock: CampaignDockWidget | None = None
+        # Phase 11 M4b/M6: workspace/settings plane wiring state.
+        self._applying_dock_layout = False
+        self._qaction_by_action_id: dict[str, QAction] = {}
+        self._default_shortcut_by_action_id: dict[str, str] = {}
 
         self.setWindowTitle("B.O.T.S. 5")
         self.resize(1180, 760)
@@ -175,6 +224,9 @@ class MainWindow(QMainWindow):
         return QApplication.instance()
 
     def _build_ui(self) -> None:
+        # Phase 11 M1: Register standard actions
+        self._register_standard_actions()
+
         self.new_window_action = QAction("New Window", self)
         self.new_window_action.setShortcut("Ctrl+Shift+N")
         self.new_window_action.setToolTip("Open another window over this B.O.T.S. session")
@@ -193,6 +245,12 @@ class MainWindow(QMainWindow):
         self.in_chat_search_action.triggered.connect(self._open_in_chat_search)
         self.menuBar().addAction(self.in_chat_search_action)
 
+        # Phase 11 M1: Command palette
+        self.command_palette_action = QAction("Command Palette", self)
+        self.command_palette_action.setShortcut("Ctrl+Shift+P")
+        self.command_palette_action.triggered.connect(self._open_command_palette)
+        self.menuBar().addAction(self.command_palette_action)
+
         root = QWidget(self)
         root.setObjectName("draft1Root")
         root_layout = QVBoxLayout(root)
@@ -206,6 +264,9 @@ class MainWindow(QMainWindow):
         self.top_bar.model_selected.connect(self._on_model_selected)
         self.top_bar.tune_requested.connect(self._on_tune_requested)
         self.top_bar.settings_requested.connect(self._on_settings_requested)
+        # Phase 11 F8: the selector button only requests the popup; the
+        # durable selection still runs through the landed command path.
+        self.top_bar.model_selector.open_requested.connect(self._open_model_selector)
         root_layout.addWidget(self.top_bar)
 
         body = QWidget(root)
@@ -262,7 +323,7 @@ class MainWindow(QMainWindow):
         self.historical_banner.setVisible(False)
         workspace_layout.addWidget(self.historical_banner)
 
-        self.transcript = TranscriptView(workspace)
+        self.transcript = TranscriptView(workspace, application=self._application)
         workspace_layout.addWidget(self.transcript, 1)
 
         # Additive Phase 9 workflow-5 seam: visible only while an imported
@@ -378,6 +439,13 @@ class MainWindow(QMainWindow):
         self.import_queue_dock.hide()
         self._phase9.attach_queue_dock(self.import_queue_dock)
 
+        # Phase 11 M4b: dock layout changes persist the QMainWindow.saveState()
+        # blob (advisory, Qt-version-tied) through the workspace plane.
+        for dock in (self.search_dock, self.inspector_dock, self.import_queue_dock):
+            dock.visibilityChanged.connect(self._on_dock_layout_changed)
+            dock.dockLocationChanged.connect(self._on_dock_layout_changed)
+            dock.topLevelChanged.connect(self._on_dock_layout_changed)
+
         # Phase 10 M2.0b: optional campaign dock
         if self._campaign_bridge_factory is not None:
             self._campaign_dock = CampaignDockWidget(
@@ -391,9 +459,187 @@ class MainWindow(QMainWindow):
             self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._campaign_dock)
             self._campaign_dock.hide()
             self._campaign_dock.visibilityChanged.connect(self._sync_campaign_dock_button)
+            self._campaign_dock.visibilityChanged.connect(self._on_dock_layout_changed)
 
         self._build_phase9_menus()
         self._update_controls()
+
+        # Phase 11 M1: Detect and report any shortcut conflicts
+        conflicts = self._action_registry.detect_conflicts()
+        if conflicts:
+            # Log conflicts for now; in a future iteration these could be surfaced
+            # to the operator via a warning dialog
+            for shortcut, actions in conflicts.items():
+                action_titles = ", ".join(a.title for a in actions)
+                print(f"WARNING: Shortcut conflict on '{shortcut}': {action_titles}")
+
+        # Phase 11 M4b/M6: map registry action ids onto the real QActions that
+        # carry the user-visible shortcut, remembering each default so a reset
+        # can restore it. Overrides are applied later, at initialize().
+        self._qaction_by_action_id = {
+            "chat.new": self.new_window_action,
+            "view.global_search": self.global_search_action,
+            "view.search_current_chat": self.in_chat_search_action,
+            "palette.open": self.command_palette_action,
+        }
+        self._default_shortcut_by_action_id = {
+            action_id: qaction.shortcut().toString()
+            for action_id, qaction in self._qaction_by_action_id.items()
+        }
+
+    def _register_standard_actions(self) -> None:
+        """Register Phase 11 M1 standard actions with the action registry.
+
+        This creates the single declarative source of truth for palette/menu/
+        shortcut metadata. Each action defines id, title, category, default
+        shortcut, handler, and optional enabled predicate.
+        """
+        # Chat actions
+        self._action_registry.register(
+            ActionDefinition(
+                action_id="chat.new",
+                title="New Chat",
+                category="chat",
+                default_shortcut="Ctrl+Shift+N",
+                handler=lambda checked=False: self.new_window_requested.emit(),
+            )
+        )
+
+        self._action_registry.register(
+            ActionDefinition(
+                action_id="chat.create",
+                title="Create Chat",
+                category="chat",
+                default_shortcut="",
+                handler=lambda checked=False: self._on_new_chat(),
+            )
+        )
+
+        self._action_registry.register(
+            ActionDefinition(
+                action_id="chat.archive",
+                title="Archive Chat",
+                category="chat",
+                default_shortcut="",
+                handler=lambda checked=False: self._on_archive_chat(),
+                is_enabled=lambda: self._current_chat_id is not None,
+            )
+        )
+
+        # Phase 11 M3 (F5/F7): pin and delete join the palette so the
+        # keyboard-first surface reaches the organisation actions too.
+        if hasattr(self._application, "set_chat_pinned"):
+            self._action_registry.register(
+                ActionDefinition(
+                    action_id="chat.pin",
+                    title="Pin/Unpin Chat",
+                    category="chat",
+                    default_shortcut="",
+                    handler=self._on_palette_pin_current_chat,
+                    is_enabled=lambda: self._current_chat_id is not None,
+                )
+            )
+        if hasattr(self._application, "delete_chat"):
+            self._action_registry.register(
+                ActionDefinition(
+                    action_id="chat.delete",
+                    title="Delete Chat…",
+                    category="chat",
+                    default_shortcut="",
+                    handler=self._on_palette_delete_current_chat,
+                    is_enabled=lambda: self._current_chat_id is not None,
+                )
+            )
+
+        # View actions
+        self._action_registry.register(
+            ActionDefinition(
+                action_id="view.global_search",
+                title="Global Search",
+                category="view",
+                default_shortcut="Ctrl+K",
+                handler=lambda checked=False: self._open_global_search(),
+            )
+        )
+
+        self._action_registry.register(
+            ActionDefinition(
+                action_id="view.search_current_chat",
+                title="Search Current Chat",
+                category="view",
+                default_shortcut="Ctrl+F",
+                handler=lambda checked=False: self._open_in_chat_search(),
+                is_enabled=lambda: self._current_chat_id is not None,
+            )
+        )
+
+        self._action_registry.register(
+            ActionDefinition(
+                action_id="view.toggle_rail",
+                title="Toggle Rail",
+                category="view",
+                default_shortcut="",
+                handler=lambda checked=False: self._toggle_rail(),
+            )
+        )
+
+        self._action_registry.register(
+            ActionDefinition(
+                action_id="view.toggle_inspector",
+                title="Toggle Inspector",
+                category="view",
+                default_shortcut="",
+                handler=lambda checked=False: self._toggle_inspector(),
+            )
+        )
+
+        self._action_registry.register(
+            ActionDefinition(
+                action_id="view.toggle_search",
+                title="Toggle Search Panel",
+                category="view",
+                default_shortcut="",
+                handler=lambda checked=False: self._toggle_search(not self.search_dock.isVisible()),
+            )
+        )
+
+        self._action_registry.register(
+            ActionDefinition(
+                action_id="view.toggle_campaign_dock",
+                title="Toggle Campaign Dock",
+                category="view",
+                default_shortcut="",
+                handler=lambda checked=False: self._show_campaign_dock(not self._campaign_dock.isVisible() if self._campaign_dock else False),
+                is_enabled=lambda: self._campaign_dock is not None,
+            )
+        )
+
+        # Palette action
+        self._action_registry.register(
+            ActionDefinition(
+                action_id="palette.open",
+                title="Command Palette",
+                category="palette",
+                default_shortcut="Ctrl+Shift+P",
+                handler=lambda checked=False: self._open_command_palette(),
+            )
+        )
+
+    def _open_command_palette(self) -> None:
+        """Open the command palette dialog."""
+        if self._palette_dialog is None:
+            self._palette_dialog = CommandPaletteDialog(self._action_registry, self)
+        
+        action_id = CommandPaletteDialog.show_palette(self._action_registry, self)
+        if action_id:
+            # Dispatch to the registered handler
+            action = self._action_registry.get_action(action_id)
+            if action and action.handler:
+                try:
+                    if action.is_enabled is None or action.is_enabled():
+                        action.handler()
+                except Exception as exc:
+                    self.statusBar().showMessage(f"Action '{action.title}' failed: {exc}")
 
     def _sync_campaign_dock_button(self, visible: bool) -> None:
         if self.top_bar is not None and hasattr(self, "campaign_dock_action"):
@@ -491,6 +737,15 @@ class MainWindow(QMainWindow):
         self.rail.export_archive_requested.connect(
             self._on_export_archive_chat_requested
         )
+        # Phase 11 M3 (F4/F5/F7): folders, pins and deletion.
+        self.rail.pin_chat_requested.connect(self._on_pin_chat_requested)
+        self.rail.move_chat_to_folder_requested.connect(
+            self._on_move_chat_to_folder_requested
+        )
+        self.rail.open_move_dialog_requested.connect(
+            self._on_open_move_dialog_requested
+        )
+        self.rail.delete_chat_requested.connect(self._on_delete_chat_requested)
 
     def _show_campaign_dock(self, checked: bool = False) -> None:
         if self._campaign_dock is not None:
@@ -528,6 +783,121 @@ class MainWindow(QMainWindow):
     def _on_export_archive_chat_requested(self, chat_id: str) -> None:
         self._phase9.open_archive_export(self, chat_id)
 
+    # ------------------------------------------------------------------
+    # Phase 11 M3 (F4/F5/F7): folders, pins and deletion.  The window only
+    # orchestrates: every state change goes through an application command,
+    # and the deletion confirmation shows the store-computed loss inventory
+    # BEFORE anything destructive is admitted.
+    # ------------------------------------------------------------------
+
+    def _supports_organisation(self) -> bool:
+        return hasattr(self._application, "list_folders")
+
+    async def _refresh_folders(self) -> None:
+        if not self._supports_organisation():
+            return
+        try:
+            folders = await self._application.list_folders()
+        except Exception:
+            return
+        self.rail.set_folders(folders)
+
+    def _on_pin_chat_requested(self, chat_id: str, pinned: bool) -> None:
+        self._schedule(self._pin_chat(chat_id, pinned))
+
+    async def _pin_chat(self, chat_id: str, pinned: bool) -> None:
+        try:
+            await self._application.set_chat_pinned(chat_id, pinned)
+        except Exception as exc:
+            self.statusBar().showMessage(str(exc))
+            return
+        chats = await self._application.list_chats()
+        self._replace_chat_list(chats)
+        self.statusBar().showMessage(
+            "Chat pinned" if pinned else "Chat unpinned", 2500
+        )
+
+    def _on_move_chat_to_folder_requested(
+        self, chat_id: str, folder_id: str | None
+    ) -> None:
+        self._schedule(self._move_chat_to_folder(chat_id, folder_id))
+
+    async def _move_chat_to_folder(self, chat_id: str, folder_id: str | None) -> None:
+        try:
+            await self._application.set_chat_folder(chat_id, folder_id)
+        except Exception as exc:
+            self.statusBar().showMessage(str(exc))
+            return
+        chats = await self._application.list_chats()
+        self._replace_chat_list(chats)
+        self.statusBar().showMessage("Chat moved", 2500)
+
+    def _on_open_move_dialog_requested(self, chat_id: str) -> None:
+        self._schedule(self._move_chat_via_dialog(chat_id))
+
+    async def _move_chat_via_dialog(self, chat_id: str) -> None:
+        if not self._supports_organisation():
+            return
+        try:
+            folders = await self._application.list_folders()
+        except Exception as exc:
+            self.statusBar().showMessage(str(exc))
+            return
+        chat = next(
+            (chat for chat in self._rail_chats if chat.id == chat_id), None
+        )
+        if chat is None:
+            return
+        dialog = MoveToFolderDialog(
+            chat.title,
+            folders,
+            chat.folder_id,
+            self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        folder_id, new_folder_name = dialog.outcome()
+        try:
+            if new_folder_name:
+                folder = await self._application.create_folder(new_folder_name)
+                folder_id = folder.id
+            await self._application.set_chat_folder(chat_id, folder_id)
+        except Exception as exc:
+            self.statusBar().showMessage(str(exc))
+            return
+        await self._refresh_folders()
+        chats = await self._application.list_chats()
+        self._replace_chat_list(chats)
+        self.statusBar().showMessage("Chat moved", 2500)
+
+    def _on_delete_chat_requested(self, chat_id: str) -> None:
+        self._schedule(self._confirm_and_delete_chat(chat_id))
+
+    async def _confirm_and_delete_chat(self, chat_id: str) -> None:
+        if not self._supports_organisation():
+            return
+        try:
+            inventory = await self._application.describe_chat_deletion(chat_id)
+        except Exception as exc:
+            self.statusBar().showMessage(str(exc))
+            return
+        dialog = DeleteChatConfirmationDialog(inventory, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            await self._application.delete_chat(chat_id)
+        except Exception as exc:
+            self.statusBar().showMessage(str(exc))
+            return
+        chats = await self._application.list_chats()
+        self._replace_chat_list(chats)
+        if self._current_chat_id is None:
+            self.transcript.render((), self._generation_busy)
+            self._sync_chat_header(None)
+        else:
+            self._schedule(self._refresh_transcript(self._current_chat_id))
+        self.statusBar().showMessage("Chat deleted", 2500)
+
     @staticmethod
     def _disabled_composer_button(text: str, tooltip: str) -> QToolButton:
         button = QToolButton()
@@ -551,12 +921,25 @@ class MainWindow(QMainWindow):
             self.rail.set_collapsed(self._window_state.rail_collapsed)
             geometry = self._window_state.geometry
             if geometry is not None:
-                self.setGeometry(*geometry)
+                # Phase 11 M0a: clamp the restored position into the union of
+                # available screens while PRESERVING the stored width/height.
+                self.setGeometry(*clamp_geometry_to_available_screens(geometry))
+            if self._window_state.maximized:
+                # Phase 11 M4b: the persisted maximized state wins over the
+                # restored geometry when the window is shown.
+                self.showMaximized()
+            if self._window_state.transcript_scroll_position is not None:
+                # Phase 11 M4b: restore-aware transcript scrolling; the pending
+                # position is applied by the next render/range change.
+                self.transcript.set_restore_scroll_position(
+                    self._window_state.transcript_scroll_position
+                )
             self._historical_leaf_message_id = self._window_state.inspector_leaf_message_id
         chats = await self._application.list_chats()
         if not chats:
             await self._application.create_chat()
             chats = await self._application.list_chats()
+        await self._refresh_folders()
         self._replace_chat_list(chats)
         if chats:
             selected = (
@@ -590,13 +973,273 @@ class MainWindow(QMainWindow):
                     )
                 await self._refresh_inspector()
             await self._sync_current_activity()
+        # Phase 11 M4b/M6: restore the persisted workspace/settings plane.
+        await self._restore_dock_layout()
+        await self._restore_search_state()
+        await self._apply_saved_keybinding_overrides()
+        await self._apply_persisted_font_scale()
+        if chats:
+            await self._restore_chat_draft(self._current_chat_id)
         await self._refresh_phase5_state()
         await self._save_workspace()
+
+    # ------------------------------------------------------------------
+    # Phase 11 M4b/M6: workspace/settings persistence plane (R-10 SQLite).
+    # Drafts, dock layout blob, keybinding overrides and font/scale settings
+    # are advisory restoration state: a read failure or incompatible payload
+    # degrades to the default behaviour and must never block the window.
+    # ------------------------------------------------------------------
+
+    def _on_dock_layout_changed(self, *_args) -> None:
+        if self._applying_dock_layout:
+            return
+        self._schedule(self._persist_dock_layout())
+
+    async def _persist_dock_layout(self) -> None:
+        if self._window_id is None:
+            return
+        saver = getattr(self._application, "save_dock_layout", None)
+        if saver is None:
+            return
+        try:
+            await saver(self._window_id, bytes(self.saveState()))
+        except Exception as exc:
+            self.statusBar().showMessage(f"Dock layout not saved: {exc}")
+
+    async def _restore_dock_layout(self) -> None:
+        if self._window_id is None:
+            return
+        getter = getattr(self._application, "get_dock_layout", None)
+        if getter is None:
+            return
+        try:
+            blob = await getter(self._window_id)
+        except Exception:
+            return
+        if not blob:
+            return
+        self._applying_dock_layout = True
+        try:
+            try:
+                restored = self.restoreState(bytes(blob))
+            except Exception:
+                restored = False
+        finally:
+            self._applying_dock_layout = False
+        if not restored:
+            # The blob is an advisory, Qt-version-tied opaque payload: a
+            # malformed or incompatible layout falls back to the default
+            # layout (mirroring the malformed-row fallback in the store)
+            # instead of raising or leaving a half-applied layout.
+            self._apply_default_dock_layout()
+            self.statusBar().showMessage(
+                "Stored dock layout was incompatible; using the default layout.",
+                5000,
+            )
+
+    def _apply_default_dock_layout(self) -> None:
+        """Re-apply the constructed default dock layout (all docks hidden)."""
+        self._applying_dock_layout = True
+        try:
+            for dock in self._dock_widgets():
+                dock.setFloating(False)
+                dock.hide()
+        finally:
+            self._applying_dock_layout = False
+
+    # ------------------------------------------------------------------
+    # Phase 11 fork R-15: faithful search-state restore.  The persisted
+    # filter set is the authoritative last search of this window; the panel
+    # widgets are a projection of it wherever the UI can represent a field.
+    # ------------------------------------------------------------------
+
+    async def _restore_search_state(self) -> None:
+        state = self._window_state
+        if state is None:
+            return
+        if state.search_open:
+            # Applied after the dock-layout blob so the structured flag wins
+            # over the opaque Qt payload for the search dock specifically.
+            self.search_dock.show()
+        if state.search_query is None and state.search_filters is None:
+            return
+        self._last_search_query = state.search_query
+        self._last_search_filters = state.search_filters
+        self._next_search_cursor = state.search_cursor
+        self._project_search_filters_into_panel(state.search_filters, state.search_query)
+
+    def _project_search_filters_into_panel(
+        self,
+        filters: SearchFilters | None,
+        query: str | None,
+    ) -> None:
+        """Reflect the restored search state into the panel widgets.
+
+        Advisory only: pagination always re-runs the restored filter object
+        itself, so a field the panel cannot represent (backend/provider/model/
+        connection/model-entry attributions, a second role or state, either
+        time bound) still round-trips faithfully through
+        ``_last_search_filters``.
+        """
+        if query is not None:
+            self.search_panel.query_edit.setText(query)
+        if filters is None:
+            return
+        kinds = set(filters.document_kinds)
+        self.search_panel.chat_kind.setChecked(
+            not kinds or SearchDocumentKind.CHAT in kinds
+        )
+        self.search_panel.message_kind.setChecked(
+            not kinds or SearchDocumentKind.MESSAGE in kinds
+        )
+        self.search_panel.attachment_kind.setChecked(
+            not kinds or SearchDocumentKind.ATTACHMENT in kinds
+        )
+        if len(filters.roles) == 1:
+            self.search_panel.role_combo.setCurrentIndex(
+                self.search_panel.role_combo.findData(filters.roles[0].value)
+            )
+        if len(filters.message_states) == 1:
+            self.search_panel.state_combo.setCurrentIndex(
+                self.search_panel.state_combo.findData(filters.message_states[0].value)
+            )
+        self.search_panel.active_only.setChecked(filters.active_branch_only)
+        self.search_panel.include_archived.setChecked(filters.include_archived)
+
+    def _dock_widgets(self) -> tuple[QDockWidget, ...]:
+        docks = [self.inspector_dock, self.search_dock, self.import_queue_dock]
+        if self._campaign_dock is not None:
+            docks.append(self._campaign_dock)
+        return tuple(docks)
+
+    async def _apply_saved_keybinding_overrides(self) -> None:
+        """Apply every persisted keybinding override at startup."""
+        getter = getattr(self._application, "get_keybinding_override", None)
+        if getter is None:
+            return
+        for action in self._action_registry.get_all_actions():
+            try:
+                shortcut = await getter(action.action_id)
+            except Exception:
+                continue
+            if shortcut:
+                # Startup application never re-persists what it just read.
+                self.apply_keybinding_override(action.action_id, shortcut, persist=False)
+
+    def apply_keybinding_override(
+        self, action_id: str, shortcut: str, *, persist: bool = True
+    ) -> bool:
+        """Apply one keybinding override; report whether it conflicts.
+
+        The override updates the action registry's effective shortcut and the
+        real QAction chord, and (unless ``persist`` is false) is saved to the
+        workspace settings plane with the detected conflict flag.
+        """
+        conflict = self._action_registry.apply_override(action_id, shortcut)
+        qaction = self._qaction_by_action_id.get(action_id)
+        if qaction is not None:
+            qaction.setShortcut(QKeySequence(shortcut))
+        if persist:
+            self._schedule(
+                self._persist_keybinding_override(action_id, shortcut, conflict)
+            )
+        return conflict
+
+    async def _persist_keybinding_override(
+        self, action_id: str, shortcut: str, conflict_detected: bool
+    ) -> None:
+        saver = getattr(self._application, "save_keybinding_override", None)
+        if saver is None:
+            return
+        try:
+            await saver(action_id, shortcut, conflict_detected)
+        except Exception as exc:
+            self.statusBar().showMessage(f"Keybinding override not saved: {exc}")
+
+    def reset_keybinding_overrides(self) -> None:
+        """Reset every keybinding override and persist the reset."""
+        self._action_registry.reset_overrides()
+        for action_id, qaction in self._qaction_by_action_id.items():
+            default = self._default_shortcut_by_action_id.get(action_id, "")
+            qaction.setShortcut(QKeySequence(default))
+        self._schedule(self._persist_keybinding_reset())
+
+    async def _persist_keybinding_reset(self) -> None:
+        reset = getattr(self._application, "reset_keybinding_overrides", None)
+        if reset is None:
+            return
+        try:
+            await reset()
+        except Exception as exc:
+            self.statusBar().showMessage(f"Keybinding overrides not reset: {exc}")
+
+    async def _apply_persisted_font_scale(self) -> None:
+        """Apply the persisted font/scale settings (Phase 11 F9/M6)."""
+        getter = getattr(self._application, "get_font_scale_settings", None)
+        if getter is None:
+            return
+        try:
+            scale_factor, ui_font, transcript_font, code_font, size_pt = await getter()
+        except Exception:
+            return
+        application_instance = self._qt_application()
+        if application_instance is None:
+            return
+        if not scale_factor or scale_factor <= 0:
+            scale_factor = 1.0
+        application_instance.setStyleSheet(
+            build_theme_stylesheet(
+                scale=scale_factor,
+                ui_font=ui_font,
+                transcript_font=transcript_font,
+                code_font=code_font,
+                size_pt=size_pt,
+            )
+        )
+
+    async def _persist_chat_draft(self, chat_id: str | None, text: str) -> None:
+        if chat_id is None:
+            return
+        saver = getattr(self._application, "save_chat_draft", None)
+        if saver is None:
+            return
+        try:
+            await saver(chat_id, text)
+        except Exception as exc:
+            self.statusBar().showMessage(f"Draft not saved: {exc}")
+
+    async def _restore_chat_draft(self, chat_id: str | None) -> None:
+        if chat_id is None:
+            return
+        getter = getattr(self._application, "get_chat_draft", None)
+        if getter is None:
+            return
+        try:
+            draft = await getter(chat_id)
+        except Exception:
+            return
+        if chat_id != self._current_chat_id:
+            return
+        if draft:
+            # A stored draft replaces the composer text.  With no stored
+            # draft the composer is left untouched, preserving the landed
+            # Draft-1 behaviour where in-progress composer text survives a
+            # chat switch (test_desktop_draft1 switching-chats contract).
+            self.composer.setPlainText(draft)
+
+    async def _switch_chat_draft(
+        self, previous_chat_id: str | None, chat_id: str | None
+    ) -> None:
+        """Save the outgoing chat's composer text and restore the incoming one."""
+        if previous_chat_id is not None:
+            await self._persist_chat_draft(previous_chat_id, self.composer.toPlainText())
+        await self._restore_chat_draft(chat_id)
 
     def _replace_chat_list(self, chats: tuple[Chat, ...] | list[Chat]) -> None:
         chats = tuple(chats)
         selected = self._current_chat_id
         self._chat_ids = [chat.id for chat in chats]
+        self._rail_chats = chats
         self.rail.set_chats(chats, selected)
         if self._current_chat_id not in self._chat_ids:
             self._current_chat_id = self._chat_ids[0] if self._chat_ids else None
@@ -611,12 +1254,18 @@ class MainWindow(QMainWindow):
     def _on_chat_selected(self, row: int) -> None:
         if 0 <= row < len(self._chat_ids):
             chat_id = self._chat_ids[row]
+            previous_chat_id = self._current_chat_id
             if chat_id != self._current_chat_id:
                 self._clear_editing()
                 self._set_historical_leaf(None)
                 self.continuation_banner.clear()
             self._current_chat_id = chat_id
             self._selected_message = None
+            if previous_chat_id is not None and previous_chat_id != chat_id:
+                # Phase 11 M4b: the composer text belongs to the outgoing
+                # chat as its draft; the incoming chat's draft takes its
+                # place (empty when none was stored).
+                self._schedule(self._switch_chat_draft(previous_chat_id, chat_id))
             if self._window_id is not None:
                 self._workspace.set_selected_chat(self._window_id, chat_id)
             self.rail.set_activity(self._activity, chat_id)
@@ -652,6 +1301,9 @@ class MainWindow(QMainWindow):
 
     def _toggle_search(self, visible: bool) -> None:
         self.search_dock.setVisible(visible)
+        # Phase 11 fork R-15: the search panel open/closed state is part of
+        # the persisted window state, not only of the opaque dock blob.
+        self._schedule(self._save_workspace())
         if visible:
             self.search_panel.set_current_chat_available(self._current_chat_id is not None)
             self.search_panel.focus_query()
@@ -745,6 +1397,9 @@ class MainWindow(QMainWindow):
         self._last_search_filters = filters
         self._next_search_cursor = page.next_cursor
         self.search_panel.show_page(page, append=append)
+        # Phase 11 fork R-15: the last search (query, faithful filter set and
+        # result cursor) is part of the persisted window state.
+        self._schedule(self._save_workspace())
 
     async def _load_more_search(self) -> None:
         query = self._last_search_query
@@ -772,6 +1427,8 @@ class MainWindow(QMainWindow):
             self.search_panel.set_busy(False)
         self._next_search_cursor = page.next_cursor
         self.search_panel.show_page(page, append=True)
+        # Phase 11 fork R-15: pagination moved the result cursor; persist it.
+        self._schedule(self._save_workspace())
 
     def _on_search_result_requested(self, result: object, location_index: int) -> None:
         if isinstance(result, SearchResult):
@@ -837,6 +1494,9 @@ class MainWindow(QMainWindow):
             self._next_search_cursor = None
             self.search_panel.show_pagination_error(str(error))
             self.statusBar().showMessage(f"Search pagination expired: {error}")
+            # Phase 11 fork R-15: the expired cursor is gone from the window
+            # state too, so a restart does not restore a dead cursor.
+            self._schedule(self._save_workspace())
             return
         if isinstance(error, SearchResultGone):
             condition = "GONE"
@@ -879,6 +1539,7 @@ class MainWindow(QMainWindow):
         self._last_search_filters = None
         self._next_search_cursor = None
         self.search_panel.results.clear()
+        self._schedule(self._save_workspace())
         self.search_panel.load_more_button.setVisible(False)
         self.search_panel.show_status(status)
 
@@ -890,6 +1551,16 @@ class MainWindow(QMainWindow):
     def _on_archive_chat(self) -> None:
         if self._current_chat_id is not None:
             self._schedule(self._toggle_current_chat_archive())
+
+    def _on_palette_pin_current_chat(self, checked: bool = False) -> None:
+        chat = self._current_chat
+        if chat is None:
+            return
+        self._on_pin_chat_requested(chat.id, not bool(chat.is_pinned))
+
+    def _on_palette_delete_current_chat(self, checked: bool = False) -> None:
+        if self._current_chat_id is not None:
+            self._on_delete_chat_requested(self._current_chat_id)
 
     async def _toggle_current_chat_archive(self) -> None:
         chat = self._current_chat
@@ -957,6 +1628,7 @@ class MainWindow(QMainWindow):
                 return
             connection_by_id = {connection.id: connection for connection in connections}
             entries = []
+            records = []
             selected_model = None
             for model in models:
                 connection = connection_by_id.get(model.connection_id)
@@ -964,9 +1636,42 @@ class MainWindow(QMainWindow):
                 state = model.availability.value
                 label = f"{connection_name} / {model.provider_model_id} [{state}]"
                 entries.append((label, model.id))
+                # Phase 11 F8: rich presentation record — display_name is the
+                # primary line; connection + context window is the secondary
+                # line; the connection health pill and detail card derive from
+                # the same landed catalogue data.  Presentation only.
+                metadata = dict(model.metadata) if isinstance(model.metadata, dict) else {}
+                context_value = metadata.get("context_length")
+                records.append(
+                    ModelSelectorEntry(
+                        model_entry_id=model.id,
+                        display_name=model.display_name,
+                        provider_model_id=model.provider_model_id,
+                        connection_id=model.connection_id,
+                        connection_name=connection_name,
+                        availability=state,
+                        connection_available=bool(connection is not None and connection.available),
+                        connection_refresh_status=(
+                            connection.catalogue_refresh_status.value
+                            if connection is not None
+                            else "never"
+                        ),
+                        connection_backend_type=(
+                            connection.backend_type.value if connection is not None else ""
+                        ),
+                        context_tokens=(
+                            context_value
+                            if isinstance(context_value, int) and not isinstance(context_value, bool)
+                            else None
+                        ),
+                        metadata=metadata,
+                    )
+                )
                 if selection is not None and model.id == selection.model_entry_id:
                     selected_model = (connection, model)
-            self.top_bar.set_models(entries, None if selection is None else selection.model_entry_id)
+            self._model_selector_records = records
+            self._model_selector_selected_id = None if selection is None else selection.model_entry_id
+            self.top_bar.set_models(entries, self._model_selector_selected_id, records=records)
             if selection is None or selection.selection_required or selected_model is None:
                 self.top_bar.model_pill.setText("Selection required")
                 self.top_bar.model_pill.setToolTip("This chat has no durable current model selection.")
@@ -982,6 +1687,33 @@ class MainWindow(QMainWindow):
     def _on_model_selected(self, model_entry_id: str) -> None:
         if self._current_chat_id is not None:
             self._schedule(self._select_model(self._current_chat_id, model_entry_id))
+
+    def _open_model_selector(self) -> None:
+        """Phase 11 F8: host the searchable, grouped selector popup.
+
+        Non-modal like the other desktop dialogs; the popup emits
+        ``model_entry_chosen`` and the landed ``_select_model`` command path
+        performs the durable selection.  Session-only: nothing here persists.
+        """
+
+        if not self._phase5 or not self.top_bar.model_selector.has_entries():
+            return
+        if self._model_selector_popup is not None:
+            self._model_selector_popup.raise_()
+            self._model_selector_popup.activateWindow()
+            return
+        dialog = ModelSelectorPopup(self)
+        dialog.set_entries(self._model_selector_records, self._model_selector_selected_id)
+        dialog.model_entry_chosen.connect(self._on_model_selected)
+        dialog.finished.connect(lambda _result: self._clear_model_selector_popup(dialog))
+        anchor = self.top_bar.model_selector
+        dialog.move(anchor.mapToGlobal(QPoint(0, anchor.height())))
+        self._model_selector_popup = dialog
+        dialog.show()
+
+    def _clear_model_selector_popup(self, dialog: ModelSelectorPopup) -> None:
+        if self._model_selector_popup is dialog:
+            self._model_selector_popup = None
 
     async def _select_model(self, chat_id: str, model_entry_id: str) -> None:
         try:
@@ -1014,12 +1746,19 @@ class MainWindow(QMainWindow):
             return
         dialog = TuneDialog(self)
         override, override_revision = await self._application.chat_generation_settings_override_with_revision(chat_id)
+        extra_override, extra_revision = await self._application.chat_generation_settings_extra_override(chat_id)
+        capabilities = await self._application.generation_setting_capabilities(selection.model_entry_id)
+        model_summary = await self._tune_model_summary(selection.model_entry_id)
         dialog.set_settings(
-            settings.as_dict(),
+            settings.as_full_dict(),
             settings.provenance,
             timeout_override=None if override is None else override.timeout_seconds,
             override_revision=0 if override_revision is None else override_revision,
+            extra_revision=extra_revision,
             model_entry_id=selection.model_entry_id,
+            extra_values=extra_override or {},
+            capabilities=capabilities,
+            model_summary=model_summary,
         )
         dialog.save_requested.connect(lambda values: self._schedule(self._save_tune(chat_id, values)))
         dialog.inherit_requested.connect(lambda values: self._schedule(self._save_tune(chat_id, values)))
@@ -1027,14 +1766,29 @@ class MainWindow(QMainWindow):
         self._tune_chat_id = chat_id
         dialog.show()
 
+    async def _tune_model_summary(self, model_entry_id: str) -> str:
+        try:
+            models = await self._application.list_model_catalogue()
+            for model in models:
+                if model.id == model_entry_id:
+                    return model.provider_model_id
+        except Exception:
+            pass
+        return ""
+
     async def _save_tune(self, chat_id: str, values: dict[str, object]) -> None:
         try:
             expected_revision = values.pop("expected_revision", None)
+            expected_extra_revision = values.pop("expected_extra_revision", None)
             expected_model_entry_id = values.pop("expected_model_entry_id", None)
+            extra = values.pop("extra", {}) or {}
+            if values.pop("extra_invalid", False):
+                raise StateError("extended settings contain invalid values")
             await self._application.set_chat_generation_settings(
                 chat_id,
-                GenerationSettings(**values),
+                GenerationSettings(**values, extra=extra),
                 expected_revision=expected_revision,
+                expected_extra_revision=expected_extra_revision,
                 expected_model_entry_id=expected_model_entry_id,
             )
             self.statusBar().showMessage("Tune settings saved")
@@ -1101,6 +1855,12 @@ class MainWindow(QMainWindow):
         self._settings_dialog.set_connections(connections, statuses)
         models = await self._application.list_model_catalogue()
         self._settings_dialog.set_models(models, {connection.id: connection for connection in connections})
+        # Real instrumentation only: live provider/model catalogue counts.
+        self._settings_dialog.instrument_strip.set_instruments([
+            ("connections", str(len(connections))),
+            ("models", str(len(models))),
+            ("available", str(sum(1 for model in models if model.availability.value == "available"))),
+        ])
         current = self._settings_dialog.connection_list.currentItem()
         if current is not None:
             connection = next((item for item in connections if item.id == current.data(Qt.ItemDataRole.UserRole)), None)
@@ -1108,18 +1868,60 @@ class MainWindow(QMainWindow):
         model_item = self._settings_dialog.model_list.currentItem()
         if model_item is not None:
             model_entry_id = str(model_item.data(Qt.ItemDataRole.UserRole))
-            defaults, revision = await self._application.model_defaults_with_revision(model_entry_id)
-            self._settings_dialog.set_model_defaults(defaults, revision)
-            overrides = await self._application.capability_overrides(model_entry_id)
+            await self._load_settings_model_detail(model_entry_id)
+            overrides = list(await self._application.capability_overrides(model_entry_id))
+            overrides.extend(await self._application.generation_setting_capability_overrides(model_entry_id))
             self._settings_dialog.set_capability_overrides(overrides)
             capabilities = await self._application.model_capabilities(model_entry_id)
             self._settings_dialog.set_capabilities(capabilities)
         application_config = await self._application.application_generation_config()
         if application_config is not None:
             application_defaults, default_model_id, revision = application_config
-            self._settings_dialog.set_application_defaults(
-                application_defaults, revision, default_model_id
+            application_extra, application_extra_revision = (
+                await self._application.application_generation_settings_extra_with_revision()
             )
+            self._settings_dialog.set_application_defaults(
+                application_defaults, revision, default_model_id,
+                extra_values=application_extra,
+                extra_revision=application_extra_revision,
+            )
+
+    async def _load_settings_model_detail(self, model_entry_id: str) -> None:
+        """Load model-scope defaults plus the registry-driven editor state."""
+        defaults, revision = await self._application.model_defaults_with_revision(model_entry_id)
+        model_extra, model_extra_revision = await self._application.model_generation_settings_extra(model_entry_id)
+        application_extra = await self._application.application_generation_settings_extra()
+        capabilities = await self._application.generation_setting_capabilities(model_entry_id)
+        # Effective (application -> model) for inherited-row display.
+        effective: dict[str, object] = dict(application_extra)
+        effective.update(model_extra or {})
+        provenance = {key: ("application" if key in application_extra and key not in (model_extra or {}) else "model") for key in effective}
+        if defaults is not None:
+            effective_legacy = {
+                "temperature": defaults.temperature,
+                "max_output_tokens": defaults.max_output_tokens,
+                "reasoning_effort": defaults.reasoning_effort,
+                "timeout_seconds": defaults.timeout_seconds,
+            }
+        else:
+            app_defaults = await self._application.application_generation_settings()
+            effective_legacy = {
+                "temperature": getattr(app_defaults, "temperature", None),
+                "max_output_tokens": getattr(app_defaults, "max_output_tokens", None),
+                "reasoning_effort": getattr(app_defaults, "reasoning_effort", None),
+                "timeout_seconds": getattr(app_defaults, "timeout_seconds", None),
+            }
+            provenance.update({key: "application" for key in effective_legacy})
+        effective_legacy.update(effective)
+        self._settings_dialog.set_model_defaults(
+            defaults,
+            revision,
+            extra_values=model_extra or {},
+            extra_revision=model_extra_revision,
+            effective=effective_legacy,
+            effective_provenance=provenance,
+            capabilities=capabilities,
+        )
 
     async def _refresh_settings_model(self, model_entry_id: str) -> None:
         async with self._phase5_refresh_lock:
@@ -1128,9 +1930,9 @@ class MainWindow(QMainWindow):
             current = self._settings_dialog.model_list.currentItem()
             if current is None or str(current.data(Qt.ItemDataRole.UserRole)) != model_entry_id:
                 return
-            defaults, revision = await self._application.model_defaults_with_revision(model_entry_id)
-            self._settings_dialog.set_model_defaults(defaults, revision)
-            overrides = await self._application.capability_overrides(model_entry_id)
+            await self._load_settings_model_detail(model_entry_id)
+            overrides = list(await self._application.capability_overrides(model_entry_id))
+            overrides.extend(await self._application.generation_setting_capability_overrides(model_entry_id))
             self._settings_dialog.set_capability_overrides(overrides)
             capabilities = await self._application.model_capabilities(model_entry_id)
             self._settings_dialog.set_capabilities(capabilities)
@@ -1142,6 +1944,8 @@ class MainWindow(QMainWindow):
             selection = await self._application.chat_model_selection(self._tune_chat_id)
             settings = await self._application.resolve_chat_generation_settings(self._tune_chat_id)
             override, override_revision = await self._application.chat_generation_settings_override_with_revision(self._tune_chat_id)
+            extra_override, extra_revision = await self._application.chat_generation_settings_extra_override(self._tune_chat_id)
+            capabilities = await self._application.generation_setting_capabilities(selection.model_entry_id)
         except Exception:
             return
         if (
@@ -1152,11 +1956,14 @@ class MainWindow(QMainWindow):
         ):
             return
         self._tune_dialog.set_settings(
-            settings.as_dict(),
+            settings.as_full_dict(),
             settings.provenance,
             timeout_override=None if override is None else override.timeout_seconds,
             override_revision=0 if override_revision is None else override_revision,
+            extra_revision=extra_revision,
             model_entry_id=selection.model_entry_id,
+            extra_values=extra_override or {},
+            capabilities=capabilities,
         )
 
     async def _create_connection_from_settings(self, values: dict[str, object]) -> None:
@@ -1271,10 +2078,13 @@ class MainWindow(QMainWindow):
     async def _save_model_defaults_from_settings(self, values: dict[str, object]) -> None:
         try:
             expected_revision = values.pop("expected_revision", None)
+            expected_extra_revision = values.pop("expected_extra_revision", None)
+            extra = values.pop("extra", {}) or {}
             await self._application.set_model_defaults(
                 str(values.pop("model_entry_id")),
-                GenerationSettings(**values),
+                GenerationSettings(**values, extra=extra),
                 expected_revision=expected_revision,
+                expected_extra_revision=expected_extra_revision,
             )
             await self._refresh_settings_dialog()
             await self._refresh_phase5_state()
@@ -1315,8 +2125,11 @@ class MainWindow(QMainWindow):
     async def _save_application_defaults_from_settings(self, values: dict[str, object]) -> None:
         try:
             expected_revision = values.pop("expected_revision", None)
+            expected_extra_revision = values.pop("expected_extra_revision", None)
+            extra = values.pop("extra", {}) or {}
             await self._application.set_application_generation_settings(
-                GenerationSettings(**values), expected_revision=expected_revision
+                GenerationSettings(**values, extra=extra), expected_revision=expected_revision,
+                expected_extra_revision=expected_extra_revision,
             )
             await self._refresh_settings_dialog()
             await self._refresh_phase5_state()
@@ -1484,6 +2297,8 @@ class MainWindow(QMainWindow):
             return
         self.composer.clear()
         self._clear_editing()
+        # Phase 11 M4b: the sent text is no longer a draft.
+        self._schedule(self._persist_chat_draft(chat_id, ""))
         self._set_active_attempt(attempt.id, attempt.state)
         await self._refresh_attempt_state(chat_id, attempt.id)
 
@@ -1699,7 +2514,18 @@ class MainWindow(QMainWindow):
 
     async def _handle_event(self, event: CoreEvent) -> None:
         chat_id = event.payload.get("chat_id")
-        if event.kind in {"chat_created", "chat_archived", "chat_unarchived"}:
+        if event.kind in {
+            "chat_created",
+            "chat_archived",
+            "chat_unarchived",
+            "chat_title_changed",
+            "chat_duplicated",
+            # Phase 11 M3 (F4/F5/F7): organisation and deletion events also
+            # re-render the rail from the authoritative listing.
+            "chat_folder_changed",
+            "chat_pin_changed",
+            "chat_deleted",
+        }:
             chats = await self._application.list_chats()
             self._replace_chat_list(chats)
             if chat_id == self._current_chat_id:
@@ -1708,6 +2534,11 @@ class MainWindow(QMainWindow):
                     self._current_chat,
                 )
                 self._sync_chat_header(self._current_chat)
+        if event.kind in {"folder_created", "folder_renamed", "folder_deleted"}:
+            await self._refresh_folders()
+            if event.kind == "folder_deleted":
+                chats = await self._application.list_chats()
+                self._replace_chat_list(chats)
         if event.kind == "pending_attachments_changed" and chat_id == self._current_chat_id:
             await self._refresh_pending_attachment_button(self._current_chat_id)
         if event.kind in {
@@ -1816,6 +2647,15 @@ class MainWindow(QMainWindow):
             inspector_open=self.inspector_dock.isVisible(),
             inspector_message_id=(None if self._selected_message is None else self._selected_message.id),
             inspector_leaf_message_id=self._historical_leaf_message_id,
+            maximized=self.isMaximized(),
+            transcript_scroll_position=self.transcript.scroll_position,
+            # Phase 11 fork R-15: the search presentation plane.  isHidden()
+            # (not isVisible()) so the open flag survives saving while the
+            # top-level window itself is still hidden, e.g. during restore.
+            search_open=not self.search_dock.isHidden(),
+            search_query=self._last_search_query,
+            search_filters=self._last_search_filters,
+            search_cursor=self._next_search_cursor,
         )
 
     async def _refresh_inspector(self) -> None:
@@ -1898,6 +2738,12 @@ class MainWindow(QMainWindow):
                     inspector_open=self.inspector_dock.isVisible(),
                     inspector_message_id=(None if self._selected_message is None else self._selected_message.id),
                     inspector_leaf_message_id=self._historical_leaf_message_id,
+                    maximized=self.isMaximized(),
+                    transcript_scroll_position=self.transcript.scroll_position,
+                    search_open=not self.search_dock.isHidden(),
+                    search_query=self._last_search_query,
+                    search_filters=self._last_search_filters,
+                    search_cursor=self._next_search_cursor,
                 )
                 self._window_id = None
             await self._workspace.close()
@@ -1915,6 +2761,12 @@ class MainWindow(QMainWindow):
                 inspector_open=self.inspector_dock.isVisible(),
                 inspector_message_id=(None if self._selected_message is None else self._selected_message.id),
                 inspector_leaf_message_id=self._historical_leaf_message_id,
+                maximized=self.isMaximized(),
+                transcript_scroll_position=self.transcript.scroll_position,
+                search_open=not self.search_dock.isHidden(),
+                search_query=self._last_search_query,
+                search_filters=self._last_search_filters,
+                search_cursor=self._next_search_cursor,
             )
             self._window_id = None
 
@@ -1942,6 +2794,15 @@ class MainWindow(QMainWindow):
         self._schedule(self._finish_close())
 
     async def _finish_close(self) -> None:
+        # Phase 11 M4b: close is a checkpoint — persist the active chat's
+        # draft and the final dock layout before scheduled tasks are torn
+        # down, so nothing still in the composer or docks is lost.
+        if self._current_chat_id is not None:
+            await self._persist_chat_draft(
+                self._current_chat_id, self.composer.toPlainText()
+            )
+        if self._window_id is not None:
+            await self._persist_dock_layout()
         self.stop_bridge()
         tasks = tuple(self._refresh_tasks)
         if tasks:
@@ -1965,6 +2826,12 @@ class MainWindow(QMainWindow):
                 inspector_open=self.inspector_dock.isVisible(),
                 inspector_message_id=(None if self._selected_message is None else self._selected_message.id),
                 inspector_leaf_message_id=self._historical_leaf_message_id,
+                maximized=self.isMaximized(),
+                transcript_scroll_position=self.transcript.scroll_position,
+                search_open=not self.search_dock.isHidden(),
+                search_query=self._last_search_query,
+                search_filters=self._last_search_filters,
+                search_cursor=self._next_search_cursor,
             )
             self._window_id = None
         elif self._window_id is not None:
@@ -1983,6 +2850,12 @@ class MainWindow(QMainWindow):
                 inspector_open=self.inspector_dock.isVisible(),
                 inspector_message_id=(None if self._selected_message is None else self._selected_message.id),
                 inspector_leaf_message_id=self._historical_leaf_message_id,
+                maximized=self.isMaximized(),
+                transcript_scroll_position=self.transcript.scroll_position,
+                search_open=not self.search_dock.isHidden(),
+                search_query=self._last_search_query,
+                search_filters=self._last_search_filters,
+                search_cursor=self._next_search_cursor,
             )
             self._window_id = None
             await self._workspace.close()

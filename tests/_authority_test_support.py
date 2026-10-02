@@ -116,6 +116,26 @@ def upgrade_to(database: Path | str, revision: str) -> None:
         engine.dispose()
 
 
+def downgrade_to(database: Path | str, revision: str) -> None:
+    """Downgrade database to specified revision using alembic."""
+    path = Path(database).absolute()
+    engine = create_engine(f"sqlite:///{path}", future=True)
+    config = Config()
+    config.set_main_option(
+        "script_location",
+        str(
+            Path(__file__).resolve().parents[1]
+            / "src/bots5/infrastructure/persistence/migrations"
+        ),
+    )
+    try:
+        with engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.downgrade(config, revision)
+    finally:
+        engine.dispose()
+
+
 @contextmanager
 def phase7_guarded_raw_mutation(connection, operation: str):
     """Arm the real Phase 7 guard on one disposable stock-SQLite connection."""

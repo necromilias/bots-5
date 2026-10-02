@@ -4,6 +4,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     Column,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -29,6 +30,11 @@ chats = Table(
     Column("head_message_id", String(64), ForeignKey("messages.id", ondelete="SET NULL")),
     Column("revision", Integer, nullable=False, default=0),
     Column("archived_at", Text),
+    # Phase 11 M3 (F4/F5) organisation columns.  These mirror the columns the
+    # hash-frozen 0013 migration installs; the runtime metadata is only used
+    # for reads, never for DDL.
+    Column("folder_id", String(64)),
+    Column("is_pinned", Boolean, nullable=False, server_default=text("'0'")),
 )
 
 # Phase 7 authoritative coordination metadata.  Search rows below are derived;
@@ -314,6 +320,52 @@ chat_model_generation_config = Table(
     Column("updated_at", String(40), nullable=False),
 )
 
+# Phase 11 scope amendment: registry-driven generation settings (the settings
+# beyond the four frozen legacy columns).  One additive row per scope with its
+# own revision; the JSON payload is closed and validated by the domain
+# registry at every store boundary.
+application_generation_settings_extra = Table(
+    "application_generation_settings_extra",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("extra_settings_json", Text, nullable=False),
+    Column("revision", Integer, nullable=False),
+    Column("updated_at", String(40), nullable=False),
+)
+
+model_generation_settings_extra = Table(
+    "model_generation_settings_extra",
+    metadata,
+    Column("model_entry_id", String(64), ForeignKey("model_catalogue_entries.id", ondelete="CASCADE"), primary_key=True),
+    Column("extra_settings_json", Text, nullable=False),
+    Column("revision", Integer, nullable=False),
+    Column("updated_at", String(40), nullable=False),
+)
+
+chat_model_generation_settings_extra = Table(
+    "chat_model_generation_settings_extra",
+    metadata,
+    Column("chat_id", String(64), ForeignKey("chats.id", ondelete="CASCADE"), primary_key=True),
+    Column("model_entry_id", String(64), ForeignKey("model_catalogue_entries.id", ondelete="CASCADE"), primary_key=True),
+    Column("extra_settings_json", Text, nullable=False),
+    Column("revision", Integer, nullable=False),
+    Column("updated_at", String(40), nullable=False),
+)
+
+# Manual per-setting capability overrides for the EXTENDED registry keys.
+# The frozen capability_overrides table keeps its closed Phase 5 key
+# vocabulary; this table carries exactly the registry's extended keys.
+generation_setting_capabilities = Table(
+    "generation_setting_capabilities",
+    metadata,
+    Column("model_entry_id", String(64), ForeignKey("model_catalogue_entries.id", ondelete="CASCADE"), primary_key=True),
+    Column("capability_key", String(128), primary_key=True),
+    Column("state", String(32), nullable=False),
+    Column("reason", Text),
+    Column("revision", Integer, nullable=False),
+    Column("updated_at", String(40), nullable=False),
+)
+
 # Phase 6: durable content-addressed attachment identity and frozen context
 # evidence.  These tables are additive; Phase 1-5 rows remain readable.
 attachment_blobs = Table(
@@ -403,5 +455,55 @@ workspace_windows = Table(
     Column("inspector_open", Boolean, nullable=False, default=False),
     Column("inspector_message_id", String(64), nullable=True),
     Column("inspector_leaf_message_id", String(64), nullable=True),
+    Column("maximized", Boolean, nullable=False, default=False),
+    Column("transcript_scroll_position", Integer, nullable=True),
+    # Phase 11 fork R-15: faithful search-state restore plane
+    # (0018_phase11_search_state).
+    Column("search_open", Boolean, nullable=False, default=False),
+    Column("search_query", Text, nullable=True),
+    Column("search_filters_json", Text, nullable=True),
+    Column("search_cursor", Text, nullable=True),
     Column("updated_at", String(40), nullable=False),
+)
+
+# Phase 11 M4b/M6: workspace/settings persistence tables
+chat_drafts = Table(
+    "chat_drafts",
+    metadata,
+    # A draft belongs to one chat; deleting the chat must remove its draft rather than leave an
+    # orphan row behind.  (dock_layout, by contrast, is an advisory, Qt-version-tied opaque blob
+    # and deliberately carries no FK.)
+    Column("chat_id", String(64), ForeignKey("chats.id", ondelete="CASCADE"), primary_key=True),
+    Column("draft_text", Text, nullable=False, default=""),
+    Column("updated_at", String(40), nullable=False),
+)
+
+dock_layout = Table(
+    "dock_layout",
+    metadata,
+    Column("window_id", String(128), primary_key=True),
+    Column("dock_state_blob", LargeBinary, nullable=True),
+    Column("updated_at", String(40), nullable=False),
+)
+
+keybinding_overrides = Table(
+    "keybinding_overrides",
+    metadata,
+    Column("action_id", String(256), primary_key=True),
+    Column("shortcut", String(64), nullable=False, default=""),
+    Column("conflict_detected", Boolean, nullable=False, default=False),
+    Column("updated_at", String(40), nullable=False),
+)
+
+font_scale_settings = Table(
+    "font_scale_settings",
+    metadata,
+    Column("id", String(1), default="1", primary_key=True),
+    Column("scale_factor", Float, nullable=False, default=1.0),
+    Column("ui_font_family", Text, nullable=True),
+    Column("transcript_font_family", Text, nullable=True),
+    Column("code_font_family", Text, nullable=True),
+    Column("base_font_size_pt", Float, nullable=False, default=11.0),
+    Column("updated_at", String(40), nullable=False),
+    CheckConstraint("id = '1'", name="ck_font_scale_single_row"),
 )

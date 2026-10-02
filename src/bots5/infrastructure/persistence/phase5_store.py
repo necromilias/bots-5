@@ -5,7 +5,7 @@ import math
 import re
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Mapping
 
 from sqlalchemy import delete, insert, select, update
 from sqlalchemy.exc import IntegrityError
@@ -35,17 +35,25 @@ from bots5.domain.provider import (
     ProviderProfile,
     validate_capability_value,
 )
+from bots5.domain.generation_settings_registry import (
+    SETTING_CAPABILITY_KEYS,
+    validate_settings_values,
+)
 
 from .schema import (
     application_generation_config,
+    application_generation_settings_extra,
     capability_facts,
     capability_observations,
     capability_overrides,
     chat_model_generation_config,
+    chat_model_generation_settings_extra,
     chat_model_selection,
     catalogue_refresh_state,
+    generation_setting_capabilities,
     model_catalogue_entries,
     model_generation_config,
+    model_generation_settings_extra,
     provider_connections,
 )
 from .transition_guard import (
@@ -175,6 +183,39 @@ def _validate_settings_value(value: GenerationSettings) -> None:
         or value.timeout_seconds <= 0
     ):
         raise StateError("generation settings are malformed")
+    # Registry-driven settings are validated by the closed domain registry:
+    # unknown keys and out-of-range values are refused at the store boundary.
+    if not isinstance(value.extra, dict):
+        raise StateError("generation settings are malformed")
+    try:
+        validate_settings_values(value.extra)
+    except ValueError as exc:
+        raise StateError(f"generation settings are malformed: {exc}") from None
+    if value.reasoning_effort is not None and value.extra.get("reasoning_effort_level") is not None:
+        raise StateError("generation settings are malformed: reasoning controls conflict")
+
+
+def _extra_json(values: Mapping[str, object]) -> str:
+    """Serialize a registry-validated extra mapping to canonical JSON."""
+    try:
+        validated = validate_settings_values(dict(values))
+    except ValueError as exc:
+        raise StateError(f"generation settings are malformed: {exc}") from None
+    return json.dumps(validated, sort_keys=True, separators=(",", ":"))
+
+
+def _extra_mapping(raw: object) -> dict[str, object]:
+    """Parse and re-validate a stored extra mapping (fail closed)."""
+    try:
+        parsed = json.loads(raw if isinstance(raw, str) else "{}")
+    except (TypeError, ValueError) as exc:
+        raise StateError("generation settings are malformed") from exc
+    if not isinstance(parsed, dict):
+        raise StateError("generation settings are malformed")
+    try:
+        return validate_settings_values(parsed)
+    except ValueError as exc:
+        raise StateError(f"generation settings are malformed: {exc}") from None
 
 
 def _connection(row: Any) -> ProviderConnection:
@@ -725,9 +766,13 @@ class Phase5StoreMixin:
         self._ensure_open()
         with self._engine.connect() as db:
             rows = db.execute(select(capability_overrides).where(capability_overrides.c.model_entry_id == model_entry_id)).fetchall()
+        # Registry-driven (extended) capability keys are admitted alongside the
+        # frozen Phase 5 catalogue; the closed v2 snapshot contract still only
+        # ever carries the frozen keys.
+        admitted_keys = CAPABILITY_KEYS | SETTING_CAPABILITY_KEYS
         result = []
         for row in rows:
-            if row._mapping["capability_key"] not in CAPABILITY_KEYS:
+            if row._mapping["capability_key"] not in admitted_keys:
                 raise StateError("capability override key is invalid")
             if row._mapping["reason"] is not None and (
                 type(row._mapping["reason"]) is not str
@@ -740,7 +785,7 @@ class Phase5StoreMixin:
     def set_capability_override(self, value: CapabilityOverride, *, expected_revision: int | None = None) -> CapabilityOverride:
         self._ensure_open()
         if (
-            value.key not in CAPABILITY_KEYS
+            value.key not in CAPABILITY_KEYS | SETTING_CAPABILITY_KEYS
             or value.reason is not None
             and (type(value.reason) is not str or len(value.reason) > 256)
             or type(value.revision) is not int
@@ -774,6 +819,69 @@ class Phase5StoreMixin:
                     raise RevisionConflict("capability override revision changed")
         return replace(value, revision=revision, updated_at=parse_utc(now))
 
+    # ------------------------------------------------------------------
+    # Phase 11 scope amendment: manual per-setting capability overrides for
+    # the EXTENDED registry keys.  The frozen capability_overrides table and
+    # its 0007 truth triggers keep their closed Phase 5 key vocabulary; these
+    # rows live in generation_setting_capabilities with the same CAS revision
+    # semantics and the same fail-closed admission discipline.
+    # ------------------------------------------------------------------
+
+    def list_generation_setting_capability_overrides(self, model_entry_id: str) -> tuple[CapabilityOverride, ...]:
+        self._ensure_open()
+        with self._engine.connect() as db:
+            rows = db.execute(select(generation_setting_capabilities).where(generation_setting_capabilities.c.model_entry_id == model_entry_id)).fetchall()
+        result = []
+        for row in rows:
+            if row._mapping["capability_key"] not in SETTING_CAPABILITY_KEYS:
+                raise StateError("capability override key is invalid")
+            if row._mapping["reason"] is not None and (
+                type(row._mapping["reason"]) is not str
+                or len(row._mapping["reason"]) > 256
+            ):
+                raise StateError("capability override reason is invalid")
+            result.append(CapabilityOverride(row._mapping["model_entry_id"], row._mapping["capability_key"], CapabilityState(row._mapping["state"]), None, row._mapping["reason"], int(row._mapping["revision"]), parse_utc(row._mapping["updated_at"])))
+        return tuple(result)
+
+    def set_generation_setting_capability_override(self, value: CapabilityOverride, *, expected_revision: int | None = None) -> CapabilityOverride:
+        self._ensure_open()
+        if (
+            value.key not in SETTING_CAPABILITY_KEYS
+            or value.key in CAPABILITY_KEYS
+            or value.value is not None
+            or value.reason is not None
+            and (type(value.reason) is not str or len(value.reason) > 256)
+            or type(value.revision) is not int
+            or value.revision < 1
+        ):
+            raise StateError("capability override is malformed")
+        try:
+            validate_capability_value(value.key, value.state, None)
+        except ValueError as exc:
+            raise StateError("capability override is malformed") from exc
+        now = utc_iso(value.updated_at or datetime.now(UTC))
+        with self.mutation_transition(), self._authority.transition(), self._engine.begin() as db:
+            row = db.execute(select(generation_setting_capabilities).where(generation_setting_capabilities.c.model_entry_id == value.model_entry_id, generation_setting_capabilities.c.capability_key == value.key)).first()
+            current_revision = 0 if row is None else int(row._mapping["revision"])
+            if expected_revision is not None and current_revision != expected_revision:
+                raise RevisionConflict("capability override revision changed")
+            revision = current_revision + 1
+            values = dict(model_entry_id=value.model_entry_id, capability_key=value.key, state=value.state.value, reason=value.reason, revision=revision, updated_at=now)
+            if row is None:
+                try:
+                    db.execute(insert(generation_setting_capabilities).values(**values))
+                except IntegrityError:
+                    raise RevisionConflict("capability override was concurrently created") from None
+            else:
+                result = db.execute(update(generation_setting_capabilities).where(
+                    generation_setting_capabilities.c.model_entry_id == value.model_entry_id,
+                    generation_setting_capabilities.c.capability_key == value.key,
+                    generation_setting_capabilities.c.revision == current_revision,
+                ).values(**values))
+                if result.rowcount != 1:
+                    raise RevisionConflict("capability override revision changed")
+        return replace(value, revision=revision, updated_at=parse_utc(now))
+
     def add_capability_observation(self, observation: dict[str, object]) -> None:
         self._ensure_open()
         with self.mutation_transition(), self._authority.transition(), self._engine.begin() as db:
@@ -790,7 +898,7 @@ class Phase5StoreMixin:
     def get_application_generation_settings(self) -> GenerationSettings:
         return self.get_application_generation_config()[0]
 
-    def set_application_generation_settings(self, value: GenerationSettings, *, expected_revision: int | None = None) -> int:
+    def set_application_generation_settings(self, value: GenerationSettings, *, expected_revision: int | None = None, expected_extra_revision: int | None = None) -> int:
         _validate_settings_value(value)
         with self.mutation_transition(), self._authority.transition(), self._engine.begin() as db:
             row = db.execute(
@@ -801,6 +909,12 @@ class Phase5StoreMixin:
             current_revision = int(row._mapping["revision"])
             if expected_revision is not None and current_revision != expected_revision:
                 raise RevisionConflict("application generation settings revision changed")
+            # The combined scope write also replaces the registry-driven plane,
+            # so it must present that plane's revision too: otherwise a stale
+            # caller silently clobbers a newer extended-setting value.
+            self._require_extra_revision(
+                db, application_generation_settings_extra, {"id": 1}, expected_extra_revision
+            )
             revision = current_revision + 1
             result = db.execute(update(application_generation_config).where(
                 application_generation_config.c.id == 1,
@@ -812,6 +926,7 @@ class Phase5StoreMixin:
             ))
             if result.rowcount != 1:
                 raise RevisionConflict("application generation settings revision changed")
+            self._write_extra_row(db, application_generation_settings_extra, {"id": 1}, dict(value.extra))
         return revision
 
     def set_application_default_model(self, model_entry_id: str, *, expected_revision: int | None = None) -> int:
@@ -868,8 +983,8 @@ class Phase5StoreMixin:
             row = db.execute(select(model_generation_config).where(model_generation_config.c.model_entry_id == model_entry_id)).first()
         return (None, None) if row is None else (_settings(row._mapping), int(row._mapping["revision"]))
 
-    def set_model_generation_settings(self, model_entry_id: str, value: GenerationSettings, *, expected_revision: int | None = None) -> int:
-        return self._set_generation_config(model_generation_config, {"model_entry_id": model_entry_id}, value, expected_revision=expected_revision)
+    def set_model_generation_settings(self, model_entry_id: str, value: GenerationSettings, *, expected_revision: int | None = None, expected_extra_revision: int | None = None) -> int:
+        return self._set_generation_config(model_generation_config, {"model_entry_id": model_entry_id}, value, expected_revision=expected_revision, expected_extra_revision=expected_extra_revision, extra_table=model_generation_settings_extra)
 
     def get_chat_model_generation_settings(self, chat_id: str, model_entry_id: str) -> GenerationSettings | None:
         return self.get_chat_model_generation_config(chat_id, model_entry_id)[0]
@@ -880,10 +995,10 @@ class Phase5StoreMixin:
             row = db.execute(select(chat_model_generation_config).where(chat_model_generation_config.c.chat_id == chat_id, chat_model_generation_config.c.model_entry_id == model_entry_id)).first()
         return (None, None) if row is None else (_settings(row._mapping), int(row._mapping["revision"]))
 
-    def set_chat_model_generation_settings(self, chat_id: str, model_entry_id: str, value: GenerationSettings, *, expected_revision: int | None = None) -> int:
-        return self._set_generation_config(chat_model_generation_config, {"chat_id": chat_id, "model_entry_id": model_entry_id}, value, expected_revision=expected_revision)
+    def set_chat_model_generation_settings(self, chat_id: str, model_entry_id: str, value: GenerationSettings, *, expected_revision: int | None = None, expected_extra_revision: int | None = None) -> int:
+        return self._set_generation_config(chat_model_generation_config, {"chat_id": chat_id, "model_entry_id": model_entry_id}, value, expected_revision=expected_revision, expected_extra_revision=expected_extra_revision, extra_table=chat_model_generation_settings_extra)
 
-    def _set_generation_config(self, table, identity: dict[str, object], value: GenerationSettings, *, expected_revision: int | None = None) -> int:
+    def _set_generation_config(self, table, identity: dict[str, object], value: GenerationSettings, *, expected_revision: int | None = None, expected_extra_revision: int | None = None, extra_table=None) -> int:
         self._ensure_open()
         _validate_settings_value(value)
         with self.mutation_transition(), self._authority.transition(), self._engine.begin() as db:
@@ -892,6 +1007,12 @@ class Phase5StoreMixin:
             current_revision = 0 if row is None else int(row._mapping["revision"])
             if expected_revision is not None and current_revision != expected_revision:
                 raise RevisionConflict("generation settings revision changed")
+            if extra_table is not None:
+                # The combined scope write replaces BOTH revision planes.  A
+                # caller that only presents the legacy revision cannot prove it
+                # saw the current extended plane, so the write fails closed
+                # rather than clobbering a newer extended-setting value.
+                self._require_extra_revision(db, extra_table, identity, expected_extra_revision)
             revision = current_revision + 1
             values = dict(identity, temperature=None if value.temperature is None else str(value.temperature), max_output_tokens=value.max_output_tokens, reasoning_effort=value.reasoning_effort, timeout_seconds=None if value.timeout_seconds is None else str(value.timeout_seconds), revision=revision, updated_at=_now())
             if row is None:
@@ -907,7 +1028,184 @@ class Phase5StoreMixin:
                 )
                 if result.rowcount != 1:
                     raise RevisionConflict("generation settings revision changed")
+            if extra_table is not None:
+                # The override row is the complete scope state: registry-driven
+                # settings not present in value.extra mean "inherit", matching
+                # the legacy per-field inheritance semantics exactly.
+                self._write_extra_row(db, extra_table, identity, dict(value.extra))
         return revision
+
+    # ------------------------------------------------------------------
+    # Phase 11 scope amendment: registry-driven (extra) generation settings.
+    # One additive row per scope with an independent revision.  Every write
+    # replaces the scope's complete extra mapping with the given validated
+    # values; every read re-validates the stored JSON through the closed
+    # registry (fail closed on malformed rows).
+    # ------------------------------------------------------------------
+
+    def _require_extra_revision(self, db, table, identity: dict[str, object], expected_extra_revision: int | None) -> int:
+        """Couple a combined scope write to the extended-settings revision plane.
+
+        Returns the current extra revision.  Fails closed with
+        ``RevisionConflict`` when the scope already has an extended-settings row
+        and the caller did not present its exact revision, or presented a stale
+        one.  A scope with no extended-settings row is writable by a caller
+        creating it (``expected_extra_revision`` of ``None`` or ``0``).
+        """
+        where = [getattr(table.c, key) == item for key, item in identity.items()]
+        row = db.execute(select(table).where(*where)).first()
+        current_revision = 0 if row is None else int(row._mapping["revision"])
+        if current_revision == 0:
+            if expected_extra_revision not in (None, 0):
+                raise RevisionConflict("generation settings extra revision changed")
+            return 0
+        if expected_extra_revision is None or expected_extra_revision != current_revision:
+            raise RevisionConflict("generation settings extra revision changed")
+        return current_revision
+
+    def _write_extra_row(self, db, table, identity: dict[str, object], values: Mapping[str, object]) -> None:
+        payload = _extra_json(values)
+        where = [getattr(table.c, key) == item for key, item in identity.items()]
+        row = db.execute(select(table).where(*where)).first()
+        if row is None:
+            if not values:
+                return
+            db.execute(insert(table).values(
+                **identity,
+                extra_settings_json=payload,
+                revision=1,
+                updated_at=_now(),
+            ))
+            return
+        if str(row._mapping["extra_settings_json"]) == payload:
+            return
+        current_revision = int(row._mapping["revision"])
+        result = db.execute(
+            update(table)
+            .where(*where, table.c.revision == current_revision)
+            .values(extra_settings_json=payload, revision=current_revision + 1, updated_at=_now())
+        )
+        if result.rowcount != 1:
+            raise RevisionConflict("generation settings revision changed")
+
+    def get_application_generation_settings_extra(self) -> dict[str, object]:
+        return self.get_application_generation_settings_extra_config()[0]
+
+    def get_application_generation_settings_extra_config(self) -> tuple[dict[str, object], int]:
+        """Application extended settings plus their revision (0 when absent)."""
+        self._ensure_open()
+        with self._engine.connect() as db:
+            row = db.execute(select(application_generation_settings_extra).where(application_generation_settings_extra.c.id == 1)).first()
+        if row is None:
+            return {}, 0
+        return _extra_mapping(row._mapping["extra_settings_json"]), int(row._mapping["revision"])
+
+    def set_application_generation_settings_extra(self, values: Mapping[str, object], *, expected_revision: int | None = None) -> int:
+        payload = _extra_json(values)
+        with self.mutation_transition(), self._authority.transition(), self._engine.begin() as db:
+            row = db.execute(select(application_generation_settings_extra).where(application_generation_settings_extra.c.id == 1)).first()
+            current_revision = 0 if row is None else int(row._mapping["revision"])
+            if expected_revision is not None and current_revision != expected_revision:
+                raise RevisionConflict("generation settings revision changed")
+            if row is None:
+                db.execute(insert(application_generation_settings_extra).values(
+                    id=1, extra_settings_json=payload, revision=1, updated_at=_now(),
+                ))
+                return 1
+            result = db.execute(
+                update(application_generation_settings_extra)
+                .where(
+                    application_generation_settings_extra.c.id == 1,
+                    application_generation_settings_extra.c.revision == current_revision,
+                )
+                .values(extra_settings_json=payload, revision=current_revision + 1, updated_at=_now())
+            )
+            if result.rowcount != 1:
+                raise RevisionConflict("generation settings revision changed")
+            return current_revision + 1
+
+    def get_model_generation_settings_extra(self, model_entry_id: str) -> tuple[dict[str, object] | None, int | None]:
+        self._ensure_open()
+        with self._engine.connect() as db:
+            row = db.execute(select(model_generation_settings_extra).where(model_generation_settings_extra.c.model_entry_id == model_entry_id)).first()
+        if row is None:
+            return (None, None)
+        return (_extra_mapping(row._mapping["extra_settings_json"]), int(row._mapping["revision"]))
+
+    def set_model_generation_settings_extra(self, model_entry_id: str, values: Mapping[str, object], *, expected_revision: int | None = None) -> int:
+        payload = _extra_json(values)
+        with self.mutation_transition(), self._authority.transition(), self._engine.begin() as db:
+            row = db.execute(select(model_generation_settings_extra).where(model_generation_settings_extra.c.model_entry_id == model_entry_id)).first()
+            current_revision = 0 if row is None else int(row._mapping["revision"])
+            if expected_revision is not None and current_revision != expected_revision:
+                raise RevisionConflict("generation settings revision changed")
+            if row is None:
+                try:
+                    db.execute(insert(model_generation_settings_extra).values(
+                        model_entry_id=model_entry_id, extra_settings_json=payload,
+                        revision=1, updated_at=_now(),
+                    ))
+                except IntegrityError:
+                    raise RevisionConflict("generation settings were concurrently created") from None
+                return 1
+            result = db.execute(
+                update(model_generation_settings_extra)
+                .where(
+                    model_generation_settings_extra.c.model_entry_id == model_entry_id,
+                    model_generation_settings_extra.c.revision == current_revision,
+                )
+                .values(extra_settings_json=payload, revision=current_revision + 1, updated_at=_now())
+            )
+            if result.rowcount != 1:
+                raise RevisionConflict("generation settings revision changed")
+            return current_revision + 1
+
+    def get_chat_model_generation_settings_extra(self, chat_id: str, model_entry_id: str) -> tuple[dict[str, object] | None, int | None]:
+        self._ensure_open()
+        with self._engine.connect() as db:
+            row = db.execute(
+                select(chat_model_generation_settings_extra).where(
+                    chat_model_generation_settings_extra.c.chat_id == chat_id,
+                    chat_model_generation_settings_extra.c.model_entry_id == model_entry_id,
+                )
+            ).first()
+        if row is None:
+            return (None, None)
+        return (_extra_mapping(row._mapping["extra_settings_json"]), int(row._mapping["revision"]))
+
+    def set_chat_model_generation_settings_extra(self, chat_id: str, model_entry_id: str, values: Mapping[str, object], *, expected_revision: int | None = None) -> int:
+        payload = _extra_json(values)
+        with self.mutation_transition(), self._authority.transition(), self._engine.begin() as db:
+            row = db.execute(
+                select(chat_model_generation_settings_extra).where(
+                    chat_model_generation_settings_extra.c.chat_id == chat_id,
+                    chat_model_generation_settings_extra.c.model_entry_id == model_entry_id,
+                )
+            ).first()
+            current_revision = 0 if row is None else int(row._mapping["revision"])
+            if expected_revision is not None and current_revision != expected_revision:
+                raise RevisionConflict("generation settings revision changed")
+            if row is None:
+                try:
+                    db.execute(insert(chat_model_generation_settings_extra).values(
+                        chat_id=chat_id, model_entry_id=model_entry_id, extra_settings_json=payload,
+                        revision=1, updated_at=_now(),
+                    ))
+                except IntegrityError:
+                    raise RevisionConflict("generation settings were concurrently created") from None
+                return 1
+            result = db.execute(
+                update(chat_model_generation_settings_extra)
+                .where(
+                    chat_model_generation_settings_extra.c.chat_id == chat_id,
+                    chat_model_generation_settings_extra.c.model_entry_id == model_entry_id,
+                    chat_model_generation_settings_extra.c.revision == current_revision,
+                )
+                .values(extra_settings_json=payload, revision=current_revision + 1, updated_at=_now())
+            )
+            if result.rowcount != 1:
+                raise RevisionConflict("generation settings revision changed")
+            return current_revision + 1
 
     def get_chat_model_selection(self, chat_id: str) -> ModelSelection | None:
         self._ensure_open()

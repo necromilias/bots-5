@@ -41,7 +41,23 @@ from bots5.infrastructure.rooted_sqlite_vfs import (
 _LEGACY_HEAD = "0009_phase6_context_attachments"
 _PHASE7_HEAD = "0010_phase7_search_navigation"
 _PHASE8_HEAD = "0011_phase8_inspector_state"
-_HEAD = "0012_phase9_archive_import"
+_PHASE9_HEAD = "0012_phase9_archive_import"
+_PHASE11_ORG_HEAD = "0013_phase11_organisation"
+_PHASE11_TOMBSTONE_HEAD = "0014_phase11_message_tombstone"
+_PHASE11_DUPLICATE_HEAD = "0015_phase11_duplicate_admission"
+_PHASE11_WORKSPACE_HEAD = "0016_phase11_workspace_state"
+# 0017 is the Phase 11 M3 integrity/deletion-path revision.  It WAS the
+# default upgrade target until the R-15 search-state revision took over, so
+# existing 0017/0016 databases remain fully supported sources on the normal
+# upgrade path, and journals written while either was the head stay
+# recoverable.
+_PHASE11_INTEGRITY_HEAD = "0017_phase11_integrity"
+_PHASE11_SEARCH_HEAD = "0018_phase11_search_state"
+# 0018 was the head until the Phase 11 scope amendment added the
+# registry-driven generation-settings plane, so existing 0018 databases
+# remain fully supported sources on the normal upgrade path.
+_PHASE11_GENERATION_SETTINGS_HEAD = "0019_phase11_generation_settings"
+_HEAD = _PHASE11_GENERATION_SETTINGS_HEAD
 _PRIOR_REVISIONS = (
     "0001_desktop_state",
     "0002_conversation_lineage",
@@ -54,6 +70,22 @@ _PRIOR_REVISIONS = (
     _LEGACY_HEAD,
     _PHASE7_HEAD,
     _PHASE8_HEAD,
+    _PHASE9_HEAD,
+    _PHASE11_ORG_HEAD,
+    _PHASE11_TOMBSTONE_HEAD,
+    _PHASE11_DUPLICATE_HEAD,
+    # 0016 was the head until the integrity revision became the default
+    # target.  Existing 0016 databases must stay supported sources on the
+    # normal upgrade path, so it belongs to the prior chain, not to _HEAD.
+    _PHASE11_WORKSPACE_HEAD,
+    # 0017 was the head until the R-15 search-state revision became the
+    # default target.  Existing 0017 databases must stay supported sources on
+    # the normal upgrade path, so it belongs to the prior chain, not to _HEAD.
+    _PHASE11_INTEGRITY_HEAD,
+    # 0018 was the head until the Phase 11 scope-amendment generation-settings
+    # revision became the default target.  Existing 0018 databases must stay
+    # supported sources on the normal upgrade path.
+    _PHASE11_SEARCH_HEAD,
 )
 _SUPPORTED_REVISIONS = frozenset((*_PRIOR_REVISIONS, _HEAD))
 _MIGRATION_CHAIN = (*_PRIOR_REVISIONS, _HEAD)
@@ -445,7 +477,30 @@ def _validate_record(
     target_revision = record.get("target_revision")
     if (
         record.get("journal_version") != 3
-        or target_revision not in {_LEGACY_HEAD, _PHASE7_HEAD, _PHASE8_HEAD, _HEAD}
+        or target_revision
+        not in {
+            _LEGACY_HEAD,
+            _PHASE7_HEAD,
+            _PHASE8_HEAD,
+            _PHASE9_HEAD,
+            _PHASE11_ORG_HEAD,
+            _PHASE11_TOMBSTONE_HEAD,
+            # 0015 was the head between the tombstone and the workspace revision.  A journal
+            # written by an interrupted migration to 0015 targets exactly this revision, so
+            # omitting it here rejects recovery from a legitimately supported state.
+            _PHASE11_DUPLICATE_HEAD,
+            # 0016 was the head until 0017 became the default target.  A journal
+            # written by an interrupted migration to 0016 targets exactly this
+            # revision, so omitting it here rejects recovery from a legitimately
+            # supported state.
+            _PHASE11_WORKSPACE_HEAD,
+            # 0017 was the head until 0018 became the default target.  A journal
+            # written by an interrupted migration to 0017 targets exactly this
+            # revision, so omitting it here rejects recovery from a legitimately
+            # supported state.
+            _PHASE11_INTEGRITY_HEAD,
+            _HEAD,
+        }
     ):
         raise RuntimeError("migration journal version or target is unsupported")
     source_kind = record.get("source_kind")
@@ -1949,7 +2004,10 @@ def upgrade_database(*, authority: DataRootAuthority) -> None:
                         _write_journal(authority, record, initial=True)
                     else:
                         if revision == _HEAD:
-                            _quiesce_source(authority, _HEAD)
+                            # Already at the default head (0018, carrying the
+                            # R-15 search-state plane).  The database is
+                            # quiescent and current; no journal is created.
+                            _quiesce_source(authority, revision)
                             success = True
                             return
                         from bots5.infrastructure.backup_capture import (

@@ -233,11 +233,11 @@ DDL = (
     BEGIN SELECT RAISE(ABORT, 'imported message differs from sealed graph'); END""",
     "DROP TRIGGER IF EXISTS messages_validate_insert",
     """CREATE TRIGGER messages_validate_insert BEFORE INSERT ON messages
-    WHEN bots5_phase9_import_message_allowed(NEW.id,NEW.chat_id,NEW.parent_id,NEW.sequence,NEW.role,NEW.state,NEW.content,NEW.created_at,NEW.lineage_id,NEW.revision,NEW.supersedes_id) = 0 AND (
+    WHEN bots5_phase9_import_message_allowed(NEW.id,NEW.chat_id,NEW.parent_id,NEW.sequence,NEW.role,NEW.state,NEW.content,NEW.created_at,NEW.lineage_id,NEW.revision,NEW.supersedes_id) = 0 AND bots5_duplicate_message_allowed(NEW.id,NEW.chat_id,NEW.parent_id,NEW.sequence,NEW.role,NEW.state,NEW.content,NEW.created_at,NEW.lineage_id,NEW.revision,NEW.supersedes_id) = 0 AND (
       typeof(NEW.sequence) <> 'integer' OR typeof(NEW.revision) <> 'integer'
       OR NEW.sequence < 1 OR NEW.role NOT IN ('user', 'assistant')
-      OR NEW.state NOT IN ('sending', 'sent', 'failed', 'streaming', 'complete', 'incomplete', 'truncated', 'aborted')
-      OR (NEW.role = 'user' AND NEW.state NOT IN ('sending', 'sent', 'failed', 'aborted'))
+      OR NEW.state NOT IN ('sending', 'sent', 'failed', 'streaming', 'complete', 'incomplete', 'truncated', 'aborted', 'deleted')
+      OR (NEW.role = 'user' AND NEW.state NOT IN ('sending', 'sent', 'failed', 'aborted', 'deleted'))
       OR (NEW.role = 'assistant' AND (NEW.state <> 'streaming' OR bots5_internal_transition(NEW.id, NULL, 'start-message') = 0))
       OR NEW.revision < 1
     ) BEGIN SELECT RAISE(ABORT, 'message fields are invalid'); END""",
@@ -290,7 +290,7 @@ REQUIRED_TRIGGERS = frozenset({
 })
 
 
-def validate_phase9_schema(connection) -> None:
+def validate_phase9_schema(connection, *, exact_ddl: bool = True) -> None:
     # Validate authoritative rows before DDL so a deliberately injected graph
     # corruption is classified by its semantic invariant rather than masked by
     # the later exact-schema comparison.
@@ -314,10 +314,16 @@ def validate_phase9_schema(connection) -> None:
         ).fetchall()
         if sql is not None
     }
-    for key, expected in expected_ddl.items():
-        actual = installed_ddl.get(key)
-        if actual != expected:
-            raise RuntimeError("Phase 9 import schema definition is contradictory")
+    # exact_ddl=False is used for the frozen 0014 tombstone revision only.  0014 rewrote
+    # messages_validate_insert with hardcoded text, so a 0014 database necessarily lacks the
+    # 0015 duplicate-admission term that the canonical (current-head) DDL contains.  Comparing
+    # it would reject a legitimately-valid 0014 database.  Row validation and the presence
+    # checks below still apply; only this head-vs-frozen exact-DDL equality is skipped.
+    if exact_ddl:
+        for key, expected in expected_ddl.items():
+            actual = installed_ddl.get(key)
+            if actual != expected:
+                raise RuntimeError("Phase 9 import schema definition is contradictory")
     rows = connection.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     observed = {str(row[0]) for row in rows}
     missing = REQUIRED_TABLES - observed

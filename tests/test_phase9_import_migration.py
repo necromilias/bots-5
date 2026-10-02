@@ -13,6 +13,10 @@ from tests._authority_test_support import upgrade_to
 
 PHASE8 = "0011_phase8_inspector_state"
 PHASE9 = "0012_phase9_archive_import"
+# The application's migration head, which is what a normal startup now reaches.
+# Kept separate from PHASE9 because that constant still names the Phase 9
+# revision this module explicitly upgrades to.
+HEAD = "0019_phase11_generation_settings"
 PRE_LEGACY = "0008_catalogue_refresh_outcomes"
 
 
@@ -90,4 +94,4 @@ def test_pre_legacy_supported_start_requires_a_fresh_whole_backup(tmp_path, monk
     with sqlite3.connect(paths.data_root / "database" / "state.sqlite3") as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == (PHASE9,)
+        ).fetchone() == (HEAD,)

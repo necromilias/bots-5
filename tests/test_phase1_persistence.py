@@ -20,16 +20,21 @@ def test_real_migration_creates_state_schema_and_enables_sqlite_safety(tmp_path:
             assert set(inspect(store.engine).get_table_names()) == {
                 "alembic_version",
                 "application_generation_config",
+                "application_generation_settings_extra",
                 "capability_facts",
                 "capability_observations",
                 "capability_overrides",
                 "chats",
                 "chat_model_generation_config",
+                "chat_model_generation_settings_extra",
                 "chat_model_selection",
+                "folders",
                 "generation_attempts",
+                "generation_setting_capabilities",
                 "messages",
                 "model_catalogue_entries",
                 "model_generation_config",
+                "model_generation_settings_extra",
                 "provider_connections",
                 "catalogue_refresh_state",
                 "attachment_blobs",
@@ -57,7 +62,11 @@ def test_real_migration_creates_state_schema_and_enables_sqlite_safety(tmp_path:
                 "archive_imported_context_plans",
                 "archive_lineage_nodes",
                 "archive_object_derivations",
+                "chat_drafts",
                 "context_plans",
+                "dock_layout",
+                "font_scale_settings",
+                "keybinding_overrides",
                 "workspace_windows",
                 "search_source_state",
                 "search_index_state",
@@ -72,7 +81,7 @@ def test_real_migration_creates_state_schema_and_enables_sqlite_safety(tmp_path:
             with store.engine.connect() as connection:
                 assert connection.execute(text("PRAGMA foreign_keys")).scalar_one() == 1
                 assert connection.execute(text("PRAGMA journal_mode")).scalar_one().lower() == "delete"
-                assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0012_phase9_archive_import"
+                assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0019_phase11_generation_settings"
 
         now = datetime.now(timezone.utc)
         chat = Chat(str(uuid4()), "Test", now, now)

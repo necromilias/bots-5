@@ -20,7 +20,7 @@ from tests.test_phase6_context_attachments import (
 
 PHASE7_HEAD = "0010_phase7_search_navigation"
 PHASE8_HEAD = "0011_phase8_inspector_state"
-CURRENT_HEAD = "0012_phase9_archive_import"
+CURRENT_HEAD = "0019_phase11_generation_settings"
 
 
 def _fields(projection) -> dict[str, str]:

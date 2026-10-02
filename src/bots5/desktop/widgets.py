@@ -24,6 +24,8 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QSplitter,
+    QStackedWidget,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -33,6 +35,8 @@ from bots5.core.inspection import InspectionProjection
 from bots5.domain.models import (
     Chat,
     ChatActivity,
+    ChatDeletionInventory,
+    Folder,
     GenerationAttempt,
     Message,
     MessageRole,
@@ -44,7 +48,19 @@ from bots5.domain.provider import (
     builtin_connection_definitions,
     connection_definition,
 )
+from bots5.domain.generation_settings_registry import SETTING_CAPABILITY_KEYS
 
+from .dialog_primitives import (
+    ChamferedPanel,
+    DialogInstrumentStrip,
+    GenerationSettingsEditor,
+    SectionHeader,
+    StateBadge,
+    fit_dialog_to_screen,
+    scrollable,
+)
+from .markdown import MarkdownRenderer, SafeAttachmentResolver
+from .model_selector import ModelSelectorButton, ModelSelectorEntry
 from .profile import DesktopSessionInfo
 
 
@@ -153,8 +169,7 @@ class TopBar(QFrame):
         )
         layout.addWidget(self.model_pill)
 
-        self.model_selector = QComboBox(self)
-        self.model_selector.setObjectName("modelSelector")
+        self.model_selector = ModelSelectorButton(self)
         self.model_selector.setAccessibleName("Current model")
         self.model_selector.setMinimumWidth(250)
         self.model_selector.setVisible(phase5)
@@ -214,25 +229,32 @@ class TopBar(QFrame):
         return button
 
     def _model_index_changed(self, index: int) -> None:
-        model_entry_id = self.model_selector.itemData(index)
+        model_entry_id = self.model_selector.model_entry_id_at(index)
         if isinstance(model_entry_id, str) and model_entry_id:
             self.model_selected.emit(model_entry_id)
 
-    def set_models(self, entries: Iterable[tuple[str, str]], selected_model_entry_id: str | None) -> None:
-        self.model_selector.blockSignals(True)
-        try:
-            self.model_selector.clear()
-            selected_index = -1
-            for index, (label, model_entry_id) in enumerate(entries):
-                self.model_selector.addItem(label, model_entry_id)
-                if model_entry_id == selected_model_entry_id:
-                    selected_index = index
-            # A selection-required chat must remain visibly unselected. Qt
-            # otherwise auto-selects index 0 while signals are blocked, which
-            # leaves the user unable to select the only available entry.
-            self.model_selector.setCurrentIndex(selected_index)
-        finally:
-            self.model_selector.blockSignals(False)
+    def set_models(
+        self,
+        entries: Iterable[tuple[str, str]],
+        selected_model_entry_id: str | None,
+        records: Iterable[ModelSelectorEntry] | None = None,
+    ) -> None:
+        """Populate the model selector.
+
+        ``records`` carries the rich Phase 11 F8 presentation (display_name
+        primary line, connection + context window secondary line, health,
+        metadata).  When it is omitted the landed flat ``(label, id)`` shape
+        is rendered as-is, preserving the pinned Phase 5 selector behaviour.
+        """
+
+        if records is None:
+            selector_entries = [
+                ModelSelectorEntry(model_entry_id=model_entry_id, display_name=label)
+                for label, model_entry_id in entries
+            ]
+        else:
+            selector_entries = list(records)
+        self.model_selector.set_entries(selector_entries, selected_model_entry_id)
 
 
 class SearchPanel(QWidget):
@@ -512,7 +534,14 @@ class TuneDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Tune")
         self.setObjectName("tuneDialog")
+        self.setMinimumWidth(360)
         layout = QVBoxLayout(self)
+        self._editor_panel = ChamferedPanel(self)
+        editor_layout = QVBoxLayout(self._editor_panel)
+        editor_layout.setContentsMargins(10, 8, 10, 8)
+        editor_layout.setSpacing(4)
+        self._instrument_strip = DialogInstrumentStrip(self._editor_panel)
+        editor_layout.addWidget(self._instrument_strip)
         form = QFormLayout()
         self.temperature_inherited = QCheckBox("Use inherited temperature", self)
         self.temperature = QDoubleSpinBox(self)
@@ -531,6 +560,7 @@ class TuneDialog(QDialog):
         self.provenance_label.setWordWrap(True)
         self._model_entry_id: str | None = None
         self._override_revision: int | None = None
+        self._extra_revision: int | None = None
         self._timeout_override: float | None = None
         form.addRow("Temperature", self.temperature)
         form.addRow("", self.temperature_inherited)
@@ -539,7 +569,17 @@ class TuneDialog(QDialog):
         form.addRow("Reasoning", self.reasoning_none)
         form.addRow("", self.reasoning_inherited)
         form.addRow("Resolved from", self.provenance_label)
-        layout.addLayout(form)
+        editor_layout.addLayout(form)
+        # Phase 11 scope amendment: registry-driven extended generation
+        # settings, gated per capability.  Unsupported or unknown settings
+        # stay visible and disabled with a reason; stored-but-inactive values
+        # are preserved and shown as inactive.
+        self.generation_settings_editor = GenerationSettingsEditor(self._editor_panel)
+        self.generation_settings_editor.setObjectName("tuneGenerationSettings")
+        editor_layout.addWidget(self.generation_settings_editor)
+        # The settings/control region scrolls vertically; the dialog stays
+        # inside the work area and the primary actions remain reachable.
+        layout.addWidget(scrollable(self._editor_panel, self), 1)
         self.temperature_inherited.toggled.connect(self.temperature.setDisabled)
         self.max_output_inherited.toggled.connect(self.max_output_tokens.setDisabled)
         self.reasoning_inherited.toggled.connect(self.reasoning_none.setDisabled)
@@ -549,6 +589,7 @@ class TuneDialog(QDialog):
         buttons.rejected.connect(self.reject)
         self.use_inherited_button.clicked.connect(self._use_inherited)
         layout.addWidget(buttons)
+        fit_dialog_to_screen(self)
 
     def set_settings(
         self,
@@ -557,7 +598,11 @@ class TuneDialog(QDialog):
         *,
         timeout_override: float | None = None,
         override_revision: int | None = None,
+        extra_revision: int | None = None,
         model_entry_id: str | None = None,
+        extra_values: Mapping[str, object] | None = None,
+        capabilities: Mapping[str, object] | None = None,
+        model_summary: str = "",
     ) -> None:
         self.temperature.setValue(float(settings.get("temperature", 0.0)))
         self.max_output_tokens.setValue(int(settings.get("max_output_tokens", 1024)))
@@ -568,18 +613,33 @@ class TuneDialog(QDialog):
         self._timeout_override = timeout_override
         self._model_entry_id = model_entry_id
         self._override_revision = override_revision
+        self._extra_revision = extra_revision
         self.provenance_label.setText(", ".join(f"{key}: {value}" for key, value in provenance.items()) or "defaults")
         self.temperature_inherited.setChecked(provenance.get("temperature") != "chat_model")
         self.max_output_inherited.setChecked(provenance.get("max_output_tokens") != "chat_model")
         self.reasoning_inherited.setChecked(provenance.get("reasoning_effort") != "chat_model")
+        self.generation_settings_editor.set_state(
+            values=extra_values or {},
+            effective=settings,
+            provenance=provenance,
+            capabilities=capabilities,
+        )
+        self._instrument_strip.set_instruments(
+            [("model", model_summary or (model_entry_id or "none"))]
+        )
 
     def _save(self) -> None:
+        extra = self.generation_settings_editor.override_payload()
+        # Fail closed on unparseable override text: refuse the whole save.
         self.save_requested.emit({
             "temperature": None if self.temperature_inherited.isChecked() else self.temperature.value(),
             "max_output_tokens": None if self.max_output_inherited.isChecked() else self.max_output_tokens.value(),
             "reasoning_effort": None if self.reasoning_inherited.isChecked() else ("none" if self.reasoning_none.isChecked() else None),
             "timeout_seconds": self._timeout_override,
+            "extra": {} if self.generation_settings_editor.has_invalid_values() else extra,
+            "extra_invalid": self.generation_settings_editor.has_invalid_values(),
             "expected_revision": self._override_revision,
+            "expected_extra_revision": self._extra_revision,
             "expected_model_entry_id": self._model_entry_id,
         })
         self.accept()
@@ -590,7 +650,9 @@ class TuneDialog(QDialog):
             "max_output_tokens": None,
             "reasoning_effort": None,
             "timeout_seconds": None,
+            "extra": {},
             "expected_revision": self._override_revision,
+            "expected_extra_revision": self._extra_revision,
             "expected_model_entry_id": self._model_entry_id,
         })
         self.accept()
@@ -845,29 +907,71 @@ class SettingsDialog(QDialog):
     credential_save_requested = Signal(object)
     credential_delete_requested = Signal(object)
 
+    # Deliberate information architecture for the settings surface.  Each
+    # section owns one bounded concern; the selected-object/detail
+    # relationship is explicit (the left navigation selects the section, the
+    # in-section lists select the object whose detail form is shown).
+    SECTION_GENERAL = 0
+    SECTION_PROVIDERS = 1
+    SECTION_MODELS = 2
+    SECTION_CREDENTIALS = 3
+    SECTION_ADVANCED = 4
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Provider and model settings")
+        self.setWindowTitle("Settings")
         self.setObjectName("settingsDialog")
-        self.resize(680, 520)
+        self.resize(820, 600)
         layout = QVBoxLayout(self)
-        self.connection_list = QListWidget(self)
+        self.instrument_strip = DialogInstrumentStrip(self)
+        layout.addWidget(self.instrument_strip)
+        body = QHBoxLayout()
+        layout.addLayout(body, 1)
+
+        self.section_nav = QListWidget(self)
+        self.section_nav.setObjectName("botsSectionNav")
+        for section in ("General", "Providers", "Models", "Credentials", "Advanced"):
+            self.section_nav.addItem(QListWidgetItem(section))
+        self.section_nav.setFixedWidth(132)
+        body.addWidget(self.section_nav)
+
+        self.section_stack = QStackedWidget(self)
+        body.addWidget(self.section_stack, 1)
+        general_page = QWidget(self)
+        providers_page = QWidget(self)
+        models_page = QWidget(self)
+        credentials_page = QWidget(self)
+        advanced_page = QWidget(self)
+        # Each detail pane scrolls independently; the navigation rail stays
+        # outside the scroll areas, so it remains accessible while the pane
+        # scrolls, and the dialog never grows past the available work area.
+        self.section_stack.addWidget(scrollable(general_page, self.section_stack))
+        self.section_stack.addWidget(scrollable(providers_page, self.section_stack))
+        self.section_stack.addWidget(scrollable(models_page, self.section_stack))
+        self.section_stack.addWidget(scrollable(credentials_page, self.section_stack))
+        self.section_stack.addWidget(scrollable(advanced_page, self.section_stack))
+        self.section_nav.currentRowChanged.connect(self.section_stack.setCurrentIndex)
+        self.section_nav.setCurrentRow(self.SECTION_PROVIDERS)
+
+        # --- Providers page ------------------------------------------------
+        providers_layout = QVBoxLayout(providers_page)
+        providers_layout.addWidget(SectionHeader(
+            "Providers",
+            "Connections and their model catalogues. Saving never contacts the provider.",
+            providers_page,
+        ))
+        self.connection_list = QListWidget(providers_page)
         self.connection_list.setObjectName("connectionList")
         self.connection_list.currentItemChanged.connect(self._connection_changed)
-        layout.addWidget(self.connection_list, 1)
+        providers_layout.addWidget(self.connection_list, 1)
         connection_actions = QHBoxLayout()
         self.add_connection_button = QPushButton("+ Add Connection", self)
         self.add_connection_button.setObjectName("addConnectionButton")
         self.add_connection_button.setToolTip("Add a supported provider connection")
         connection_actions.addWidget(self.add_connection_button)
         connection_actions.addStretch(1)
-        layout.addLayout(connection_actions)
-        self.model_list = QListWidget(self)
-        self.model_list.setObjectName("modelCatalogueList")
-        self.model_list.setMaximumHeight(130)
-        self.model_list.currentItemChanged.connect(self._model_changed)
-        layout.addWidget(self.model_list)
-        form = QFormLayout()
+        providers_layout.addLayout(connection_actions)
+        connection_form = QFormLayout()
         self.connection_name = QLineEdit(self)
         self.connection_name.setObjectName("connectionName")
         self.connection_backend = QComboBox(self)
@@ -880,51 +984,56 @@ class SettingsDialog(QDialog):
         self.connection_profile.addItem("OpenRouter", "openrouter")
         self.connection_endpoint = QLineEdit(self)
         self.connection_endpoint.setObjectName("connectionEndpoint")
-        self.connection_credential_source = QComboBox(self)
-        self.connection_credential_source.setObjectName("credentialSource")
-        self.connection_credential_source.addItem("None", "none")
-        self.connection_credential_source.addItem("Environment variable", "environment")
-        self.connection_credential_source.addItem("Secret Service", "secret_service")
-        self.connection_credential_reference = QLineEdit(self)
-        self.connection_credential_reference.setObjectName("credentialReference")
-        self.connection_credential_value = QLineEdit(self)
-        self.connection_credential_value.setObjectName("credentialValue")
-        self.connection_credential_value.setEchoMode(QLineEdit.EchoMode.Password)
-        form.addRow("Name", self.connection_name)
-        form.addRow("Backend", self.connection_backend)
-        form.addRow("Profile", self.connection_profile)
-        form.addRow("Endpoint", self.connection_endpoint)
-        form.addRow("Credential source", self.connection_credential_source)
-        form.addRow("Credential reference", self.connection_credential_reference)
-        form.addRow("Credential value", self.connection_credential_value)
-        layout.addLayout(form)
+        connection_form.addRow("Name", self.connection_name)
+        connection_form.addRow("Backend", self.connection_backend)
+        connection_form.addRow("Profile", self.connection_profile)
+        connection_form.addRow("Endpoint", self.connection_endpoint)
+        providers_layout.addLayout(connection_form)
         actions = QHBoxLayout()
         self.save_refresh_button = QPushButton("Save & Refresh", self)
         self.refresh_button = QPushButton("Refresh", self)
         self.enable_connection_button = QPushButton("Enable/disable", self)
-        self.retire_connection_button = QPushButton("Retire", self)
-        self.retirement_replacement_model = QComboBox(self)
-        self.retirement_replacement_model.setObjectName("retirementReplacementModel")
-        self.retirement_replacement_model.addItem("Choose replacement model", None)
         actions.addWidget(self.save_refresh_button)
         actions.addWidget(self.refresh_button)
         actions.addWidget(self.enable_connection_button)
-        actions.addWidget(self.retire_connection_button)
-        layout.addLayout(actions)
-        layout.addWidget(QLabel("Retirement replacement", self))
-        layout.addWidget(self.retirement_replacement_model)
+        providers_layout.addLayout(actions)
+        # Destructive / retirement actions are deliberately separated from the
+        # routine actions above and require an explicit replacement model.
+        self.retirement_panel = ChamferedPanel(providers_page, card=True, chamfer=4)
+        retirement_layout = QVBoxLayout(self.retirement_panel)
+        retirement_layout.setContentsMargins(8, 6, 8, 6)
+        retirement_layout.setSpacing(2)
+        self.retirement_label = QLabel("Retirement (destructive)", self.retirement_panel)
+        self.retirement_label.setObjectName("botsSectionSubtitle")
+        retirement_layout.addWidget(self.retirement_label)
+        self.retirement_replacement_model = QComboBox(self)
+        self.retirement_replacement_model.setObjectName("retirementReplacementModel")
+        self.retirement_replacement_model.addItem("Choose replacement model", None)
+        retirement_layout.addWidget(self.retirement_replacement_model)
+        self.retire_connection_button = QPushButton("Retire connection", self)
+        retirement_layout.addWidget(self.retire_connection_button)
+        providers_layout.addWidget(self.retirement_panel)
+
+        # --- Models page -----------------------------------------------------
+        models_layout = QVBoxLayout(models_page)
+        models_layout.addWidget(SectionHeader(
+            "Models",
+            "Model defaults inherit from the application defaults; chat overrides inherit from both.",
+            models_page,
+        ))
+        self.model_list = QListWidget(models_page)
+        self.model_list.setObjectName("modelCatalogueList")
+        self.model_list.setMaximumHeight(110)
+        self.model_list.currentItemChanged.connect(self._model_changed)
+        models_layout.addWidget(self.model_list)
         manual = QHBoxLayout()
         self.manual_model_id = QLineEdit(self)
         self.manual_model_id.setObjectName("manualModelId")
         self.manual_model_id.setPlaceholderText("Exact provider model ID")
         self.add_manual_model_button = QPushButton("Add manual model", self)
-        self.save_credential_button = QPushButton("Save credential", self)
-        self.delete_credential_button = QPushButton("Delete credential", self)
         manual.addWidget(self.manual_model_id, 1)
         manual.addWidget(self.add_manual_model_button)
-        manual.addWidget(self.save_credential_button)
-        manual.addWidget(self.delete_credential_button)
-        layout.addLayout(manual)
+        models_layout.addLayout(manual)
         model_form = QFormLayout()
         self.model_defaults_inherited = QCheckBox("Use inherited model defaults", self)
         self.model_temperature_inherited = QCheckBox("Use inherited temperature", self)
@@ -951,7 +1060,55 @@ class SettingsDialog(QDialog):
         model_form.addRow("", self.model_reasoning_inherited)
         self.save_model_defaults_button = QPushButton("Save model defaults", self)
         model_form.addRow("", self.save_model_defaults_button)
-        layout.addLayout(model_form)
+        models_layout.addLayout(model_form)
+        models_layout.addWidget(SectionHeader(
+            "Extended generation settings",
+            "Registry-driven defaults for this model. Gated controls show why they are inactive.",
+            models_page,
+        ))
+        self.model_settings_editor = GenerationSettingsEditor(models_page)
+        self.model_settings_editor.setObjectName("modelGenerationSettings")
+        models_layout.addWidget(self.model_settings_editor, 1)
+        models_layout.addStretch(0)
+
+        # --- Credentials page ------------------------------------------------
+        credentials_layout = QVBoxLayout(credentials_page)
+        credentials_layout.addWidget(SectionHeader(
+            "Credentials",
+            "Credential material for the selected connection. Values never leave the secret store.",
+            credentials_page,
+        ))
+        credential_form = QFormLayout()
+        self.connection_credential_source = QComboBox(self)
+        self.connection_credential_source.setObjectName("credentialSource")
+        self.connection_credential_source.addItem("None", "none")
+        self.connection_credential_source.addItem("Environment variable", "environment")
+        self.connection_credential_source.addItem("Secret Service", "secret_service")
+        self.connection_credential_reference = QLineEdit(self)
+        self.connection_credential_reference.setObjectName("credentialReference")
+        self.connection_credential_value = QLineEdit(self)
+        self.connection_credential_value.setObjectName("credentialValue")
+        self.connection_credential_value.setEchoMode(QLineEdit.EchoMode.Password)
+        credential_form.addRow("Credential source", self.connection_credential_source)
+        credential_form.addRow("Credential reference", self.connection_credential_reference)
+        credential_form.addRow("Credential value", self.connection_credential_value)
+        credentials_layout.addLayout(credential_form)
+        credential_actions = QHBoxLayout()
+        self.save_credential_button = QPushButton("Save credential", self)
+        self.delete_credential_button = QPushButton("Delete credential", self)
+        credential_actions.addWidget(self.save_credential_button)
+        credential_actions.addWidget(self.delete_credential_button)
+        credential_actions.addStretch(1)
+        credentials_layout.addLayout(credential_actions)
+        credentials_layout.addStretch(1)
+
+        # --- Advanced page -----------------------------------------------------
+        advanced_layout = QVBoxLayout(advanced_page)
+        advanced_layout.addWidget(SectionHeader(
+            "Advanced",
+            "Capability overrides follow the existing precedence: manual over confirmed endpoint over provider metadata.",
+            advanced_page,
+        ))
         capability_form = QFormLayout()
         self.capability_key = QComboBox(self)
         self.capability_key.setObjectName("capabilityKey")
@@ -961,6 +1118,11 @@ class SettingsDialog(QDialog):
             "telemetry.usage", "telemetry.reasoning_tokens", "telemetry.cost",
             "telemetry.request_id", "telemetry.returned_model",
         ):
+            self.capability_key.addItem(key, key)
+        # Registry-driven per-setting capability keys extend the closed
+        # Phase 5 catalogue; they gate individual Tune controls.
+        self._registry_capability_offset = self.capability_key.count()
+        for key in sorted(SETTING_CAPABILITY_KEYS):
             self.capability_key.addItem(key, key)
         self.capability_state = QComboBox(self)
         self.capability_state.setObjectName("capabilityState")
@@ -988,7 +1150,16 @@ class SettingsDialog(QDialog):
         self.capability_provenance_label.setWordWrap(True)
         capability_form.addRow("Effective", self.capability_summary_label)
         capability_form.addRow("Provenance", self.capability_provenance_label)
-        layout.addLayout(capability_form)
+        advanced_layout.addLayout(capability_form)
+        advanced_layout.addStretch(1)
+
+        # --- General page ------------------------------------------------------
+        general_layout = QVBoxLayout(general_page)
+        general_layout.addWidget(SectionHeader(
+            "General",
+            "Application-wide defaults. Every model inherits these unless it overrides them.",
+            general_page,
+        ))
         application_form = QFormLayout()
         self.application_temperature = QDoubleSpinBox(self)
         self.application_temperature.setObjectName("applicationTemperature")
@@ -1014,7 +1185,17 @@ class SettingsDialog(QDialog):
         application_form.addRow("Application max output", self.application_max_output_tokens)
         application_form.addRow("Advanced generation timeout", self.application_timeout)
         application_form.addRow("", self.save_application_defaults_button)
-        layout.addLayout(application_form)
+        general_layout.addLayout(application_form)
+        general_layout.addWidget(SectionHeader(
+            "Extended generation defaults",
+            "Apply to every request unless the model or the chat overrides them and supports them.",
+            general_page,
+        ))
+        self.application_settings_editor = GenerationSettingsEditor(general_page)
+        self.application_settings_editor.setObjectName("applicationGenerationSettings")
+        general_layout.addWidget(self.application_settings_editor, 1)
+        general_layout.addStretch(0)
+
         self.status_label = QLabel("No connection selected", self)
         self.status_label.setObjectName("settingsStatus")
         self.status_label.setWordWrap(True)
@@ -1035,13 +1216,17 @@ class SettingsDialog(QDialog):
         self._credential_form_revision: int | None = None
         self._credential_form_reference: str | None = None
         self._model_default_revisions: dict[str, int | None] = {}
+        self._model_extra_revisions: dict[str, int | None] = {}
         self._model_default_timeouts: dict[str, float | None] = {}
         self._capability_override_revisions: dict[tuple[str, str], int] = {}
         self._capability_override_values: dict[tuple[str, str], int | None] = {}
         self._capability_override_states: dict[tuple[str, str], str] = {}
         self._capability_override_reasons: dict[tuple[str, str], str | None] = {}
         self._application_revision: int | None = None
+        self._application_extra_revision: int | None = None
         self._application_reasoning_effort: str | None = None
+        self._application_extra_values: dict[str, object] = {}
+        self._model_settings_editor_state: dict[str, object] = {}
         self._model_defaults_loaded_id: str | None = None
         for checkbox in (
             self.model_temperature_inherited,
@@ -1053,6 +1238,7 @@ class SettingsDialog(QDialog):
         self.capability_key.currentIndexChanged.connect(self._capability_key_changed)
         self.capability_state.currentIndexChanged.connect(self._sync_capability_override_editor)
         self._sync_capability_override_editor(reset_missing=True)
+        fit_dialog_to_screen(self)
 
     def set_connections(self, connections: Iterable[object], credential_statuses: Mapping[str, str] | None = None) -> None:
         connections = tuple(connections)
@@ -1158,12 +1344,24 @@ class SettingsDialog(QDialog):
         finally:
             self.application_default_model.blockSignals(False)
 
-    def set_model_defaults(self, settings: object | None, revision: int | None = None) -> None:
+    def set_model_defaults(
+        self,
+        settings: object | None,
+        revision: int | None = None,
+        *,
+        extra_values: Mapping[str, object] | None = None,
+        extra_revision: int | None = None,
+        effective: Mapping[str, object] | None = None,
+        effective_provenance: Mapping[str, str] | None = None,
+        capabilities: Mapping[str, object] | None = None,
+    ) -> None:
         current = self.model_list.currentItem()
         model_entry_id = None if current is None else str(current.data(Qt.ItemDataRole.UserRole))
         if model_entry_id is not None:
             self._model_default_revisions[model_entry_id] = 0 if revision is None else revision
+            self._model_extra_revisions[model_entry_id] = extra_revision
         self._model_defaults_loaded_id = model_entry_id
+        self._model_settings_editor_state = dict(extra_values or {})
         if settings is None:
             self._model_default_timeouts[model_entry_id] = None
             self.model_temperature.setValue(0.0)
@@ -1177,6 +1375,12 @@ class SettingsDialog(QDialog):
                 self.model_defaults_inherited.setChecked(True)
             finally:
                 self.model_defaults_inherited.blockSignals(False)
+            self.model_settings_editor.set_state(
+                values=extra_values or {},
+                effective=effective or {},
+                provenance=effective_provenance or {},
+                capabilities=capabilities,
+            )
             return
         self._model_default_timeouts[model_entry_id] = settings.timeout_seconds
         self.model_temperature.setValue(0.0 if settings.temperature is None else float(settings.temperature))
@@ -1194,20 +1398,43 @@ class SettingsDialog(QDialog):
             )
         finally:
             self.model_defaults_inherited.blockSignals(False)
+        self.model_settings_editor.set_state(
+            values=extra_values or {},
+            effective=effective if effective is not None else dict(getattr(settings, "extra", {}) or {}),
+            provenance=effective_provenance or {},
+            capabilities=capabilities,
+        )
 
     def set_application_defaults(
         self,
         settings: object,
         revision: int | None = None,
         default_model_entry_id: str | None = None,
+        *,
+        extra_values: Mapping[str, object] | None = None,
+        extra_revision: int | None = None,
     ) -> None:
         self._application_revision = revision
+        self._application_extra_revision = extra_revision
         self._application_reasoning_effort = settings.reasoning_effort
+        self._application_extra_values = dict(extra_values or {})
         self.application_temperature.setValue(float(settings.temperature or 0.0))
         self.application_max_output_tokens.setValue(int(settings.max_output_tokens or 1024))
         self.application_timeout.setValue(0.0 if settings.timeout_seconds is None else float(settings.timeout_seconds))
         self.application_default_model.setCurrentIndex(
             self.application_default_model.findData(default_model_entry_id)
+        )
+        self.application_settings_editor.set_state(
+            values=extra_values or {},
+            effective={
+                "temperature": getattr(settings, "temperature", None),
+                "max_output_tokens": getattr(settings, "max_output_tokens", None),
+                "reasoning_effort": getattr(settings, "reasoning_effort", None),
+                "timeout_seconds": getattr(settings, "timeout_seconds", None),
+                **(dict(getattr(settings, "extra", {}) or {})),
+            },
+            provenance={key: "application" for key in (extra_values or {})},
+            capabilities=None,
         )
 
     def set_capability_overrides(self, overrides: Iterable[object]) -> None:
@@ -1385,13 +1612,19 @@ class SettingsDialog(QDialog):
         if self._model_defaults_loaded_id != model_entry_id:
             self.status_label.setText("Model defaults are still loading; save again after refresh")
             return
+        extra = self.model_settings_editor.override_payload()
+        if self.model_settings_editor.has_invalid_values():
+            self.status_label.setText("Extended settings contain invalid values; fix them before saving")
+            return
         self.model_defaults_requested.emit({
             "model_entry_id": model_entry_id,
             "temperature": None if self.model_temperature_inherited.isChecked() else self.model_temperature.value(),
             "max_output_tokens": None if self.model_max_output_inherited.isChecked() else self.model_max_output_tokens.value(),
             "reasoning_effort": None if self.model_reasoning_inherited.isChecked() else self.model_reasoning.currentData(),
             "timeout_seconds": self._model_default_timeouts.get(model_entry_id),
+            "extra": extra,
             "expected_revision": self._model_default_revisions.get(model_entry_id),
+            "expected_extra_revision": self._model_extra_revisions.get(model_entry_id),
         })
 
     def _save_application_default_model(self) -> None:
@@ -1462,13 +1695,18 @@ class SettingsDialog(QDialog):
             self.capability_value_set.setChecked(False)
 
     def _save_application_defaults(self) -> None:
+        if self.application_settings_editor.has_invalid_values():
+            self.status_label.setText("Extended defaults contain invalid values; fix them before saving")
+            return
         timeout = self.application_timeout.value()
         self.application_defaults_requested.emit({
             "temperature": self.application_temperature.value(),
             "max_output_tokens": self.application_max_output_tokens.value(),
             "reasoning_effort": self._application_reasoning_effort,
             "timeout_seconds": None if timeout == 0.0 else timeout,
+            "extra": self.application_settings_editor.override_payload(),
             "expected_revision": self._application_revision,
+            "expected_extra_revision": self._application_extra_revision,
         })
 
 
@@ -1479,6 +1717,19 @@ class LeftRail(QFrame):
     # forwards these to Phase9DesktopController).
     export_transcript_requested = Signal(str)
     export_archive_requested = Signal(str)
+    # Additive Phase 11 A-1: rename and duplicate.
+    rename_chat_requested = Signal(str)
+    duplicate_chat_requested = Signal(str)
+    # Additive Phase 11 A-1c: sort selector.
+    sort_changed = Signal(str)
+    # Phase 11 M3 (F4/F5/F7): folders, pins and deletion.
+    folder_filter_changed = Signal(object)  # folder id or None (All chats)
+    pin_chat_requested = Signal(str, bool)
+    move_chat_to_folder_requested = Signal(str, object)  # chat id, folder id or None
+    open_move_dialog_requested = Signal(str)  # open the move-to-folder dialog
+    delete_chat_requested = Signal(str)
+
+    _FOLDER_ROLE = Qt.ItemDataRole.UserRole + 1
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1486,6 +1737,8 @@ class LeftRail(QFrame):
         self._collapsed = False
         self._expanded_width = 220
         self._collapsed_width = 48
+        self._folders: tuple[Folder, ...] = ()
+        self._folder_filter: str | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(7, 7, 7, 7)
@@ -1508,6 +1761,22 @@ class LeftRail(QFrame):
         self.section_label.setObjectName("chatTitle")
         layout.addWidget(self.section_label)
 
+        # Additive Phase 11 A-1c: sort selector
+        self.sort_combo = QComboBox(self)
+        self.sort_combo.setObjectName("chatSort")
+        self.sort_combo.addItem("Activity (default)", "recent")
+        self.sort_combo.addItem("Creation", "creation")
+        self.sort_combo.addItem("Title", "title")
+        layout.addWidget(self.sort_combo)
+
+        # Phase 11 M3 (F4): folder area — the rail groups chats by folder by
+        # filtering the (store-ordered, pins-first) list to one folder.
+        self.folder_combo = QComboBox(self)
+        self.folder_combo.setObjectName("folderCombo")
+        self.folder_combo.setAccessibleName("Folder filter")
+        self.folder_filter_model = self.folder_combo.model()
+        layout.addWidget(self.folder_combo)
+
         self.chat_list = QListWidget(self)
         self.chat_list.setObjectName("chatList")
         self.chat_list.setAccessibleName("Chats")
@@ -1521,6 +1790,60 @@ class LeftRail(QFrame):
         layout.addLayout(self.activity_column)
         self._chat_buttons: dict[str, QToolButton] = {}
         self._chat_titles: dict[str, str] = {}
+        self._chat_pin_state: dict[str, bool] = {}
+        self._chat_folder_by_id: dict[str, str | None] = {}
+
+        # Connect sort selector
+        self.sort_combo.currentIndexChanged.connect(self._on_sort_changed)
+        # Connect the Phase 11 M3 folder area (F4)
+        self.folder_combo.currentIndexChanged.connect(self._on_folder_filter_changed)
+
+    def _on_sort_changed(self, index: int) -> None:
+        """Emit the selected sort option."""
+        sort_key = self.sort_combo.itemData(index)
+        if isinstance(sort_key, str):
+            self.sort_changed.emit(sort_key)
+
+    def _on_folder_filter_changed(self, index: int) -> None:
+        """Apply the F4 folder grouping selection to the chat list."""
+        folder_id = self.folder_combo.itemData(index)
+        self._folder_filter = folder_id if isinstance(folder_id, str) else None
+        self._apply_folder_visibility()
+        self.folder_filter_changed.emit(self._folder_filter)
+
+    def set_folders(self, folders: Iterable[Folder]) -> None:
+        """Populate the folder area with one entry per folder (F4)."""
+        self._folders = tuple(folders)
+        current = self._folder_filter
+        self.folder_combo.blockSignals(True)
+        try:
+            self.folder_combo.clear()
+            self.folder_combo.addItem("All chats", None)
+            for folder in self._folders:
+                self.folder_combo.addItem(folder.name, folder.id)
+            if current is not None:
+                index = self.folder_combo.findData(current)
+                if index >= 0:
+                    self.folder_combo.setCurrentIndex(index)
+        finally:
+            self.folder_combo.blockSignals(False)
+        self._apply_folder_visibility()
+
+    def _apply_folder_visibility(self) -> None:
+        """Hide chat rows outside the selected folder, keeping row order.
+
+        Rows are hidden rather than removed so the window's row-to-chat
+        mapping (``_chat_ids``) stays exact while the rail still groups by
+        folder (F4).
+        """
+        for row in range(self.chat_list.count()):
+            item = self.chat_list.item(row)
+            folder_id = item.data(self._FOLDER_ROLE)
+            visible = (
+                self._folder_filter is None
+                or folder_id == self._folder_filter
+            )
+            item.setHidden(not visible)
 
     def _focus_chat_list(self) -> None:
         if self._collapsed:
@@ -1528,10 +1851,12 @@ class LeftRail(QFrame):
         self.chat_list.setFocus()
 
     def _show_chat_context_menu(self, pos) -> None:
-        """Additive Phase 9 context actions for one chat under the cursor.
+        """Phase 9/11 context actions for one chat under the cursor.
 
         Pure selection + presentation: the chosen entry is emitted and the
-        window delegates it to Phase9DesktopController.
+        window delegates it to the application commands.  The menu is built
+        by :meth:`_build_chat_menu` so tests can inspect the entries without
+        running a blocking ``exec``.
         """
 
         item = self.chat_list.itemAt(pos)
@@ -1540,14 +1865,67 @@ class LeftRail(QFrame):
         chat_id = item.data(Qt.ItemDataRole.UserRole)
         if not isinstance(chat_id, str) or not chat_id:
             return
-        menu = QMenu(self.chat_list)
+        menu = self._build_chat_menu(chat_id, self.chat_list)
+        chosen = menu.exec(self.chat_list.mapToGlobal(pos))
+        self._dispatch_chat_menu_choice(chat_id, chosen)
+
+    def _build_chat_menu(self, chat_id: str, parent: QWidget) -> QMenu:
+        """Build the Phase 9/11 context menu for one chat (F4/F5/F7).
+
+        The menu stays FLAT: the frozen Phase 9 surface contract pins the
+        chat list to exactly one constructed QMenu, so "Move to folder…"
+        opens a dialog instead of nesting a submenu.
+        """
+        menu = QMenu(parent)
         export_transcript_action = menu.addAction("Export Transcript…")
         export_archive_action = menu.addAction("Export Archive…")
-        chosen = menu.exec(self.chat_list.mapToGlobal(pos))
-        if chosen is export_transcript_action:
+        menu.addSeparator()
+        rename_action = menu.addAction("Rename Title…")
+        duplicate_action = menu.addAction("Duplicate Chat…")
+        menu.addSeparator()
+        # Phase 11 M3 (F5): the pin toggle reflects the chat's current state.
+        is_pinned = self._chat_pin_state.get(chat_id, False)
+        pin_action = menu.addAction("Unpin chat" if is_pinned else "Pin chat")
+        pin_action.setObjectName("pinChatAction")
+        # Phase 11 M3 (F4): the move dialog resolves folders and inline
+        # folder creation through the application commands.
+        move_action = menu.addAction("Move to folder…")
+        move_action.setObjectName("moveToFolderAction")
+        menu.addSeparator()
+        delete_action = menu.addAction("Delete chat…")
+        delete_action.setObjectName("deleteChatAction")
+        self._pending_menu_actions = {
+            "export_transcript": export_transcript_action,
+            "export_archive": export_archive_action,
+            "rename": rename_action,
+            "duplicate": duplicate_action,
+            "pin": pin_action,
+            "move": move_action,
+            "delete": delete_action,
+        }
+        return menu
+
+    def _dispatch_chat_menu_choice(self, chat_id: str, chosen) -> None:
+        """Emit the signal for one chosen context-menu entry."""
+        if chosen is None:
+            return
+        pending = getattr(self, "_pending_menu_actions", {})
+        if chosen is pending.get("export_transcript"):
             self.export_transcript_requested.emit(chat_id)
-        elif chosen is export_archive_action:
+        elif chosen is pending.get("export_archive"):
             self.export_archive_requested.emit(chat_id)
+        elif chosen is pending.get("rename"):
+            self.rename_chat_requested.emit(chat_id)
+        elif chosen is pending.get("duplicate"):
+            self.duplicate_chat_requested.emit(chat_id)
+        elif chosen is pending.get("pin"):
+            self.pin_chat_requested.emit(
+                chat_id, not self._chat_pin_state.get(chat_id, False)
+            )
+        elif chosen is pending.get("move"):
+            self.open_move_dialog_requested.emit(chat_id)
+        elif chosen is pending.get("delete"):
+            self.delete_chat_requested.emit(chat_id)
 
     @staticmethod
     def _icon_button(text: str, tooltip: str, *, checked: bool = False) -> QToolButton:
@@ -1595,6 +1973,14 @@ class LeftRail(QFrame):
             )
             for chat in chats
         }
+        # Phase 11 M3 (F4/F5): remember the organisation state so the context
+        # menu can label the pin toggle and the folder filter can group.
+        self._chat_pin_state = {
+            chat.id: bool(getattr(chat, "is_pinned", False)) for chat in chats
+        }
+        self._chat_folder_by_id = {
+            chat.id: getattr(chat, "folder_id", None) for chat in chats
+        }
         for chat in chats:
             title = self._chat_titles[chat.id]
             button = self._icon_button("·", title)
@@ -1613,12 +1999,27 @@ class LeftRail(QFrame):
             self.chat_list.clear()
             selected_row = -1
             for row, chat in enumerate(chats):
-                item = QListWidgetItem(self._chat_titles[chat.id])
+                # Phase 11 M3 (F5): the floating pin is visible in the rail.
+                display_title = self._chat_titles[chat.id]
+                if self._chat_pin_state[chat.id]:
+                    display_title = f"📌 {display_title}"
+                item = QListWidgetItem(display_title)
                 item.setData(Qt.ItemDataRole.UserRole, chat.id)
                 item.setData(
                     Qt.ItemDataRole.AccessibleDescriptionRole,
                     "Archived chat" if getattr(chat, "archived_at", None) is not None else "Active chat",
                 )
+                item.setData(self._FOLDER_ROLE, self._chat_folder_by_id[chat.id])
+                tooltip = display_title
+                folder_id = self._chat_folder_by_id[chat.id]
+                if folder_id is not None:
+                    folder_name = next(
+                        (f.name for f in self._folders if f.id == folder_id),
+                        None,
+                    )
+                    if folder_name is not None:
+                        tooltip = f"{display_title} — in folder: {folder_name}"
+                item.setToolTip(tooltip)
                 self.chat_list.addItem(item)
                 if chat.id == selected_chat_id:
                     selected_row = row
@@ -1628,6 +2029,7 @@ class LeftRail(QFrame):
                 self.chat_list.setCurrentRow(0)
         finally:
             self.chat_list.blockSignals(False)
+        self._apply_folder_visibility()
         self.set_activity({}, selected_chat_id)
 
     def set_activity(
@@ -1663,12 +2065,33 @@ class MessageRow(QWidget):
     inspect_requested = Signal(object)
     regenerate_requested = Signal(object)
 
-    def __init__(self, message: Message, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        message: Message,
+        parent: QWidget | None = None,
+        *,
+        application: object | None = None,
+    ) -> None:
         super().__init__(parent)
         self.message = message
         self._generation_busy = False
         self._historical_view = False
+        # Phase 11 M3 (F7): a tombstoned message keeps its lineage and
+        # sequence but gives up its content, so the transcript renders an
+        # explicit tombstone instead of a blank body.
+        self._tombstone = message.state is MessageState.DELETED
         self.setProperty("messageRole", message.role.value)
+
+        # Create markdown renderer with safe attachment resolver
+        self._markdown_renderer: MarkdownRenderer | None = None
+        if application is not None and not self._tombstone:
+            # Try to get the authority from the application's store
+            store = getattr(application, "_store", None)
+            if store is not None:
+                authority = getattr(store, "_authority", None)
+                if authority is not None:
+                    resolver = SafeAttachmentResolver(authority)
+                    self._markdown_renderer = MarkdownRenderer(attachment_resolver=resolver)
 
         row_layout = QHBoxLayout(self)
         row_layout.setContentsMargins(5, 3, 5, 3)
@@ -1688,14 +2111,26 @@ class MessageRow(QWidget):
         bubble_layout.setContentsMargins(11, 8, 8, 6)
         bubble_layout.setSpacing(4)
 
-        self.body = QLabel(message.content, self.bubble)
-        self.body.setObjectName("messageBody")
-        self.body.setTextFormat(Qt.TextFormat.PlainText)
+        # Render markdown content (never for a tombstone: its body is gone)
+        markdown_text = message.content
+        if self._tombstone:
+            html_content = self._escape_html_for_rich_text("This message was deleted")
+        elif self._markdown_renderer is not None:
+            html_content = self._markdown_renderer.render(markdown_text)
+        else:
+            # Fallback: escape HTML and wrap in paragraphs
+            html_content = self._escape_html_for_rich_text(markdown_text)
+
+        self.body = QLabel(html_content, self.bubble)
+        self.body.setObjectName("messageBody" if not self._tombstone else "messageTombstone")
+        self.body.setTextFormat(Qt.TextFormat.RichText)
         self.body.setWordWrap(True)
         self.body.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
             | Qt.TextInteractionFlag.TextSelectableByKeyboard
         )
+        # Allow links to be opened via QDesktopServices when explicitly clicked
+        self.body.setOpenExternalLinks(False)
         self.body.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         bubble_layout.addWidget(self.body)
 
@@ -1756,6 +2191,13 @@ class MessageRow(QWidget):
         actions.addStretch(1)
         bubble_layout.addLayout(actions)
 
+        if self._tombstone:
+            # A tombstone is a record of removal: no message actions exist.
+            self.copy_button.setVisible(False)
+            self.edit_button.setVisible(False)
+            self.branch_button.setVisible(False)
+            self.more_button.setVisible(False)
+
         if message.role is MessageRole.ASSISTANT:
             row_layout.addWidget(self.avatar, 0, Qt.AlignmentFlag.AlignTop)
             row_layout.addWidget(self.bubble, 0, Qt.AlignmentFlag.AlignLeft)
@@ -1773,6 +2215,17 @@ class MessageRow(QWidget):
         button.setAutoRaise(True)
         return button
 
+    @staticmethod
+    def _escape_html_for_rich_text(text: str) -> str:
+        """Escape HTML special characters for safe rich text display."""
+        return (
+            text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+            .replace("'", "&#x27;")
+        )
+
     def set_generation_busy(self, busy: bool) -> None:
         self._generation_busy = busy
         self._sync_mutating_actions()
@@ -1789,6 +2242,10 @@ class MessageRow(QWidget):
         self.bubble.style().polish(self.bubble)
 
     def _sync_mutating_actions(self) -> None:
+        if self._tombstone:
+            self.edit_button.setEnabled(False)
+            self.regenerate_action.setEnabled(False)
+            return
         self.edit_button.setEnabled(
             not self._generation_busy
             and not self._historical_view
@@ -1820,7 +2277,12 @@ class MessageRow(QWidget):
 
 
 class TranscriptView(QScrollArea):
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        application: object | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setObjectName("transcriptView")
         self.setWidgetResizable(True)
@@ -1839,6 +2301,56 @@ class TranscriptView(QScrollArea):
         self.setWidget(self.content)
         self.message_rows: dict[str, MessageRow] = {}
         self._bubble_cap: int | None = None
+        self._application = application
+        # Phase 11 M4b/M0a: restore-aware scrolling.  When a persisted
+        # transcript scroll position is pending, renders scroll to that
+        # position (clamped to the live range) instead of unconditionally
+        # jumping to the bottom.  The pending value is consumed as soon as
+        # the scroll range can actually represent it — including on a later
+        # rangeChanged after the window becomes visible and lays out.
+        self._pending_restore_position: int | None = None
+        # True while the render in flight is the one carrying a pending
+        # restore, so its own final layout pass must not yank the view to
+        # the bottom after the restore was just applied.
+        self._render_restoring = False
+        self.verticalScrollBar().rangeChanged.connect(self._on_scroll_range_changed)
+
+    def set_restore_scroll_position(self, position: int | None) -> None:
+        """Queue a persisted transcript scroll position for restoration."""
+        position = None if position is None else max(0, int(position))
+        self._pending_restore_position = position
+
+    @property
+    def pending_restore_position(self) -> int | None:
+        """The restore position not yet applied to a live scroll range."""
+        return self._pending_restore_position
+
+    @property
+    def scroll_position(self) -> int:
+        """The position worth persisting: pending restore, else current value.
+
+        While a restore is still pending (the range cannot represent it yet),
+        the intended position is reported so a save must never clobber the
+        persisted value with the pre-layout ``0``.
+        """
+        if self._pending_restore_position is not None:
+            return self._pending_restore_position
+        return int(self.verticalScrollBar().value())
+
+    def _apply_pending_restore(self) -> None:
+        """Apply the pending restore position, consuming it only once the
+        scroll range can fully represent it.  Until then every render and
+        range change keeps the view parked at the closest reachable offset
+        so a slow layout never silently degrades the restore to the bottom."""
+        if self._pending_restore_position is None:
+            return
+        scrollbar = self.verticalScrollBar()
+        scrollbar.setValue(min(self._pending_restore_position, scrollbar.maximum()))
+        if scrollbar.maximum() >= self._pending_restore_position:
+            self._pending_restore_position = None
+
+    def _on_scroll_range_changed(self, _minimum: int, _maximum: int) -> None:
+        self._apply_pending_restore()
 
     def render(
         self,
@@ -1854,7 +2366,7 @@ class TranscriptView(QScrollArea):
         messages = tuple(messages)
         self.empty_label.setVisible(not messages)
         for message in messages:
-            row = MessageRow(message, self.content)
+            row = MessageRow(message, self.content, application=self._application)
             row.set_generation_busy(generation_busy)
             message_id = getattr(message, "id", f"message-{id(message)}")
             row.set_historical_view(
@@ -1864,7 +2376,18 @@ class TranscriptView(QScrollArea):
             self.message_rows[message_id] = row
             self._layout.insertWidget(self._layout.count() - 1, row)
         self._resize_bubbles()
-        self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
+        # Phase 11 M0a/M4b: restore-aware scrolling.  A pending persisted
+        # position wins over the old unconditional jump to the bottom; with
+        # nothing to restore, chat-style bottom-following behaviour is kept.
+        # A render that consumed a restore must not immediately undo it.
+        self._render_restoring = self._render_restoring or (
+            self._pending_restore_position is not None
+        )
+        if self._pending_restore_position is not None:
+            self._apply_pending_restore()
+        elif not self._render_restoring:
+            self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
+        self._render_restoring = False
 
     def focus_message(self, message_id: str | None) -> bool:
         for row in self.message_rows.values():
@@ -1932,3 +2455,124 @@ class InspectorPanel(QWidget):
         self._field("Inspection", projection.status)
         for field in projection.fields:
             self._field(field.name, field.value)
+
+
+class MoveToFolderDialog(QDialog):
+    """Phase 11 M3 (F4): move one chat into exactly one folder.
+
+    Flat folders only: the dialog offers the existing folders plus an inline
+    new-folder field.  Choosing OK resolves to ``(folder_id_or_None,
+    new_folder_name_or_None)``; the WINDOW performs the create-then-move
+    through the application commands, so this dialog never touches state.
+    """
+
+    def __init__(
+        self,
+        chat_title: str,
+        folders: Iterable[Folder],
+        current_folder_id: str | None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Move to folder")
+        self.setObjectName("moveToFolderDialog")
+        self._folder_ids: tuple[str, ...] = tuple(folder.id for folder in folders)
+
+        layout = QVBoxLayout(self)
+        heading = QLabel(f"Move “{chat_title}” to:", self)
+        heading.setObjectName("moveToFolderHeading")
+        layout.addWidget(heading)
+
+        self.folder_combo = QComboBox(self)
+        self.folder_combo.setObjectName("moveToFolderCombo")
+        self.folder_combo.addItem("No folder", None)
+        for folder in folders:
+            self.folder_combo.addItem(folder.name, folder.id)
+        if current_folder_id is not None:
+            index = self.folder_combo.findData(current_folder_id)
+            if index >= 0:
+                self.folder_combo.setCurrentIndex(index)
+        layout.addWidget(self.folder_combo)
+
+        self.new_folder_edit = QLineEdit(self)
+        self.new_folder_edit.setObjectName("newFolderEdit")
+        self.new_folder_edit.setPlaceholderText("…or create a new folder")
+        self.new_folder_edit.setClearButtonEnabled(True)
+        layout.addWidget(self.new_folder_edit)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        buttons.setObjectName("moveToFolderButtons")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def outcome(self) -> tuple[str | None, str | None]:
+        """Resolve the dialog to (folder_id, new_folder_name)."""
+        new_name = self.new_folder_edit.text().strip()
+        if new_name:
+            return (None, new_name)
+        folder_id = self.folder_combo.currentData()
+        return (folder_id if isinstance(folder_id, str) else None, None)
+
+
+class DeleteChatConfirmationDialog(QDialog):
+    """Phase 11 M3 (F7): the deliberate whole-chat deletion confirmation.
+
+    Presents the LOSS INVENTORY computed by the store
+    (``describe_chat_deletion``) so the operator sees exactly what is lost
+    before the destructive command is admitted.  The dialog itself never
+    deletes; it only resolves to accepted/rejected.
+    """
+
+    def __init__(
+        self,
+        inventory: ChatDeletionInventory,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.inventory = inventory
+        self.setWindowTitle("Delete chat?")
+        self.setObjectName("deleteChatConfirmationDialog")
+
+        layout = QVBoxLayout(self)
+        heading = QLabel(
+            f"Delete “{inventory.title}” permanently?", self
+        )
+        heading.setObjectName("deleteChatHeading")
+        heading.setWordWrap(True)
+        layout.addWidget(heading)
+
+        lines = [
+            f"Chats deleted: 1",
+            f"Messages deleted: {inventory.message_count}",
+            f"Attachments detached: {inventory.attachment_count}",
+            f"Generation attempts deleted: {inventory.generation_attempt_count}",
+        ]
+        self.inventory_label = QLabel("\n".join(lines), self)
+        self.inventory_label.setObjectName("deleteChatInventory")
+        layout.addWidget(self.inventory_label)
+
+        warning = QLabel(
+            "This cannot be undone. Attachment files are kept for cleanup "
+            "and may still be used by other chats.",
+            self,
+        )
+        warning.setObjectName("deleteChatWarning")
+        warning.setWordWrap(True)
+        layout.addWidget(warning)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        buttons.setObjectName("deleteChatButtons")
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Delete chat")
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setObjectName(
+            "deleteChatConfirmButton"
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)

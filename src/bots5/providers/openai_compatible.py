@@ -12,7 +12,12 @@ import httpx
 
 from ..core.urls import canonical_http_base_url
 from ..errors import ProviderError, ProviderHttpError, ProviderResponseError
-from .base import CompletionRequest, CompletionResult, CompletionStreamEvent
+from .base import (
+    CompletionRequest,
+    CompletionResult,
+    CompletionStreamEvent,
+    serialize_generation_settings,
+)
 
 
 _BEARER_RE = re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+")
@@ -217,6 +222,18 @@ class OpenAICompatibleProvider:
                 {"reasoning_effort": request.reasoning_effort}
                 if request.reasoning_effort is not None
                 else {}
+            ),
+            # Generic OpenAI-compatible profile: the registry omits settings
+            # whose only truthful mapping belongs to another provider profile.
+            # Only settings carrying an explicit emitted capability state cross
+            # the boundary; contradictory/unsupported payload entries are
+            # dropped here as a last line of defence.
+            **serialize_generation_settings(
+                request.generation_settings,
+                states=request.generation_setting_states,
+                capabilities=request.generation_setting_capabilities,
+                omitted=request.generation_omitted_settings,
+                profile="generic",
             ),
         }
 

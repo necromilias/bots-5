@@ -285,7 +285,7 @@ def test_reorder_is_dense_and_refuses_nonwaiting_or_stale_rows():
 
 def test_durable_cutoff_writes_operation_journal_and_reservations_in_one_transaction(tmp_path):
     database = tmp_path / "state.sqlite3"
-    upgrade_to(database, "0012_phase9_archive_import")
+    upgrade_to(database, "0014_phase11_message_tombstone")
     engine = create_engine(f"sqlite:///{database}", future=True)
     try:
         with engine.begin() as connection:
@@ -1223,7 +1223,7 @@ async def test_public_imported_regeneration_uses_choice_without_chat_global_sele
             attempt_attachments=export_source.attempt_attachments, payloads={},
             attachment_policy=AttachmentPolicy.EMBEDDED,
             chat_configuration=export_source.chat_configuration,
-            application_version="0.1", migration_revision="0012_phase9_archive_import",
+            application_version="0.1", migration_revision="0016_phase11_workspace_state",
             context_plans=export_source.context_plans,
             object_provenance=export_source.object_provenance,
             continuation_history=export_source.continuation_history,
@@ -1256,7 +1256,7 @@ async def test_public_imported_regeneration_uses_choice_without_chat_global_sele
                 attempt_attachments=export_source.attempt_attachments, payloads={},
                 attachment_policy=AttachmentPolicy.EMBEDDED,
                 chat_configuration=export_source.chat_configuration,
-                application_version="0.1", migration_revision="0012_phase9_archive_import",
+                application_version="0.1", migration_revision="0016_phase11_workspace_state",
                 context_plans=export_source.context_plans,
             ))
 
@@ -1664,7 +1664,7 @@ def test_v1_import_then_v2_export_and_v2_import_preserves_source_hops(tmp_path):
             attempt_attachments=export_source.attempt_attachments, payloads={},
             attachment_policy=AttachmentPolicy.EMBEDDED,
             chat_configuration=export_source.chat_configuration,
-            application_version="0.1", migration_revision="0012_phase9_archive_import",
+            application_version="0.1", migration_revision="0016_phase11_workspace_state",
             context_plans=export_source.context_plans,
             object_provenance=export_source.object_provenance,
         ))
@@ -1751,7 +1751,7 @@ def test_v1_safe_context_attachment_bindings_survive_v2_second_hop(tmp_path):
                 attempt_attachments=export_source.attempt_attachments, payloads=payloads,
                 attachment_policy=AttachmentPolicy.EMBEDDED,
                 chat_configuration=export_source.chat_configuration,
-                application_version="0.1", migration_revision="0012_phase9_archive_import",
+                application_version="0.1", migration_revision="0016_phase11_workspace_state",
                 context_plans=export_source.context_plans,
                 object_provenance=export_source.object_provenance,
                 continuation_history=export_source.continuation_history,
@@ -2021,7 +2021,7 @@ def test_imported_branch_history_is_exact_immutable_reopens_and_round_trips(tmp_
             attempt_attachments=export_source.attempt_attachments, payloads={},
             attachment_policy=AttachmentPolicy.EMBEDDED,
             chat_configuration=export_source.chat_configuration,
-            application_version="0.1", migration_revision="0012_phase9_archive_import",
+            application_version="0.1", migration_revision="0016_phase11_workspace_state",
             context_plans=export_source.context_plans,
             object_provenance=export_source.object_provenance,
             continuation_history=export_source.continuation_history,
@@ -2776,7 +2776,7 @@ def test_empty_import_requires_v2_and_reimports_its_provenance(tmp_path):
     empty = archive_v2_bytes({
         "format": "org.necromilias.bots5.chat-archive", "archive_version": 2,
         "archive_id": "empty-import", "created_at": "2026-09-20T00:00:00.000000Z",
-        "source_application_version": "0.1", "source_db_migration_revision": "0012_phase9_archive_import",
+        "source_application_version": "0.1", "source_db_migration_revision": "0016_phase11_workspace_state",
         "source_chat": {"source_id": "empty-source", "title": "empty"},
         "attachment_policy": "embedded", "self_contained": True,
         "features": sorted(FEATURES), "external_resources": [], "secret_exclusion": "safe fields only",
@@ -3492,7 +3492,7 @@ async def test_native_chat_reusing_ready_imported_attachment_exports_truthful_v2
             attempt_attachments=second_export.attempt_attachments,
             payloads={}, attachment_policy=AttachmentPolicy.EXTERNAL_REFERENCE,
             chat_configuration=second_export.chat_configuration,
-            application_version="0.1", migration_revision="0012_phase9_archive_import",
+            application_version="0.1", migration_revision="0016_phase11_workspace_state",
             context_plans=second_export.context_plans,
             object_provenance=second_export.object_provenance,
             continuation_history=second_export.continuation_history,

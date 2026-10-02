@@ -796,3 +796,45 @@ def test_r4_qasync_real_session_bridge_close_is_shared_and_ordered(
             event_loop.run_until_complete(scenario())
     finally:
         qt_application.setQuitOnLastWindowClosed(original_quit)
+
+
+def test_phase4_rename_during_streaming_generation_is_metadata_only(tmp_path):
+    """A-1 + Phase 4: renaming mid-stream never disturbs the running generation.
+
+    The rename is metadata only: it must not bump the chat revision the
+    finalize step CAS-matches against, so the streaming attempt still
+    terminalizes normally after the title change.
+    """
+
+    async def scenario():
+        backend = ControlledBackend({"rename me mid-stream": "block"})
+        application = _application(tmp_path, backend)
+        subscription = application.subscribe()
+        try:
+            chat = await application.create_chat("rename me mid-stream")
+            attempt = await application.send_message(chat.id, "rename me mid-stream")
+            await backend.started[chat.id].wait()
+            streaming_chat, _ = await application.open_chat(chat.id)
+
+            # Feature-positive: the rename lands while the generation streams.
+            renamed = await application.rename_chat(chat.id, "renamed mid-flight")
+            assert renamed.title == "renamed mid-flight"
+            # ...without bumping the revision the finalize CAS will match.
+            assert renamed.revision == streaming_chat.revision
+
+            backend.release[chat.id].set()
+            await _terminals(subscription, {attempt.id})
+
+            stored = await application.list_generation_attempts(chat.id)
+            assert stored[0].state is AttemptState.COMPLETE
+            final_chat, messages = await application.open_chat(chat.id)
+            # The title survived the finalize, and the finalize CAS matched the
+            # un-bumped revision (rename moved no revision counter).
+            assert final_chat.title == "renamed mid-flight"
+            assert final_chat.revision == streaming_chat.revision
+            assert messages[-1].content.startswith("partial-")
+        finally:
+            subscription.close()
+            await application.close()
+
+    asyncio.run(scenario())
