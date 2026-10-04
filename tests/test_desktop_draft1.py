@@ -116,7 +116,7 @@ class LifecycleBackend:
             yield GenerationCompleted(attempt_id=request.attempt_id)
 
 
-def test_draft1_shell_uses_native_frame_and_approved_inert_affordances(tmp_path):
+def test_shell_uses_owned_frameless_chrome_and_approved_inert_affordances(tmp_path):
     qt_application = QApplication.instance() or QApplication([])
 
     async def scenario():
@@ -128,7 +128,7 @@ def test_draft1_shell_uses_native_frame_and_approved_inert_affordances(tmp_path)
             window.show()
             qt_application.processEvents()
 
-            assert not bool(window.windowFlags() & Qt.WindowType.FramelessWindowHint)
+            assert bool(window.windowFlags() & Qt.WindowType.FramelessWindowHint)
             assert len(window.findChildren(QLabel, "modelPill")) == 1
             assert window.top_bar.model_pill.text() == "fake-v0.1"
             for button in (

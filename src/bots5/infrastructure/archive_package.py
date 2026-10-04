@@ -300,6 +300,12 @@ def _inventory(entries: tuple[ArchiveLogicalEntry, ...]) -> list[dict[str, objec
 
 
 def archive_bytes(projection: ArchiveProjection) -> bytes:
+    if projection.manifest_base.get("archive_version") == 3:
+        from .archive_v3 import archive_v3_bytes
+        raw = archive_v3_bytes(projection.manifest_base, {entry.path: entry.content for entry in projection.entries})
+        import io
+        validate_archive(io.BytesIO(raw))
+        return raw
     if projection.manifest_base.get("archive_version") == 2:
         from .archive_v2 import archive_v2_bytes
         return archive_v2_bytes(
@@ -605,7 +611,7 @@ def validate_archive(source: Path | BinaryIO) -> ArchiveValidationResult:
             manifest = _json_object(contents["manifest.json"], "manifest")
             _reject_secret_shaped_fields(manifest)
             version = manifest.get("archive_version")
-            if type(version) is int and version not in {1, 2}:
+            if type(version) is int and version not in {1, 2, 3}:
                 raise ArchiveUnsupportedError("Archive version is unsupported")
             if version == 1:
                 unknown_members = names - {"manifest.json", "COMPLETED"} - _REQUIRED
@@ -614,6 +620,15 @@ def validate_archive(source: Path | BinaryIO) -> ArchiveValidationResult:
             # The frozen v1 branch below remains exact.  V2 gets a separate
             # closed validator so no v1 optionality or graph assumption is
             # accidentally reinterpreted as an import-provenance language.
+            if version == 3:
+                from .archive_v3 import validate_v3, ArchiveV3Error, ArchiveV3Unsupported
+                try:
+                    result = validate_v3(manifest, names, contents, total_size=total)
+                except ArchiveV3Unsupported as exc:
+                    raise ArchiveUnsupportedError("Archive v3 semantic is unsupported") from exc
+                except ArchiveV3Error as exc:
+                    raise ArchivePackageError("Archive v3 is invalid") from exc
+                return ArchiveValidationResult(result.archive_id, result.logical_content_digest, result.entry_count, result.total_uncompressed_size)
             if manifest.get("archive_version") == 2:
                 try:
                     result = validate_v2(manifest, names, contents, total_size=total)

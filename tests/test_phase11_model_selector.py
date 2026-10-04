@@ -264,7 +264,7 @@ def test_model_selector_popup_connection_health_pill_reflects_connection_state()
         pills = popup.findChildren(QLabel, "connectionHealthPill")
         assert len(pills) == 3, "each connection group must carry one health pill"
         states = {pill.property("health"): pill.text() for pill in pills}
-        assert states == {HEALTH_OK: "Ready", HEALTH_UNKNOWN: "Unknown", HEALTH_DOWN: "Offline"}
+        assert states == {HEALTH_OK: "Catalogue refreshed", HEALTH_UNKNOWN: "Catalogue not refreshed", HEALTH_DOWN: "Connection unavailable"}
     finally:
         popup.deleteLater()
         qt_application.processEvents()
@@ -368,7 +368,10 @@ def test_model_selector_detail_card_shows_context_streaming_pricing():
         title = popup.findChild(QLabel, "modelSelectorDetailTitle")
         assert title.text() == "Qwen3.5 35B Instruct"
         subtitle = popup.findChild(QLabel, "modelSelectorDetailSubtitle")
-        assert subtitle.text() == "Qwen3.5:35B-A3B · available"
+        assert "Qwen3.5:35B-A3B" in subtitle.text()
+        assert "Provider and model ready" in subtitle.text()
+        assert "Model available" in subtitle.text()
+        assert "validated when you send" in subtitle.text()
     finally:
         popup.deleteLater()
         qt_application.processEvents()

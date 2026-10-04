@@ -41,7 +41,12 @@ def serialize_generation_settings(
     if settings is None:
         return {}
     payload: dict[str, Any] = {}
-    for key in settings.emittable_keys(states, capabilities, omitted):
+    allowed = settings.emittable_keys(states, capabilities, omitted)
+    for key in allowed:
+        if profile == "openrouter" and key == "top_logprobs" and (
+            "logprobs" not in allowed or settings.logprobs is not True
+        ):
+            continue
         definition = setting_definition(key)
         mapping = definition.serialization_for(PayloadFamily.OPENAI_COMPATIBLE, profile)
         if mapping is None:
@@ -80,6 +85,11 @@ class CompletionRequest:
     # and the boundary then drops the setting.
     generation_setting_capabilities: Mapping[str, str] | None = None
     generation_omitted_settings: Mapping[str, str] | None = None
+    # Closed OpenRouter alias selected from frozen catalogue provenance.
+    # Generic/legacy requests retain their existing max_tokens wire field.
+    max_output_parameter: Literal["max_tokens", "max_completion_tokens"] = "max_tokens"
+    context_messages: tuple[tuple[str, str], ...] | None = None
+    accounting_mode: str | None = None
 
 
 

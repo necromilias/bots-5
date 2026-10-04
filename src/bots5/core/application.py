@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from functools import wraps
 
+from bots5.domain.openrouter_capabilities import openrouter_capability_facts
 from bots5.domain.clock import Clock, SystemClock
 from bots5.domain.ids import IdFactory, Uuid7Factory
 from bots5.domain.models import (
@@ -27,6 +28,7 @@ from bots5.domain.models import (
 )
 from bots5.domain.provider import (
     BackendType,
+    CAPABILITY_KEYS,
     CapabilityFact,
     CapabilityKey,
     CapabilitySource,
@@ -241,6 +243,7 @@ class BotsApplication:
         api_key_env: str | None = None,
         configuration: ProviderConfiguration | None = None,
         generation_mode: GenerationMode | str | None = None,
+        developer_provider_test_mode: bool = False,
         import_workers: OwnedImportWorkers | None = None,
         backup_service: BackupPort | None = None,
     ) -> None:
@@ -261,6 +264,13 @@ class BotsApplication:
         self._base_url = base_url
         self._api_key_env = api_key_env
         self._configuration = configuration
+        if type(developer_provider_test_mode) is not bool:
+            raise StateError("developer provider test mode requires an explicit boolean")
+        if developer_provider_test_mode and (
+            configuration is None or configuration.phase6_enabled
+        ):
+            raise StateError("developer provider test mode requires non-Phase-6 provider configuration")
+        self._developer_provider_test_mode = developer_provider_test_mode
         if generation_mode is None:
             generation_mode = (
                 GenerationMode.CONFIGURED
@@ -329,6 +339,11 @@ class BotsApplication:
     @property
     def generation_mode(self) -> GenerationMode:
         return self._generation_mode
+
+    @property
+    def developer_provider_test_mode(self) -> bool:
+        """Temporary launch-only smoke mode; never a persisted provider setting."""
+        return self._developer_provider_test_mode
 
     @property
     def phase6_enabled(self) -> bool:
@@ -959,8 +974,10 @@ class BotsApplication:
             requested=archive_version,
             has_import_provenance=source.requires_v2,
             has_missing_external_reference=False,
+            has_provider_managed_evidence=source.requires_v3,
         )
-        builder = build_archive_v2_projection if version == 2 else build_archive_projection
+        from .export import build_archive_v3_projection
+        builder = build_archive_v3_projection if version == 3 else build_archive_v2_projection if version == 2 else build_archive_projection
         return builder(
             archive_id=self._ids.new(), created_at=source.captured_at, chat=source.chat,
             messages=source.messages, attempts=source.attempts, message_attachments=source.message_attachments,
@@ -970,14 +987,15 @@ class BotsApplication:
                 for item in values if item.payload is not None
             },
             attachment_policy=attachment_policy, chat_configuration=source.chat_configuration,
-            application_version="0.1.0", migration_revision="0016_phase11_workspace_state",
+            application_version="0.1.0", migration_revision=source.migration_revision,
             context_plans=source.context_plans,
             **({
                 "object_provenance": source.object_provenance,
                 "continuation_history": source.continuation_history,
                 "history_bindings": source.history_bindings,
                 "archived_attempt_provenance": source.archived_attempt_provenance,
-            } if version == 2 else {}),
+            } if version in (2, 3) else {}),
+            **({"provider_managed_plans": source.provider_managed_plans} if version == 3 else {}),
         )
 
     @_tracked_command
@@ -1126,6 +1144,8 @@ class BotsApplication:
     @_tracked_command
     async def stage_attachment(self, chat_id: str, attachment_id: str) -> tuple[str, ...]:
         self._ensure_open()
+        if self.developer_provider_test_mode:
+            raise StateError("attachments are unavailable in INEXACT / PROVIDER TEST MODE")
         if self._generation_mode is GenerationMode.LEGACY_PHASE3_LOCAL_OPENAI:
             raise StateError(
                 "attachments are unavailable in the Phase 3 local_openai compatibility mode"
@@ -1192,6 +1212,8 @@ class BotsApplication:
     ) -> ContextPlan:
         """Build from an explicit parent rather than the mutable chat head."""
         self._ensure_open()
+        if self.developer_provider_test_mode:
+            raise StateError("Phase 6 context planning is unavailable in INEXACT / PROVIDER TEST MODE")
         if self._generation_mode is not GenerationMode.CONFIGURED:
             raise StateError("Phase 6 context planning is unavailable in legacy generation mode")
         chat = self._store.get_chat(chat_id)
@@ -1338,9 +1360,11 @@ class BotsApplication:
         continuation=None,
     ) -> tuple[GenerationRequest, GenerationAttempt, ContextPlan | None]:
         context_plan: ContextPlan | None = None
+        if self.developer_provider_test_mode and self._pending_attachment_ids.get(chat_id):
+            raise StateError("attachments are unavailable in INEXACT / PROVIDER TEST MODE")
         if self._generation_mode is GenerationMode.CONFIGURED:
-            context_history = self._context_history(chat_id, user_message.parent_id)
-            selected_attachments = self._selected_attachment_sources(chat_id)
+            context_history = () if self.developer_provider_test_mode else self._context_history(chat_id, user_message.parent_id)
+            selected_attachments = () if self.developer_provider_test_mode else self._selected_attachment_sources(chat_id)
             # ProviderConfiguration owns the frozen model/capability lookup and
             # exact Phase 6 adapter; this call cannot be bypassed by UI state.
             # The current desktop schema has one normal send contract: v3
@@ -1362,6 +1386,7 @@ class BotsApplication:
                 selected_attachments=selected_attachments,
                 parent_id=user_message.parent_id,
                 phase6=phase6,
+                developer_provider_test_mode=self.developer_provider_test_mode,
                 branch_model_entry_id=None if continuation is None else continuation.local_model_entry_id,
                 branch_explicit_settings=None if continuation is None else continuation.explicit_settings,
             )
@@ -1713,6 +1738,12 @@ class BotsApplication:
                 if model.availability.value != "available":
                     continue
                 metadata = model.metadata
+                # Persist the frozen legacy keys so the independent Phase 6
+                # start transaction can recheck the same truth and provenance.
+                if refreshed_connection is not None:
+                    for fact in openrouter_capability_facts(refreshed_connection, model):
+                        if fact.key in CAPABILITY_KEYS:
+                            self._store.set_capability_fact(fact)
                 for metadata_key, capability_key in (
                     ("context_length", CapabilityKey.CONTEXT_TOKENS.value),
                     ("max_output_tokens", CapabilityKey.OUTPUT_TOKENS.value),

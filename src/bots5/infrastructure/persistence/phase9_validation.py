@@ -276,8 +276,8 @@ def _validate_continuation_branch_snapshots(connection) -> None:
             raise RuntimeError("Phase 9 branch settings provenance lacks an admitted branch")
         if not branch_present:
             continue
-        if snapshot.get("snapshot_version") != 3 or row["local_connection_id"] is None:
-            raise RuntimeError("Phase 9 continuation branch lacks an exact v3 choice")
+        if snapshot.get("snapshot_version") not in (3, 5) or row["local_connection_id"] is None:
+            raise RuntimeError("Phase 9 continuation branch lacks a supported context choice")
         if snapshot.get("connection_id") != row["local_connection_id"] or snapshot.get("model_entry_id") != row["local_model_entry_id"]:
             raise RuntimeError("Phase 9 continuation branch target contradicts its choice")
         if row["first_message_id"] not in {row["user_message_id"], row["assistant_message_id"]}:

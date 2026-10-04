@@ -208,7 +208,7 @@ def test_registry_never_claims_false_family_equivalence():
         for definition in (repetition, frequency, presence)
         for mapping in definition.serialization
     }
-    assert payload_keys == {"repeat_penalty", "frequency_penalty", "presence_penalty"}
+    assert payload_keys == {"repeat_penalty", "repetition_penalty", "frequency_penalty", "presence_penalty"}
     budget = SETTING_DEFINITIONS_BY_KEY["reasoning_token_budget"]
     assert all(mapping.profile == "openrouter" for mapping in budget.serialization)
     assert SETTING_DEFINITIONS_BY_KEY["timeout_seconds"].serialization == ()
@@ -1255,18 +1255,18 @@ def test_narrow_dialogs_do_not_clip_content_horizontally():
 
 
 def test_theme_retains_tokens_and_adds_industrial_rules():
-    # The design's section 3.1 retained tokens are untouched.
-    assert SURFACE_BASE == "#11161b"
-    assert SURFACE_PANEL == "#171d24"
-    assert SURFACE_BUBBLE == "#1b232b"
-    assert BORDER_DEFAULT == "#29343f"
-    assert ACCENT_BLUE == "#3b9ddd"
+    # Mick's colour refinement supersedes the original section 3.1 palette.
+    assert SURFACE_BASE == "#040B12"
+    assert SURFACE_PANEL == "#031120"
+    assert SURFACE_BUBBLE == "#05101B"
+    assert BORDER_DEFAULT == "#21364C"
+    assert ACCENT_BLUE == "#0E67A5"
     stylesheet = build_theme_stylesheet(scale=1.0)
-    # Industrial dialog rules exist and carry no gradients or drop shadows.
+    # Recomposition retains the palette and real control rules. The authorized
+    # steel-blue header finish may use Qt gradients; CSS-only effects stay absent.
     assert "QFrame#botsChamferedPanel {" in stylesheet
     assert "QDialog#tuneDialog" in stylesheet and "QDialog#settingsDialog" in stylesheet
     assert "QListWidget#botsSectionNav::item:selected" in stylesheet
     assert "QLabel#botsStateBadge[gate=\"unsupported\"]" in stylesheet
     assert "linear-gradient" not in stylesheet
-    assert "qlineargradient" not in stylesheet
     assert "box-shadow" not in stylesheet

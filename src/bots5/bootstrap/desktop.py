@@ -577,7 +577,12 @@ def build_runtime(
     api_key_env: str | None = None,
     reasoning_effort: ReasoningEffort | None = None,
     destructive_restore_override: bool = False,
+    developer_provider_test_mode: bool = False,
 ) -> DesktopRuntime:
+    if type(developer_provider_test_mode) is not bool:
+        raise ValueError("developer provider test mode requires an explicit boolean")
+    if developer_provider_test_mode and backend != "fake":
+        raise ValueError("developer provider test mode requires the configured-provider desktop")
     from bots5.desktop.session import DesktopSessionController
 
     paths = resolve_app_paths(data_root)
@@ -625,7 +630,10 @@ def build_runtime(
         else:
             raise ValueError(f"unsupported desktop backend: {backend}")
         configuration = (
-            ProviderConfiguration(store, ids, clock, secret_store_factory=secret_store_for)
+            ProviderConfiguration(
+                store, ids, clock, secret_store_factory=secret_store_for,
+                phase6_enabled=not developer_provider_test_mode,
+            )
             if backend == "fake"
             else None
         )
@@ -659,6 +667,7 @@ def build_runtime(
             api_key_env=selected_api_key_env,
             configuration=configuration,
             generation_mode=generation_mode,
+            developer_provider_test_mode=developer_provider_test_mode,
             backup_service=backup_service,
         )
         session = DesktopSessionInfo(
@@ -667,6 +676,7 @@ def build_runtime(
             provider_id=provider_id,
             generation_mode=generation_mode.value,
             phase6_enabled=application.phase6_enabled,
+            developer_provider_test_mode=application.developer_provider_test_mode,
         )
         return DesktopRuntime(
             paths,
@@ -819,6 +829,19 @@ async def _present_restore_handoff_result(
             pass
 
 
+def _restore_bootstrap_command() -> list[str]:
+    """Re-enter the desktop bootstrap using this runtime's execution model.
+
+    Nuitka's executable already calls ``main`` before desktop/store
+    composition. Its ``sys.executable`` can name a nonexistent bundled
+    Python, so the Linux process image is the re-entry target. Source
+    execution still needs the interpreter's module dispatch.
+    """
+    if "__compiled__" in globals():
+        return [os.readlink("/proc/self/exe")]
+    return [sys.executable, "-m", "bots5.bootstrap.desktop"]
+
+
 async def _run_restore_handoff_post_close(runtime: "DesktopRuntime") -> None:
     """S7/S8: consume the one-shot request and run the waited bootstrap child.
 
@@ -853,9 +876,7 @@ async def _run_restore_handoff_post_close(runtime: "DesktopRuntime") -> None:
     if request is None:
         return
     argv = [
-        sys.executable,
-        "-m",
-        "bots5.bootstrap.desktop",
+        *_restore_bootstrap_command(),
         "--data-root",
         os.fspath(runtime.paths.data_root),
         "--restore-from",
@@ -950,6 +971,15 @@ def _release_after_restore_initiation(authority: AuthorityLock, code: int) -> in
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bots5-desktop")
     parser.add_argument(
+        "--developer-provider-test-mode",
+        action="store_true",
+        help=(
+            "TEMPORARY developer-only INEXACT / PROVIDER TEST MODE; disables "
+            "Phase 6 planning for this session only. No deterministic context "
+            "budgeting, history, or attachment guarantees. Not Phase 6 compliant."
+        ),
+    )
+    parser.add_argument(
         "--data-root",
         type=Path,
         default=None,
@@ -1010,6 +1040,10 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.developer_provider_test_mode and (
+        args.backend != "fake" or args.restore_from is not None
+    ):
+        parser.error("--developer-provider-test-mode requires the configured-provider desktop, not local_openai or restore")
     if args.expected_backup_id is not None and args.restore_from is None:
         parser.error("--expected-backup-id requires --restore-from")
     if args.restore_from is not None:
@@ -1037,6 +1071,7 @@ def main(argv: list[str] | None = None) -> int:
                 model=args.model,
                 api_key_env=args.api_key_env,
                 reasoning_effort=args.reasoning_effort,
+                developer_provider_test_mode=args.developer_provider_test_mode,
             )
         except Exception as exc:
             print(f"error: {exc}", file=sys.stderr)

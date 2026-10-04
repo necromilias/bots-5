@@ -9,6 +9,7 @@ from datetime import datetime
 from functools import wraps
 from typing import Any, Mapping
 
+from bots5.domain.openrouter_capabilities import openrouter_capability_facts
 from bots5.domain.provider import (
     BackendType,
     CAPABILITY_KEYS,
@@ -193,6 +194,13 @@ def resolve_setting_emission_plan(
             continue
         payload_values[key] = normalized
         resolutions.append(SettingResolution(key, normalized, resolved.provenance.get(key, ""), capability_state, STATE_EMITTED))
+    if profile == "openrouter" and "top_logprobs" in payload_values and payload_values.get("logprobs") is not True:
+        del payload_values["top_logprobs"]
+        resolutions = [
+            replace(item, state=STATE_OMITTED_INVALID, reason="top_logprobs requires emitted logprobs=true")
+            if item.key == "top_logprobs" else item
+            for item in resolutions
+        ]
     payload = GenerationSettingsPayload(**payload_values) if payload_values else None
     return SettingsEmissionPlan(tuple(resolutions), payload)
 
@@ -612,6 +620,14 @@ class ProviderConfiguration:
         model = self.store.get_model_catalogue_entry(model_entry_id)
         connection = None if model is None else self.store.get_provider_connection(model.connection_id)
         catalogue_revision = None if connection is None else connection.catalogue_revision
+        # Extended storage holds manual overrides, not provider facts. Derive
+        # advertised facts from the already durable, revision-bound catalogue
+        # metadata rather than mislabelling discovery as a manual override.
+        if model is not None and connection is not None:
+            facts += tuple(
+                fact for fact in openrouter_capability_facts(connection, model)
+                if fact.key in SETTING_CAPABILITY_KEYS
+            )
         if catalogue_revision is not None:
             facts = tuple(
                 fact
@@ -673,6 +689,7 @@ class ProviderConfiguration:
         selected_attachments: tuple[ContextSource, ...] = (),
         parent_id: str | None = None,
         phase6: bool = False,
+        developer_provider_test_mode: bool = False,
         branch_model_entry_id: str | None = None,
         branch_explicit_settings: dict[str, object] | None = None,
     ) -> tuple[PreparedGeneration, str]:
@@ -687,6 +704,17 @@ class ProviderConfiguration:
         if connection is None:
             raise StateError("selected model connection no longer exists")
         self._ensure_model_usable(model, connection)
+        generation_authority = None
+        if phase6 and connection.profile is ProviderProfile.OPENROUTER and connection.backend_type is BackendType.OPENAI_COMPATIBLE_HTTP:
+            _, app_extra_revision = self.store.get_application_generation_settings_extra_config()
+            _, model_extra_revision = self.store.get_model_generation_settings_extra(model.id)
+            _, chat_extra_revision = self.store.get_chat_model_generation_settings_extra(chat_id, model.id)
+            generation_authority = {
+                "model_revision": model.revision,
+                "extra_revisions": {"application": app_extra_revision, "model": model_extra_revision, "chat": chat_extra_revision},
+                "capability_overrides": {item.key: {"state": item.state.value, "revision": item.revision}
+                    for item in self.store.list_generation_setting_capability_overrides(model.id)},
+            }
         settings = self._resolve_settings(chat_id, model.id)
         if branch_explicit_settings is not None:
             if set(branch_explicit_settings) != {"temperature", "max_output_tokens", "reasoning_effort", "timeout_seconds"}:
@@ -764,9 +792,12 @@ class ProviderConfiguration:
         # registry-driven (extended) settings plane.  With no extended setting
         # configured anywhere the plan stays empty and the request/snapshot
         # contract is byte-identical to the pre-amendment v2 behaviour.
+        from .provider_managed_context import AccountingMode, accounting_mode, build_provider_managed_plan, ProviderManagedContextPlan
+        mode = accounting_mode(backend=connection.backend_type.value, profile=connection.profile.value, developer=developer_provider_test_mode)
+        provider_managed = phase6 and mode is AccountingMode.PROVIDER_MANAGED
         emission_plan: SettingsEmissionPlan | None = None
         if settings.extra:
-            if phase6:
+            if phase6 and not provider_managed:
                 raise StateError(
                     "extended generation settings require the OpenAI-compatible request path"
                 )
@@ -801,7 +832,7 @@ class ProviderConfiguration:
                 or context_capability.value <= 0
             ):
                 raise StateError("an exact supported context window is required before dispatch")
-            if connection.backend_type is not BackendType.FAKE:
+            if connection.backend_type is not BackendType.FAKE and not provider_managed:
                 raise StateError("no exact Phase 6 accounting adapter is registered for this backend")
             field = context_capability.provenance.get("field")
             if type(field) is not str or not field:
@@ -816,26 +847,38 @@ class ProviderConfiguration:
                 ),
             )
             try:
-                context_plan = self._context_builder.build(
-                    current_user=ContextSource(
-                        source_id=user_message_id,
-                        kind="current_user",
-                        role="user",
-                        content=prompt,
-                    ),
-                    historical_turns=context_history,
-                    selected_attachments=selected_attachments,
-                    bots_required_instructions=(required_instruction,),
-                    envelope={"version": 3, "untrusted_user_context": True},
-                    context_window=context_capability.value,
-                    context_window_provenance=(
-                        f"{context_capability.source.value}:{context_capability.source_revision}:{field}"
-                    ),
-                    output_reserve=settings.max_output_tokens,
-                    parent_id=parent_id,
-                )
+                if provider_managed:
+                    context_plan = build_provider_managed_plan(
+                        current_user=ContextSource(user_message_id, "current_user", "user", prompt),
+                        historical_turns=context_history, selected_attachments=selected_attachments,
+                        context_capability={"advertised_context_tokens": context_capability.value,
+                            "source": context_capability.source.value, "source_revision": context_capability.source_revision, "field": field},
+                        output_reserve=settings.max_output_tokens, parent_id=parent_id,
+                    )
+                else:
+                    context_plan = self._context_builder.build(
+                        current_user=ContextSource(
+                            source_id=user_message_id,
+                            kind="current_user",
+                            role="user",
+                            content=prompt,
+                        ),
+                        historical_turns=context_history,
+                        selected_attachments=selected_attachments,
+                        bots_required_instructions=(required_instruction,),
+                        envelope={"version": 3, "untrusted_user_context": True},
+                        context_window=context_capability.value,
+                        context_window_provenance=(
+                            f"{context_capability.source.value}:{context_capability.source_revision}:{field}"
+                        ),
+                        output_reserve=settings.max_output_tokens,
+                        parent_id=parent_id,
+                    )
             except ContextBuildError as exc:
                 raise StateError(str(exc)) from exc
+        from bots5.domain.openrouter_capabilities import openrouter_capability_facts
+        alias_fact = next((f for f in openrouter_capability_facts(connection, model) if f.key == "request.max_output_tokens"), None)
+        wire_alias = ("max_completion_tokens" if alias_fact is not None and alias_fact.provenance.get("field") == "supported_parameters.max_completion_tokens" else "max_tokens")
         request = GenerationRequest(
             attempt_id=attempt_id,
             chat_id=chat_id,
@@ -868,6 +911,8 @@ class ProviderConfiguration:
             system_prompt=(None if context_plan is None else ""),
             wire_representation=(None if context_plan is None else context_plan.wire_representation),
             context_plan_digest=(None if context_plan is None else context_plan.canonical_digest),
+            accounting_mode=(mode.value if phase6 or developer_provider_test_mode else None),
+            max_output_parameter=(wire_alias if connection.profile is ProviderProfile.OPENROUTER else None),
         )
         # The frozen Phase 5 evidence schema pins the legacy provenance to the
         # four legacy keys; the extended plane's provenance rides the v4
@@ -910,7 +955,12 @@ class ProviderConfiguration:
             # normalized generation-settings decision record.
             snapshot["snapshot_version"] = PHASE11_SNAPSHOT_VERSION
             snapshot["generation_settings"] = emission_plan.as_evidence()
-        if context_plan is not None:
+        if isinstance(context_plan, ProviderManagedContextPlan):
+            snapshot.update(snapshot_version=5, accounting_mode="provider-managed",
+                provider_managed_plan=context_plan.as_evidence(), settings_revisions=settings_revisions, generation_authority=generation_authority,
+                serialization={"max_output_parameter": wire_alias, "catalogue_revision": connection.catalogue_revision})
+            snapshot_text = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        elif context_plan is not None:
             snapshot["settings_revisions"] = settings_revisions
             snapshot_text = phase6_snapshot(
                 attempt_id=attempt_id,

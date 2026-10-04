@@ -60,7 +60,7 @@ from tests._authority_test_support import upgrade_to
 
 
 REPO = Path(__file__).resolve().parents[1]
-HEAD = "0019_phase11_generation_settings"
+HEAD = "0020_provider_managed_context"
 PRIOR_HEAD = "0012_phase9_archive_import"
 
 _RESTORE_JOURNAL = ".bots5-restore-journal.json"

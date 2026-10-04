@@ -57,7 +57,8 @@ _PHASE11_SEARCH_HEAD = "0018_phase11_search_state"
 # registry-driven generation-settings plane, so existing 0018 databases
 # remain fully supported sources on the normal upgrade path.
 _PHASE11_GENERATION_SETTINGS_HEAD = "0019_phase11_generation_settings"
-_HEAD = _PHASE11_GENERATION_SETTINGS_HEAD
+_PROVIDER_MANAGED_HEAD = "0020_provider_managed_context"
+_HEAD = _PROVIDER_MANAGED_HEAD
 _PRIOR_REVISIONS = (
     "0001_desktop_state",
     "0002_conversation_lineage",
@@ -86,6 +87,7 @@ _PRIOR_REVISIONS = (
     # revision became the default target.  Existing 0018 databases must stay
     # supported sources on the normal upgrade path.
     _PHASE11_SEARCH_HEAD,
+    _PHASE11_GENERATION_SETTINGS_HEAD,
 )
 _SUPPORTED_REVISIONS = frozenset((*_PRIOR_REVISIONS, _HEAD))
 _MIGRATION_CHAIN = (*_PRIOR_REVISIONS, _HEAD)
@@ -499,6 +501,8 @@ def _validate_record(
             # revision, so omitting it here rejects recovery from a legitimately
             # supported state.
             _PHASE11_INTEGRITY_HEAD,
+            _PHASE11_SEARCH_HEAD,
+            _PHASE11_GENERATION_SETTINGS_HEAD,
             _HEAD,
         }
     ):

@@ -377,6 +377,7 @@ def validate_phase6_schema(connection, *, destructive: bool = True) -> None:
         "0017_phase11_integrity",
         "0018_phase11_search_state",
         "0019_phase11_generation_settings",
+        "0020_provider_managed_context",
     }:
         # Phase 6 remains exact at revision 0009.  Later Phase 7/8/9 revisions
         # may add only the closed Phase 7 trigger set to Phase 6-owned tables.
@@ -387,6 +388,11 @@ def validate_phase6_schema(connection, *, destructive: bool = True) -> None:
             "phase9_import_attachment_delete_guard",
             "phase9_import_blob_delete_guard",
         }
+    if revision == "0020_provider_managed_context":
+        phase7_additions.add("provider_managed_exact_exclusion_guard")
+        from .provider_managed_schema import reference_guards
+        for name, statement in reference_guards().items():
+            canonical[name] = _normalise_sql(statement.replace("IF NOT EXISTS ", ""))
     required_names = {*REQUIRED_TABLES, *REQUIRED_TRIGGERS, *REQUIRED_INDEXES}
     unexpected = sorted(
         str(name)
@@ -415,6 +421,7 @@ def validate_phase6_schema(connection, *, destructive: bool = True) -> None:
             "0017_phase11_integrity",
             "0018_phase11_search_state",
             "0019_phase11_generation_settings",
+        "0020_provider_managed_context",
         } and name == "phase6_attempt_attachment_insert_guard":
             current_tokens = actual.get(name, ())
             required_tokens = {
@@ -429,6 +436,7 @@ def validate_phase6_schema(connection, *, destructive: bool = True) -> None:
             "0017_phase11_integrity",
             "0018_phase11_search_state",
             "0019_phase11_generation_settings",
+        "0020_provider_managed_context",
         } and name in {
             # 0017 recreated exactly these three delete guards behind the
             # connection-local chat-deletion admission, and every later
@@ -973,6 +981,15 @@ def _validate_phase6_rows(connection) -> None:
             or hashlib.sha256(str(row[2]).encode("utf-8")).hexdigest() != row[3]
         ):
             raise RuntimeError("current Phase 6 context plan row is malformed")
+    reference_plans = dict(plans)
+    revision = connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one_or_none()
+    if revision == "0020_provider_managed_context":
+        from .provider_managed_schema import validate_schema
+        validate_schema(connection)
+        for attempt_id, representation in connection.exec_driver_sql("SELECT attempt_id,canonical_representation FROM provider_managed_context_plans"):
+            if attempt_id in reference_plans:
+                raise RuntimeError("conflicting context plan ownership")
+            reference_plans[attempt_id] = (attempt_id, 1, representation)
     for table, identity in (("message_attachments", "message_id"), ("attempt_attachments", "attempt_id")):
         duplicate = connection.exec_driver_sql(
             f"SELECT {identity}, ordinal, COUNT(*) FROM {table} "
@@ -987,7 +1004,7 @@ def _validate_phase6_rows(connection) -> None:
     for message_id, attachment_id, ordinal, attempt_id in refs:
         if attempt_id is None:
             raise RuntimeError("current Phase 6 message reference has no generation attempt")
-        plan_row = plans.get(str(attempt_id))
+        plan_row = reference_plans.get(str(attempt_id))
         if plan_row is None:
             raise RuntimeError("current Phase 6 message reference has no v3 plan")
         canonical = json.loads(plan_row[2])
@@ -1005,7 +1022,7 @@ def _validate_phase6_rows(connection) -> None:
         "SELECT attempt_id, attachment_id, ordinal FROM attempt_attachments"
     ).fetchall()
     for attempt_id, attachment_id, ordinal in refs:
-        plan_row = plans.get(str(attempt_id))
+        plan_row = reference_plans.get(str(attempt_id))
         if plan_row is None:
             raise RuntimeError("current Phase 6 attempt reference has no v3 plan")
         canonical = json.loads(plan_row[2])
@@ -1024,18 +1041,21 @@ def _validate_phase6_rows(connection) -> None:
         ).first()
         imported_owner = connection.exec_driver_sql(
             "SELECT 1 FROM archive_continuation_branches b "
-            "JOIN archive_continuation_requirement_candidates c "
-            "ON c.chat_id=b.chat_id AND c.base_key=b.base_key AND c.ordinal=? "
-            "JOIN archive_import_attachment_refs r "
-            "ON r.id=c.imported_ref_id AND r.attachment_id=? AND r.availability='READY' "
-            "WHERE b.attempt_id=?",
-            (ordinal, attachment_id, attempt_id),
+            "JOIN archive_continuation_choices choice ON choice.chat_id=b.chat_id AND choice.base_key=b.base_key AND choice.choice_revision=b.choice_revision "
+            "JOIN archive_continuation_requirement_candidates c ON c.chat_id=b.chat_id AND c.base_key=b.base_key "
+            "JOIN archive_import_attachment_refs r ON r.id=c.imported_ref_id AND r.attachment_id=? AND r.availability='READY' "
+            "WHERE b.attempt_id=? AND NOT EXISTS (SELECT 1 FROM json_each(choice.excluded_refs) e WHERE CAST(json_extract(e.value,'$.requirement_ordinal') AS INTEGER)=c.ordinal) "
+            "AND ?=(SELECT count(*) FROM archive_continuation_requirements prior WHERE prior.chat_id=b.chat_id AND prior.base_key=b.base_key AND prior.ordinal<c.ordinal "
+            "AND NOT EXISTS (SELECT 1 FROM json_each(choice.excluded_refs) e WHERE CAST(json_extract(e.value,'$.requirement_ordinal') AS INTEGER)=prior.ordinal))",
+            (attachment_id, attempt_id, ordinal),
         ).first() if revision in {
             "0012_phase9_archive_import",
             "0013_phase11_organisation",
             "0014_phase11_message_tombstone",
             "0015_phase11_duplicate_admission",
             "0016_phase11_workspace_state",
+            "0017_phase11_integrity", "0018_phase11_search_state",
+            "0019_phase11_generation_settings", "0020_provider_managed_context",
         } else None
         if native_owner is None and imported_owner is None:
             raise RuntimeError("current Phase 6 attempt reference has no message reference")

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from collections.abc import AsyncIterator
 from dataclasses import replace
 
@@ -14,7 +16,7 @@ from bots5.core.generation import (
 )
 from bots5.core.urls import canonical_http_base_url
 from bots5.domain.generation_settings_registry import SETTING_KEY_BY_CAPABILITY_KEY
-from bots5.errors import ProviderError, ProviderHttpError, ProviderResponseError
+from bots5.errors import ContextAdmissionError, ProviderError, ProviderHttpError, ProviderResponseError
 from bots5.providers.base import (
     CompletionRequest,
     CompletionStreamEvent,
@@ -124,6 +126,8 @@ class OpenAICompatibleStreamingBackend:
 
     @staticmethod
     def _provider_failure_is_uncertain(error: ProviderError) -> bool:
+        if isinstance(error, ContextAdmissionError):
+            return False
         if isinstance(error, ProviderHttpError):
             return error.status_code >= 500
         return True
@@ -155,6 +159,15 @@ class OpenAICompatibleStreamingBackend:
             generation_setting_states=request.generation_setting_states,
             generation_setting_capabilities=_setting_capability_states(request.capabilities),
             generation_omitted_settings=request.omitted_settings,
+            context_messages=(tuple((m["role"], m["content"]) for m in json.loads(request.wire_representation)) if request.accounting_mode == "provider-managed" and request.wire_representation is not None else None),
+            accounting_mode=request.accounting_mode,
+            max_output_parameter=request.max_output_parameter or (
+                "max_completion_tokens"
+                if request.provider_profile == "openrouter"
+                and (request.capability_provenance or {}).get("request.max_output_tokens", {}).get("field")
+                == "supported_parameters.max_completion_tokens"
+                else "max_tokens"
+            ),
         )
         metadata = CompletionStreamEvent()
         finish_reason: str | None = None

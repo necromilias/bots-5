@@ -560,11 +560,13 @@ def capture_validated_archive(
                         cancelled=cancelled,
                     )))
             context_plans = parse_jsonl(package.read("domain/context-plans.jsonl"))
+            if manifest.get("archive_version") == 3:
+                context_plans += parse_jsonl(package.read("domain/provider-managed-context-plans.jsonl"))
             message_attachment_relations = parse_jsonl(package.read("domain/message-attachments.jsonl"))
             attempt_attachment_relations = parse_jsonl(package.read("domain/attempt-attachments.jsonl"))
             chat_configuration = strict_json_loads(package.read("domain/chat-configuration.json"))
             archive_provenance = strict_json_loads(package.read("domain/provenance.json"))
-            if manifest.get("archive_version") == 2:
+            if manifest.get("archive_version") in (2, 3):
                 object_provenance = parse_jsonl(package.read("domain/object-provenance.jsonl"))
                 continuation_history = strict_json_loads(package.read("domain/continuation-history.json"))
                 history_bindings = parse_jsonl(package.read("domain/history-bindings.jsonl"))
@@ -592,7 +594,7 @@ def capture_validated_archive(
         type(manifest) is not dict
         or type(chat) is not dict
         or type(manifest.get("archive_version")) is not int
-        or manifest["archive_version"] not in {1, 2}
+        or manifest["archive_version"] not in {1, 2, 3}
         or type(chat.get("source_id")) is not str
         or not chat["source_id"]
         or type(chat_configuration) is not dict

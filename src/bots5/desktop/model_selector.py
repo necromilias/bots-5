@@ -34,6 +34,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QKeyEvent, QMouseEvent
 from PySide6.QtWidgets import (
     QDialog,
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -41,11 +42,18 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
+from .icons import icon_action
+from .dialog_primitives import (
+    ChamferedPanel, ElidingLabel, PanelPair, SectionHeader, WorkPanel,
+    FittedWrappedLabel, fit_dialog_to_screen, scrollable, DialogHeader,
+)
 from .theme import (
+    PICKER_SIZE,
     ACCENT_BLUE,
     BORDER_SUBTLE,
     STATUS_ERROR,
@@ -66,9 +74,9 @@ HEALTH_UNKNOWN = "unknown"
 HEALTH_DOWN = "down"
 
 _HEALTH_LABELS = {
-    HEALTH_OK: "Ready",
-    HEALTH_UNKNOWN: "Unknown",
-    HEALTH_DOWN: "Offline",
+    HEALTH_OK: "Catalogue refreshed",
+    HEALTH_UNKNOWN: "Catalogue not refreshed",
+    HEALTH_DOWN: "Connection unavailable",
 }
 
 _PILL_STYLES = {
@@ -106,6 +114,7 @@ _PILL_STYLES = {
 
 _ROW_STYLESHEET = (
     """
+QListWidget#modelSelectorList::item { padding: 0; }
 QFrame#modelSelectorRow, QFrame#modelSelectorGroupHeader {
     background: transparent;
     border: none;
@@ -148,18 +157,10 @@ QLabel#modelSelectorDetailEmpty {
     font-size: 11px;
 }
 QFrame#modelSelectorDetailCard {
-    background: %SURFACE_BUBBLE%;
-    border: 1px solid %BORDER_SUBTLE%;
-    border-radius: 6px;
+    background: transparent;
+    border: none;
 }
-QPushButton#modelSelectorChoose {
-    background: %ACCENT_BLUE%;
-    color: #0d1117;
-    border: 1px solid %ACCENT_BLUE%;
-    border-radius: 4px;
-    padding: 5px 14px;
-    font-weight: 700;
-}
+
 """.replace("%TEXT_PRIMARY%", TEXT_PRIMARY)
     .replace("%TEXT_SECONDARY%", TEXT_SECONDARY)
     .replace("%TEXT_INACTIVE%", TEXT_INACTIVE)
@@ -249,6 +250,35 @@ class ModelSelectorEntry:
     connection_backend_type: str = ""
     context_tokens: int | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
+    connection_retired: bool = False
+    connection_enabled: bool = True
+    credential_status: str = "unknown"
+    credential_required: bool = False
+    catalogue_freshness: str = "unknown"
+    context_accounting: str = ""
+
+
+
+def model_readiness(entry: ModelSelectorEntry) -> tuple[str, str]:
+    """Explain existing truth; this never changes catalogue/lifecycle state."""
+    if entry.connection_retired:
+        return "Unavailable — connection retired", "Models from this connection cannot be used. Choose another model or view the connection."
+    if not entry.connection_enabled:
+        return "Unavailable — connection disabled", "Enable this connection in Settings to use its models."
+    if not entry.connection_available:
+        return "Unavailable — connection unavailable", "View the connection in Settings for its current state."
+    if entry.credential_required and entry.credential_status != "available":
+        return f"Unavailable — credential {entry.credential_status}", "View Credentials in Settings. Catalogue refresh does not establish authentication."
+    if entry.availability != "available":
+        return f"Unavailable — model {entry.availability}", "Refresh the catalogue or choose another model."
+    return "Provider and model ready", "Model available. Generation settings and request limits are validated when you send."
+
+
+def readiness_details(entry: ModelSelectorEntry) -> str:
+    lifecycle = "retired" if entry.connection_retired else "active"
+    enabled = "enabled" if entry.connection_enabled else "disabled"
+    credential = entry.credential_status if entry.credential_required else "not required"
+    return f"Connection {lifecycle}, {enabled} · Credential {credential}\nCatalogue {entry.connection_refresh_status} · {entry.catalogue_freshness} · Model {entry.availability}"
 
 
 class _SearchEdit(QLineEdit):
@@ -281,18 +311,21 @@ def _build_row_widget(entry: ModelSelectorEntry, parent: QWidget) -> QFrame:
     layout = QVBoxLayout(row)
     layout.setContentsMargins(8, 4, 8, 4)
     layout.setSpacing(1)
-    primary = QLabel(entry.display_name or entry.provider_model_id, row)
+    primary = ElidingLabel(entry.display_name or entry.provider_model_id, row)
     primary.setObjectName("modelSelectorPrimary")
     layout.addWidget(primary)
     secondary_text = entry_secondary_line(entry)
+    heading, _reason = model_readiness(entry)
+    if heading.startswith("Unavailable"):
+        secondary_text += " · " + heading
     if secondary_text:
-        secondary = QLabel(secondary_text, row)
+        secondary = ElidingLabel(secondary_text, row)
         secondary.setObjectName("modelSelectorSecondary")
         layout.addWidget(secondary)
     return row
 
 
-def _build_header_widget(connection_name: str, health: str, parent: QWidget) -> QFrame:
+def _build_header_widget(connection_name: str, health: str, parent: QWidget, entry: ModelSelectorEntry | None = None) -> QFrame:
     """Connection group header: name label + connection-health pill."""
 
     header = QFrame(parent)
@@ -300,11 +333,20 @@ def _build_header_widget(connection_name: str, health: str, parent: QWidget) -> 
     layout = QHBoxLayout(header)
     layout.setContentsMargins(8, 6, 8, 3)
     layout.setSpacing(6)
-    label = QLabel(connection_name.upper(), header)
+    label = ElidingLabel(connection_name.upper(), header)
     label.setObjectName("modelSelectorGroupLabel")
-    layout.addWidget(label)
-    layout.addStretch(1)
-    pill = QLabel(_HEALTH_LABELS.get(health, health), header)
+    layout.addWidget(label, 1)
+    label_text = _HEALTH_LABELS.get(health, health)
+    if entry is not None:
+        if entry.connection_backend_type == "fake":
+            label_text = "Seeded catalogue"
+        if entry.connection_retired:
+            label_text = "RETIRED — models unavailable"
+        elif not entry.connection_enabled:
+            label_text = "Connection disabled"
+        elif entry.connection_refresh_status == "failed":
+            label_text = "Catalogue refresh failed"
+    pill = QLabel(label_text, header)
     pill.setObjectName("connectionHealthPill")
     pill.setProperty("health", health)
     pill.setStyleSheet(_PILL_STYLES.get(health, ""))
@@ -322,11 +364,12 @@ class ModelSelectorDetailCard(QFrame):
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(10, 8, 10, 8)
         self._layout.setSpacing(3)
-        self._title = QLabel("", self)
+        self._layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self._title = FittedWrappedLabel("", self)
         self._title.setObjectName("modelSelectorDetailTitle")
         self._title.setWordWrap(True)
         self._layout.addWidget(self._title)
-        self._subtitle = QLabel("", self)
+        self._subtitle = FittedWrappedLabel("", self)
         self._subtitle.setObjectName("modelSelectorDetailSubtitle")
         self._subtitle.setWordWrap(True)
         self._layout.addWidget(self._subtitle)
@@ -349,8 +392,8 @@ class ModelSelectorDetailCard(QFrame):
             self._empty.setVisible(False)
             return
         self._title.setText(entry.display_name or entry.provider_model_id)
-        identity_bits = [bit for bit in (entry.provider_model_id, entry.availability) if bit]
-        self._subtitle.setText(" · ".join(identity_bits))
+        heading, reason = model_readiness(entry)
+        self._subtitle.setText(f"{entry.provider_model_id}\n{heading}\n{reason}\n{readiness_details(entry)}")
         rows = entry_detail_rows(entry)
         self._empty.setVisible(not rows)
         for key, value in rows:
@@ -379,23 +422,31 @@ class ModelSelectorPopup(QDialog):
     """
 
     model_entry_chosen = Signal(str)
+    view_connection_requested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Select model")
         self.setObjectName("modelSelectorPopup")
         self.setModal(False)
-        self.setMinimumWidth(430)
-        self.setMinimumHeight(420)
+        self.setMinimumWidth(320)
+        self.setMinimumHeight(300)
         self.setStyleSheet(_ROW_STYLESHEET)
 
         self._entries: tuple[ModelSelectorEntry, ...] = ()
         self._selected_model_entry_id: str | None = None
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setContentsMargins(16, 16, 16, 0)
         layout.setSpacing(8)
-
+        masthead = DialogHeader(self, description="Provider → model → availability. Selection does not change connection state.")
+        layout.addWidget(masthead)
+        catalogue = WorkPanel("Provider / model catalogue", self)
+        self.provider_filter = QComboBox(self)
+        self.provider_filter.setObjectName("modelSelectorProviderFilter")
+        self.provider_filter.addItem("All providers", None)
+        self.provider_filter.currentIndexChanged.connect(lambda _index: self._apply_filter(self.search_edit.text()))
+        catalogue.body_layout.addWidget(self.provider_filter)
         self.search_edit = _SearchEdit(self)
         self.search_edit.setObjectName("modelSelectorSearch")
         self.search_edit.setPlaceholderText("Filter models…")
@@ -403,26 +454,54 @@ class ModelSelectorPopup(QDialog):
         self.search_edit.textChanged.connect(self._apply_filter)
         self.search_edit.navigate.connect(self._move_current)
         self.search_edit.commit.connect(self._commit_current)
-        layout.addWidget(self.search_edit)
+        catalogue.body_layout.addWidget(self.search_edit)
 
         self.list = QListWidget(self)
         self.list.setObjectName("modelSelectorList")
+        self.list.setMinimumWidth(0)
+        self.list.setMinimumHeight(90)
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.list.currentItemChanged.connect(self._on_current_item_changed)
         self.list.itemActivated.connect(self._on_item_activated)
-        layout.addWidget(self.list, 1)
-
+        catalogue.body_layout.addWidget(self.list, 1)
+        selected = WorkPanel("Selected model / readiness", self)
         self.detail_card = ModelSelectorDetailCard(self)
-        layout.addWidget(self.detail_card)
+        # Keep selected identity outside the fact inspector's scroll region.
+        # The same title object is still updated by set_entry on selection.
+        self.detail_card._layout.removeWidget(self.detail_card._title)
+        selected.body_layout.addWidget(self.detail_card._title)
+        selected.body_layout.addWidget(scrollable(self.detail_card, selected), 1)
+        self._work_pair = PanelPair(
+            catalogue, selected, self, master_max_width=560,
+            master_weight=2, detail_weight=1, narrow_master_height=170,
+            breakpoint=480,
+        )
+        selected.setMinimumHeight(190)
+        layout.addWidget(scrollable(self._work_pair, self), 1)
 
-        footer = QHBoxLayout()
+        footer_frame = QFrame(self)
+        footer_frame.setObjectName("botsDialogFooter")
+        footer = QHBoxLayout(footer_frame)
+        footer.setContentsMargins(0, 8, 0, 8)
         self.status_label = QLabel("", self)
         self.status_label.setObjectName("modelSelectorStatus")
+        self.status_label.setWordWrap(True)
+        self.status_label.setMinimumWidth(0)
         footer.addWidget(self.status_label, 1)
         self.choose_button = QPushButton("Use model", self)
         self.choose_button.setObjectName("modelSelectorChoose")
         self.choose_button.clicked.connect(self._commit_current)
+        self.view_connection_button = QPushButton("View connection", self)
+        self.view_connection_button.clicked.connect(self._view_connection)
+        footer.addWidget(self.view_connection_button)
+        close_button = QPushButton("Cancel", self)
+        close_button.clicked.connect(self.reject)
+        footer.addWidget(close_button)
+        self.choose_button.setProperty("role", "primary")
         footer.addWidget(self.choose_button)
-        layout.addLayout(footer)
+        layout.addWidget(footer_frame)
+        self.resize(*PICKER_SIZE)
+        fit_dialog_to_screen(self)
 
     # -- population ---------------------------------------------------------
 
@@ -433,6 +512,14 @@ class ModelSelectorPopup(QDialog):
     ) -> None:
         self._entries = tuple(entries)
         self._selected_model_entry_id = selected_model_entry_id
+        prior = self.provider_filter.currentData()
+        self.provider_filter.blockSignals(True)
+        self.provider_filter.clear()
+        self.provider_filter.addItem("All providers", None)
+        for connection_id, name in dict((entry.connection_id, entry.connection_name) for entry in entries).items():
+            self.provider_filter.addItem(name, connection_id)
+        self.provider_filter.setCurrentIndex(max(0, self.provider_filter.findData(prior)))
+        self.provider_filter.blockSignals(False)
         self._apply_filter(self.search_edit.text())
 
     def _apply_filter(self, pattern: str) -> None:
@@ -441,17 +528,22 @@ class ModelSelectorPopup(QDialog):
         visible = [
             entry
             for entry in self._entries
-            if not needle
+            if (self.provider_filter.currentData() is None or entry.connection_id == self.provider_filter.currentData())
+            and (not needle
             or needle in entry.display_name.casefold()
             or needle in entry.provider_model_id.casefold()
-            or needle in entry.connection_name.casefold()
+            or needle in entry.connection_name.casefold())
         ]
+        groups: dict[str, list[ModelSelectorEntry]] = {}
+        for entry in visible:
+            groups.setdefault(entry.connection_id, []).append(entry)
+        visible = [entry for group in groups.values() for entry in group]
         current_connection: str | None = None
         for entry in visible:
             if entry.connection_id != current_connection:
                 current_connection = entry.connection_id
                 header = _build_header_widget(
-                    entry.connection_name, connection_health_state(entry), self
+                    entry.connection_name, connection_health_state(entry), self, entry
                 )
                 header_item = QListWidgetItem()
                 header_item.setFlags(Qt.ItemFlag.NoItemFlags)
@@ -479,7 +571,7 @@ class ModelSelectorPopup(QDialog):
         )
         total = len(self._entries)
         self.status_label.setText(
-            f"{shown_entries} of {total} models" if needle else f"{total} models"
+            f"{shown_entries} of {total} models" if needle or self.provider_filter.currentData() else f"{total} models"
         )
         self._sync_detail_card()
 
@@ -525,7 +617,17 @@ class ModelSelectorPopup(QDialog):
     def _sync_detail_card(self) -> None:
         self.detail_card.set_entry(self._current_entry())
         entry = self._current_entry()
+        self.choose_button.setProperty("role", "secondary" if entry is not None and model_readiness(entry)[0].startswith("Unavailable") else "primary")
+        self.choose_button.style().unpolish(self.choose_button)
+        self.choose_button.style().polish(self.choose_button)
+        self.choose_button.setText("Select unavailable model" if entry is not None and model_readiness(entry)[0].startswith("Unavailable") else "Use model")
         self.choose_button.setEnabled(entry is not None)
+        self.view_connection_button.setEnabled(entry is not None)
+
+    def _view_connection(self) -> None:
+        entry = self._current_entry()
+        if entry is not None:
+            self.view_connection_requested.emit(entry.connection_id)
 
     # -- API ----------------------------------------------------------------
 
@@ -559,16 +661,31 @@ class ModelSelectorButton(QFrame):
         text_column = QVBoxLayout()
         text_column.setContentsMargins(0, 0, 0, 0)
         text_column.setSpacing(0)
-        self.primary_label = QLabel("Selection required", self)
+        self.primary_label = ElidingLabel("Selection required", self)
         self.primary_label.setObjectName("modelSelectorButtonPrimary")
+        self.primary_label.setWordWrap(False)
+        self.primary_label.setMinimumWidth(0)
         text_column.addWidget(self.primary_label)
-        self.secondary_label = QLabel("", self)
+        self.secondary_label = ElidingLabel("", self)
         self.secondary_label.setObjectName("modelSelectorButtonSecondary")
+        self.secondary_label.setWordWrap(False)
+        self.secondary_label.setMinimumWidth(0)
         text_column.addWidget(self.secondary_label)
         layout.addLayout(text_column, 1)
         self.chevron = QLabel("▾", self)
         self.chevron.setObjectName("modelSelectorChevron")
-        layout.addWidget(self.chevron)
+        # Child consumes its own mouse/keyboard press; selector body remains
+        # the separate model-choice target.
+        selector_tools = QVBoxLayout()
+        selector_tools.setContentsMargins(0, 0, 0, 0)
+        selector_tools.setSpacing(0)
+        self.tune_button = QToolButton(self)
+        self.tune_button.setObjectName("modelTuneCog")
+        icon_action(self.tune_button, "cog", "Tune current model")
+        self.tune_button.setToolTip("Tune current model")
+        selector_tools.addWidget(self.tune_button, 0, Qt.AlignmentFlag.AlignRight)
+        selector_tools.addWidget(self.chevron, 0, Qt.AlignmentFlag.AlignRight)
+        layout.addLayout(selector_tools)
 
         self._entries: tuple[ModelSelectorEntry, ...] = ()
         self._current_index = -1

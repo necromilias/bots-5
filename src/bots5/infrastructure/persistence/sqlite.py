@@ -300,6 +300,7 @@ _PHASE9_OR_LATER_REVISIONS = frozenset(
         _PHASE11_INTEGRITY_HEAD,
         _PHASE11_SEARCH_HEAD,
         _PHASE11_GENERATION_SETTINGS_HEAD,
+        "0020_provider_managed_context",
     }
 )
 _PHASE8_WORKSPACE_COLUMN_TYPES = {
@@ -752,7 +753,7 @@ def _validate_attempt_outcome(
         outcome_error_message=attempt.error_message,
         phase3=phase3,
         phase5=(
-            (_is_persisted_phase5_attempt(attempt) or _is_persisted_phase6_attempt(attempt))
+            (_is_persisted_phase5_attempt(attempt) or _is_persisted_phase6_attempt(attempt) or _is_provider_managed_attempt(attempt))
             if phase5 is None
             else phase5
         ),
@@ -791,6 +792,14 @@ def _is_persisted_phase6_attempt(attempt: GenerationAttempt) -> bool:
     return isinstance(snapshot, dict) and snapshot.get("snapshot_version") == 3
 
 
+def _is_provider_managed_attempt(attempt: GenerationAttempt) -> bool:
+    try:
+        snapshot = json.loads(attempt.request_snapshot)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(snapshot, dict) and snapshot.get("snapshot_version") == 5 and snapshot.get("accounting_mode") == "provider-managed"
+
+
 def _validate_phase6_attempt_authority(connection, attempt: GenerationAttempt, branch_choice_context=None) -> None:
     """CAS-check every durable fact used by a frozen v3 plan.
 
@@ -804,7 +813,7 @@ def _validate_phase6_attempt_authority(connection, attempt: GenerationAttempt, b
         snapshot = json.loads(attempt.request_snapshot)
     except (TypeError, ValueError):
         return
-    if not isinstance(snapshot, dict) or snapshot.get("snapshot_version") != 3:
+    if not isinstance(snapshot, dict) or snapshot.get("snapshot_version") not in (3, 5):
         return
     connection_id = snapshot.get("connection_id")
     model_entry_id = snapshot.get("model_entry_id")
@@ -996,6 +1005,26 @@ def _validate_phase6_attempt_authority(connection, attempt: GenerationAttempt, b
             "source_revision": source_revision,
             "value": value,
         })
+    if snapshot.get("snapshot_version") == 5:
+        extra_revisions = {}
+        for name, table, clause, parameters in (
+            ("application", "application_generation_settings_extra", "id=1", ()),
+            ("model", "model_generation_settings_extra", "model_entry_id=?", (model_entry_id,)),
+            ("chat", "chat_model_generation_settings_extra", "chat_id=? AND model_entry_id=?", (attempt.chat_id, model_entry_id)),
+        ):
+            revision = connection.exec_driver_sql(f"SELECT revision FROM {table} WHERE {clause}", parameters).scalar_one_or_none()
+            extra_revisions[name] = 0 if revision is None and name == "application" else revision
+        actual_authority = {
+            "model_revision": connection.exec_driver_sql("SELECT revision FROM model_catalogue_entries WHERE id=?", (model_entry_id,)).scalar_one(),
+            "extra_revisions": extra_revisions,
+            "capability_overrides": {key:{"state":state,"revision":revision} for key,state,revision in connection.exec_driver_sql("SELECT capability_key,state,revision FROM generation_setting_capabilities WHERE model_entry_id=?", (model_entry_id,)).fetchall()},
+        }
+        if snapshot.get("generation_authority") != actual_authority:
+            raise StateError("provider-managed extended settings or capabilities changed before start")
+        alias_fields = [item[1].get("field") for item in facts if str(item[0]["capability_key"]) == "request.max_output_tokens" and item[0]["source"] == "provider_metadata"]
+        alias = "max_completion_tokens" if "supported_parameters.max_completion_tokens" in alias_fields and "supported_parameters.max_tokens" not in alias_fields else "max_tokens"
+        if snapshot.get("serialization") != {"max_output_parameter": alias, "catalogue_revision": catalogue_revision}:
+            raise StateError("provider-managed serialization mapping changed before start")
     if snapshot.get("capabilities") != resolved:
         raise StateError("Phase 6 capability facts changed before start")
     expected_provenance = snapshot.get("capability_provenance")
@@ -1157,6 +1186,9 @@ def _validate_open_connection(
         _validate_phase5_schema(connection)
         _validate_phase5_trigger_behavior(connection)
         validate_phase6_schema(connection, destructive=destructive_phase6)
+        if expected_revision == "0020_provider_managed_context":
+            from .provider_managed_schema import validate_schema
+            validate_schema(connection)
         if expected_revision in _PHASE9_OR_LATER_REVISIONS:
             # The frozen 0014 tombstone migration hardcodes its messages_validate_insert text and so
             # predates the 0015 duplicate-admission term in the canonical DDL.  Row validation still
@@ -1628,8 +1660,12 @@ def _validate_phase5_schema(connection) -> None:
             _PHASE5_SCHEMA_OBJECTS,
         ).fetchall()
     }
+    expected_schema = dict(_PHASE5_SCHEMA_SHA256)
+    if connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one_or_none() == "0020_provider_managed_context":
+        from .provider_managed_schema import attribution_guards
+        expected_schema.update({name: hashlib.sha256(_normalise_sql_fragment(sql).encode("utf-8")).hexdigest() for name, sql in attribution_guards().items()})
     for name in _PHASE5_SCHEMA_OBJECTS:
-        if current_schema.get(name) != _PHASE5_SCHEMA_SHA256.get(name):
+        if current_schema.get(name) != expected_schema.get(name):
             kind = "trigger" if name in _PHASE5_TRIGGER_MARKERS else "table"
             raise RuntimeError(
                 f"current Phase 5 schema {kind} is not migration-authoritative: {name}"
@@ -2099,17 +2135,18 @@ def _validate_phase5_rows(connection) -> None:
             raise RuntimeError("current Phase 5 capability observation timestamp is invalid")
         parse_utc(mapping["observed_at"])
 
+    attribution_versions = "2, 3, 5" if connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one_or_none() == "0020_provider_managed_context" else "2, 3"
     inconsistent_attempts = connection.execute(
         text(
             "SELECT COUNT(*) FROM generation_attempts AS a "
-                "WHERE (json_extract(a.request_snapshot, '$.snapshot_version') IN (2, 3) "
+                f"WHERE (json_extract(a.request_snapshot, '$.snapshot_version') IN ({attribution_versions}) "
             "AND (a.connection_id IS NULL OR a.model_entry_id IS NULL OR NOT EXISTS ("
             "SELECT 1 FROM model_catalogue_entries AS m "
             "JOIN provider_connections AS p ON p.id = m.connection_id "
             "WHERE m.id = a.model_entry_id AND m.connection_id = a.connection_id "
             "AND m.provider_model_id = json_extract(a.request_snapshot, '$.model') "
             "AND p.id = json_extract(a.request_snapshot, '$.connection_id')"
-                "))) OR (COALESCE(json_extract(a.request_snapshot, '$.snapshot_version'), 0) NOT IN (2, 3) "
+                f"))) OR (COALESCE(json_extract(a.request_snapshot, '$.snapshot_version'), 0) NOT IN ({attribution_versions}) "
             "AND (a.connection_id IS NOT NULL OR a.model_entry_id IS NOT NULL))"
         )
     ).scalar_one()
@@ -5844,6 +5881,9 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                         clear_transition(connection)
                     for attempt_id in attempt_ids:
                         connection.exec_driver_sql(
+                            "DELETE FROM provider_managed_context_plans WHERE attempt_id = ?", (attempt_id,),
+                        )
+                        connection.exec_driver_sql(
                             "DELETE FROM context_plans WHERE attempt_id = ?",
                             (attempt_id,),
                         )
@@ -7702,6 +7742,10 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                         }
                         for row in context_rows
                     }
+                    provider_managed_source = {}
+                    if connection.exec_driver_sql("SELECT 1 FROM sqlite_master WHERE name='provider_managed_context_plans' AND type='table'").first():
+                        for row in connection.exec_driver_sql("SELECT p.attempt_id,p.plan_json,p.created_at FROM provider_managed_context_plans p JOIN generation_attempts a ON a.id=p.attempt_id WHERE a.chat_id=? ORDER BY p.attempt_id", (chat_id,)).mappings():
+                            provider_managed_source[str(row['attempt_id'])] = dict(attempt_id=str(row['attempt_id']), accounting_mode='provider-managed', plan=json.loads(row['plan_json']), created_at=row['created_at'])
                     imported_context_rows = connection.exec_driver_sql(
                         "SELECT a.id,c.source_plan FROM archive_imported_context_plans c "
                         "JOIN archive_imported_attempts a ON a.id=c.attempt_id WHERE a.chat_id=?",
@@ -7716,7 +7760,10 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                             raise StateError("imported context evidence is malformed")
                         source_context = dict(source_context)
                         source_context["attempt_id"] = str(row["id"])
-                        context_source[str(row["id"])] = source_context
+                        if source_context.get("accounting_mode") == "provider-managed":
+                            provider_managed_source[str(row["id"])] = source_context
+                        else:
+                            context_source[str(row["id"])] = source_context
                     selection_row = connection.execute(
                         select(chat_model_selection).where(chat_model_selection.c.chat_id == chat_id)
                     ).first()
@@ -8014,10 +8061,14 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                         provenance = _archive_snapshot(
                             attempt, messages_by_id[attempt.user_message_id].content,
                         )
-                        if provenance.get("status") != "available" or provenance.get("snapshot_version") != 3:
+                        if provenance.get("status") != "available" or provenance.get("snapshot_version") not in (3, 5):
                             continue
                         context = provenance.get("context")
-                        sources = context.get("sources") if isinstance(context, dict) else None
+                        if provenance.get("snapshot_version") == 5:
+                            from bots5.infrastructure.archive_v3_context import safe_sources
+                            sources = safe_sources(provenance["provider_managed_plan"])
+                        else:
+                            sources = context.get("sources") if isinstance(context, dict) else None
                         if not isinstance(sources, list):
                             raise StateError("native safe context evidence is malformed")
                         for ordinal, source in enumerate(sources):
@@ -8055,6 +8106,9 @@ class SQLiteAppStateStore(Phase5StoreMixin):
                             })
                     history_bindings.sort(key=lambda item: (str(item["attempt_id"]), int(item["ordinal"])))
                     result = ChatExportSource(
+                        migration_revision=str(connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()),
+                        provider_managed_plans=provider_managed_source,
+                        requires_v3=bool(provider_managed_source) or any(hop.get("archive_version") == 3 for row in provenance_rows for hop in ([row["source"]["immediate"]] if row["source"]["immediate"] else []) + list(row["source"]["prior_chain"])),
                         chat=chat, messages=source_messages, attempts=source_attempts,
                         message_attachments=grouped(message_attachment_rows),
                         attempt_attachments=grouped(attempt_attachment_rows),
@@ -8530,27 +8584,32 @@ class SQLiteAppStateStore(Phase5StoreMixin):
             raise StateError("Phase 6 attachment selection requires a frozen context plan")
         try:
             wire_digest = hashlib.sha256(context_plan.wire_representation).hexdigest()
-            connection.execute(
-                insert(context_plans).values(
-                    attempt_id=attempt_id,
-                    plan_version=context_plan.version,
-                    canonical_representation=context_plan.canonical_representation,
-                    canonical_digest=context_plan.canonical_digest,
-                    wire_representation_digest=wire_digest,
-                    budget_limit=context_plan.budget.limit,
-                    budget_provenance=context_plan.budget.provenance,
-                    budget_semantics=context_plan.budget.semantics,
-                    adapter_id=context_plan.budget.adapter_id,
-                    adapter_version=context_plan.budget.adapter_version,
-                    input_counts=json.dumps(context_plan.input_counts, sort_keys=True, separators=(",", ":")),
-                    envelope_overhead=context_plan.budget.envelope_overhead,
-                    output_reserve=context_plan.budget.output_reserve,
-                    input_units=context_plan.budget.input_units,
-                    total_units=context_plan.budget.total_units,
-                    headroom=context_plan.budget.headroom,
-                    created_at=utc_iso(datetime.now(UTC)),
+            from bots5.core.provider_managed_context import ProviderManagedContextPlan
+            if isinstance(context_plan, ProviderManagedContextPlan):
+                from .provider_managed_schema import persist_plan
+                persist_plan(connection, attempt_id=attempt_id, plan=context_plan, created_at=utc_iso(datetime.now(UTC)))
+            else:
+                connection.execute(
+                    insert(context_plans).values(
+                        attempt_id=attempt_id,
+                        plan_version=context_plan.version,
+                        canonical_representation=context_plan.canonical_representation,
+                        canonical_digest=context_plan.canonical_digest,
+                        wire_representation_digest=wire_digest,
+                        budget_limit=context_plan.budget.limit,
+                        budget_provenance=context_plan.budget.provenance,
+                        budget_semantics=context_plan.budget.semantics,
+                        adapter_id=context_plan.budget.adapter_id,
+                        adapter_version=context_plan.budget.adapter_version,
+                        input_counts=json.dumps(context_plan.input_counts, sort_keys=True, separators=(",", ":")),
+                        envelope_overhead=context_plan.budget.envelope_overhead,
+                        output_reserve=context_plan.budget.output_reserve,
+                        input_units=context_plan.budget.input_units,
+                        total_units=context_plan.budget.total_units,
+                        headroom=context_plan.budget.headroom,
+                        created_at=utc_iso(datetime.now(UTC)),
+                    )
                 )
-            )
             source_by_id = {source.source_id: source for source in context_plan.sources}
             for ordinal, attachment_id in enumerate(attachment_ids):
                 source = source_by_id.get(attachment_id)

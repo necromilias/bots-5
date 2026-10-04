@@ -31,6 +31,8 @@ from PySide6.QtWidgets import (
     QWidget,
     QDialog,
     QDialogButtonBox,
+    QSizePolicy,
+    QBoxLayout,
 )
 
 
@@ -41,7 +43,18 @@ from bots5.core.campaign import (
     POLL_MAX_INTERVAL_MS,
 )
 
+from .dialog_primitives import (
+    ChamferedPanel, PanelPair, WorkPanel, normalize_dialog, scrollable, SectionHeader,
+)
 from .theme import (
+    PANEL_INSET,
+    ROW_GAP,
+    SURFACE_PANEL,
+    SURFACE_RAISED,
+    STATUS_SUCCESS,
+    STATUS_WARNING,
+    STATUS_ERROR,
+    ACCENT_STRUCTURE,
     CAMPAIGN_DOCK_PRICING_HEIGHT,
     CAMPAIGN_DOCK_PREFLIGHT_HEIGHT,
     CAMPAIGN_DOCK_RESULT_HEIGHT,
@@ -269,32 +282,50 @@ class CampaignDockWidget(QDockWidget):
         content = QWidget(self)
         content.setObjectName("campaignContent")
         layout = QVBoxLayout(content)
+        layout.setContentsMargins(PANEL_INSET, PANEL_INSET, PANEL_INSET, PANEL_INSET)
+        layout.setSpacing(ROW_GAP)
 
-        # Top section: job identity and controls
+        # Operational input and consent are separate work panels. Existing
+        # controls are reparented without touching the bridge command paths.
         job_section = self._build_job_section(content)
-        layout.addLayout(job_section)
+        job_items = [job_section.takeAt(0) for _ in range(job_section.count())]
+        job = WorkPanel("Job / pricing evidence", content)
+        preflight = WorkPanel("Preflight / approval", content)
+        for item in job_items[:4]:
+            job.body_layout.addWidget(item.widget())
+        preflight.body_layout.addWidget(job_items[4].widget())
+        preflight.body_layout.addWidget(job_items[5].widget())
+        approval_controls = job_items[6].layout()
+        approval_controls.setParent(None)
+        preflight.body_layout.addLayout(approval_controls)
+        layout.addWidget(PanelPair(job, preflight, content, master_max_width=560,
+                                   master_weight=1, detail_weight=1,
+                                   narrow_master_height=16_777_215))
 
-        # Run identity and status
+        run = WorkPanel("Run / stage outcomes", content)
         run_section = self._build_run_section(content)
-        layout.addLayout(run_section)
+        run.body_layout.addLayout(run_section)
 
         # Stages table
         stages_section = self._build_stages_section(content)
-        layout.addLayout(stages_section)
+        run.body_layout.addLayout(stages_section)
 
         # Cost line
         self._cost_label = QLabel("cost: unknown (no run active)", content)
         self._cost_label.setObjectName("campaignCostLabel")
         self._cost_label.setWordWrap(True)
-        layout.addWidget(self._cost_label)
+        run.body_layout.addWidget(self._cost_label)
 
         # Freshness and warnings
         freshness_section = self._build_freshness_section(content)
-        layout.addLayout(freshness_section)
+        run.body_layout.addLayout(freshness_section)
+        layout.addWidget(run)
 
         # Result inspection (expandable)
+        result = WorkPanel("Selected stage / result inspection", content)
         result_section = self._build_result_section(content)
-        layout.addLayout(result_section)
+        result.body_layout.addLayout(result_section)
+        layout.addWidget(result)
 
         # Status bar
         status_section = self._build_status_section(content)
@@ -302,9 +333,27 @@ class CampaignDockWidget(QDockWidget):
 
         # Bottom controls
         controls_section = self._build_controls_section(content)
-        layout.addLayout(controls_section)
-
-        self.setWidget(content)
+        shell = QWidget(self)
+        shell_layout = QVBoxLayout(shell)
+        shell_layout.setContentsMargins(0, 0, 0, 0)
+        shell_layout.setSpacing(8)
+        masthead = ChamferedPanel(shell, chamfer=8, header=True)
+        head_layout = QVBoxLayout(masthead)
+        head_layout.setContentsMargins(12, 8, 12, 8)
+        head_layout.addWidget(SectionHeader("Campaign", "Load a job, validate its routes, then approve the prepared operation.", masthead))
+        shell_layout.addWidget(masthead)
+        shell_layout.addWidget(scrollable(content, shell), 1)
+        footer = QFrame(shell)
+        footer.setObjectName("botsDialogFooter")
+        footer_layout = QVBoxLayout(footer)
+        footer_layout.setContentsMargins(PANEL_INSET, ROW_GAP, PANEL_INSET, ROW_GAP)
+        footer_layout.addLayout(controls_section)
+        shell_layout.addWidget(footer)
+        for button in shell.findChildren(QPushButton):
+            button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        self._fit_action_layouts()
+        self.setWidget(shell)
+        self.resize(1100, 540)
 
         # Polling timer
         self._poll_timer = QTimer(self)
@@ -334,11 +383,14 @@ class CampaignDockWidget(QDockWidget):
             '"input_usd_per_1m":"...","output_usd_per_1m":"...",'
             '"rate_source":"...","observed_at":"..."}]}'
         )
-        self._pricing_input.setMaximumHeight(CAMPAIGN_DOCK_PRICING_HEIGHT)
+        self._pricing_input.setFixedHeight(CAMPAIGN_DOCK_PRICING_HEIGHT)
         self._pricing_input.setToolTip(
             "Operator-supplied currently advertised rates, cited source, and observation time per paid route"
         )
         self._pricing_input.textChanged.connect(self._on_pricing_changed)
+        pricing_label = QLabel("Pricing evidence for paid routes (JSON)", parent)
+        pricing_label.setObjectName("botsFieldLabel")
+        section.addWidget(pricing_label)
         section.addWidget(self._pricing_input)
         self._pricing_status = QLabel("Pricing evidence required for paid routes", parent)
         self._pricing_status.setObjectName("campaignPricingStatus")
@@ -348,10 +400,12 @@ class CampaignDockWidget(QDockWidget):
         self._preflight_text = QTextEdit(parent)
         self._preflight_text.setObjectName("campaignPreflightSummary")
         self._preflight_text.setReadOnly(True)
-        self._preflight_text.setMaximumHeight(CAMPAIGN_DOCK_PREFLIGHT_HEIGHT)
+        self._preflight_text.setFixedHeight(100)
+        section.addWidget(QLabel("Preflight summary", parent))
         section.addWidget(self._preflight_text)
 
         job_controls = QHBoxLayout()
+        self._job_controls_layout = job_controls
         job_controls.setObjectName("campaignJobControls")
 
         self._load_job_button = QPushButton("Load Job", parent)
@@ -410,7 +464,11 @@ class CampaignDockWidget(QDockWidget):
         self._stages_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._stages_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         header = self._stages_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._stages_table.setMinimumHeight(150)
+        self._stages_table.setMaximumHeight(240)
+        self._stages_table.setAlternatingRowColors(True)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        header.resizeSection(0, 140)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
@@ -422,6 +480,7 @@ class CampaignDockWidget(QDockWidget):
         section.addWidget(self._stages_table, 1)
 
         stage_controls = QHBoxLayout()
+        self._stage_controls_layout = stage_controls
         stage_controls.setObjectName("campaignStageControls")
 
         self._make_current_button = QPushButton("Make current", parent)
@@ -469,6 +528,16 @@ class CampaignDockWidget(QDockWidget):
 
         return section
 
+    def _fit_action_layouts(self) -> None:
+        direction = QBoxLayout.Direction.TopToBottom if self.width() < 500 else QBoxLayout.Direction.LeftToRight
+        for layout in (self._job_controls_layout, self._stage_controls_layout):
+            layout.setDirection(direction)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if hasattr(self, "_stage_controls_layout"):
+            self._fit_action_layouts()
+
     def _build_result_section(self, parent: QWidget) -> QVBoxLayout:
         section = QVBoxLayout()
         section.setObjectName("campaignResultSection")
@@ -496,8 +565,9 @@ class CampaignDockWidget(QDockWidget):
 
         return section
 
-    def _build_controls_section(self, parent: QWidget) -> QVBoxLayout:
-        section = QVBoxLayout()
+    def _build_controls_section(self, parent: QWidget) -> QHBoxLayout:
+        section = QHBoxLayout()
+        section.addStretch(1)
         section.setObjectName("campaignControlsSection")
 
         self._cancel_button = QPushButton("Cancel", parent)
@@ -522,6 +592,7 @@ class CampaignDockWidget(QDockWidget):
             "Load Campaign Job",
             "",
             "Job files (*.yaml *.yml *.json);;All files (*)",
+            options=QFileDialog.Option.DontUseNativeDialog,
         )
         if not path:
             return
@@ -832,23 +903,20 @@ class CampaignDockWidget(QDockWidget):
         # The actual switching is handled by _on_make_current
         pass
 
-    def _state_color(self, state: str, provider_unknown: bool) -> int:
-        """Return Qt.GlobalColor value for state background."""
-        from PySide6.QtGui import QColor
-
-        if state == "succeeded":
-            return QColor(200, 230, 200)  # light green
-        if state == "failed":
-            if provider_unknown:
-                return QColor(255, 235, 205)  # amber for unknown
-            return QColor(255, 200, 200)  # light red
-        if state == "running":
-            return QColor(200, 220, 255)  # light blue
-        if state == "queued":
-            return QColor(240, 240, 240)  # light gray
-        if state == "cancelled":
-            return QColor(220, 220, 240)  # light purple
-        return QColor(255, 255, 255)  # white
+    def _state_color(self, state: str, provider_unknown: bool) -> QColor:
+        """Retain state tones with readable light text on graphite."""
+        base = QColor(SURFACE_PANEL)
+        tone = {
+            "succeeded": STATUS_SUCCESS,
+            "failed": STATUS_WARNING if provider_unknown else STATUS_ERROR,
+            "running": ACCENT_STRUCTURE,
+            "queued": SURFACE_RAISED,
+            "cancelled": SURFACE_RAISED,
+        }.get(state, SURFACE_RAISED)
+        accent = QColor(tone)
+        return QColor(round(base.red() * .8 + accent.red() * .2),
+                      round(base.green() * .8 + accent.green() * .2),
+                      round(base.blue() * .8 + accent.blue() * .2))
 
     # ------------------------------------------------------------------
     # Stage controls
@@ -973,6 +1041,7 @@ class CampaignDockWidget(QDockWidget):
         # Create a proper QDialog for model input
         dialog = QDialog(self)
         dialog.setWindowTitle("Regenerate Stage")
+        dialog.setObjectName("campaignRegenerationDialog")
         dialog_layout = QVBoxLayout(dialog)
 
         model_label = QLabel("New model:", dialog)
@@ -987,9 +1056,15 @@ class CampaignDockWidget(QDockWidget):
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
             dialog
         )
+        # normalize_dialog applies shared Cancel-before-primary action ordering.
         button_box.accepted.connect(dialog.accept)
         button_box.rejected.connect(dialog.reject)
-        dialog_layout.addWidget(button_box)
+        dialog_actions = QHBoxLayout()
+        dialog_actions.addStretch(1)
+        dialog_actions.addWidget(button_box)
+        dialog_layout.addLayout(dialog_actions)
+        button_box.button(QDialogButtonBox.StandardButton.Ok).setProperty("role", "primary")
+        normalize_dialog(dialog, size=(620, 340), description=f"Choose a replacement model for stage {stage_id}. This prepares regeneration; approval is still required.")
 
         if dialog.exec() != 1:  # QDialog.Accepted
             return

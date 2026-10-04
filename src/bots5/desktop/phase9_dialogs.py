@@ -49,6 +49,8 @@ from PySide6.QtWidgets import (
 )
 
 from bots5.core.export import AttachmentPolicy, TranscriptScope
+from .dialog_primitives import (ChamferedPanel, FittedWrappedLabel, SectionHeader, normalize_dialog,
+                                normalize_message_box, normalized_question)
 
 
 _MD_FILTER = "Markdown transcript (*.md)"
@@ -72,10 +74,95 @@ class _Phase9Dialog(QDialog):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._error_label = QLabel("", self)
+        self._error_label = FittedWrappedLabel("", self)
         self._error_label.setObjectName("phase9DialogError")
         self._error_label.setWordWrap(True)
         self._error_label.setVisible(False)
+
+    def _finish_ui(self, *, size: tuple[int, int] = (640, 480)) -> None:
+        """Keep outcome content scrollable and the existing actions reachable."""
+        self._group_controls()
+        actions = self.layout().itemAt(self.layout().count() - 1).layout()
+        if actions is not None:
+            # Cancel/Close stays beside the affirmative action in a predictable
+            # order; this changes no button signals or confirmation defaults.
+            buttons = [actions.itemAt(i).widget() for i in range(actions.count())]
+            cancel = next((b for b in buttons if isinstance(b, QPushButton)
+                           and b.text() in {"Cancel", "Close"}), None)
+            if cancel is not None:
+                actions.removeWidget(cancel)
+                actions.insertWidget(1, cancel)
+        for name in ("export_button", "import_button", "continue_button",
+                     "create_button", "verify_button"):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.setProperty("role", "primary")
+        normalize_dialog(self, size=size)
+
+    def _group_controls(self) -> None:
+        """Reparent existing controls into workflow sections without new intent.
+
+        Labels, values, signals, validation and final actions remain the same.
+        Outcome widgets remain outside the static groups so a hidden result
+        never leaves an empty result card or suppresses a later typed error.
+        """
+        boundaries = {
+            "transcriptExportDialog": (("scope_active_path", "Export scope"), ("@Destination", "Destination")),
+            "archiveExportDialog": (("@Attachment policy", "Archive options"), ("@Destination", "Destination")),
+            "archiveImportAdmissionDialog": (("@Archive package", "Source package"), ("@Resolver roots", "External file resolution"), ("import_as_archived", "Import options")),
+            "continuationResolutionDialog": (("source_truth_label", "Imported source"), ("@Active provider", "Local provider and model"), ("@Explicit generation settings", "Generation overrides"), ("missing_label", "Missing attachments and consent")),
+            "backupCreationDialog": (("@Destination", "Backup destination"), ("overwrite_checkbox", "Replacement consent")),
+            "backupVerificationDialog": (("@Backup package", "Package to verify"), ("@Expected backup identity", "Identity constraint")),
+            "restoreHandoffDialog": (("@Backup package", "Recovery source"), ("@Expected backup identity", "Identity constraint")),
+            "restoreHandoffResultDialog": (("headline_label", "Restore outcome"), ("data_root_label", "Installation"), ("detail_view", "Raw process output")),
+        }.get(self.objectName(), ())
+        if not boundaries:
+            return
+        layout = self.layout()
+        items = [layout.takeAt(0) for _ in range(layout.count())]
+        footer = items.pop()
+        target = layout
+        outcome_widgets = {self._error_label}
+        if self.objectName() != "restoreHandoffResultDialog":
+            outcome_widgets.update(widget for name in ("progress_label", "status_label", "summary_label")
+                                   if (widget := getattr(self, name, None)) is not None)
+        outcomes = [item.widget() for item in items if item.widget() in outcome_widgets]
+        outcomes_inserted = False
+        for item in items:
+            widget = item.widget()
+            if widget in outcome_widgets:
+                continue
+            title = next((title for anchor, title in boundaries
+                          if (anchor.startswith("@") and isinstance(widget, QLabel)
+                              and widget.text().startswith(anchor[1:]))
+                          or (not anchor.startswith("@") and widget is not None
+                              and widget is getattr(self, anchor, None))), None)
+            if title is not None:
+                if not outcomes_inserted:
+                    # A typed failure, progress update or retained receipt takes
+                    # priority over input controls when it becomes visible.
+                    for outcome in outcomes:
+                        layout.addWidget(outcome)
+                    outcomes_inserted = True
+                group = ChamferedPanel(self, card=True, chamfer=4)
+                group.setProperty("workflowSection", True)
+                target = QVBoxLayout(group)
+                target.setContentsMargins(12, 8, 12, 10)
+                target.setSpacing(6)
+                target.addWidget(SectionHeader(title, "", group))
+                layout.addWidget(group)
+            if widget is not None:
+                target.addWidget(widget)
+            elif item.layout() is not None:
+                item.layout().setParent(None)
+                target.addLayout(item.layout())
+            else:
+                target.addItem(item)
+        if footer.widget() is not None:
+            layout.addWidget(footer.widget())
+        elif footer.layout() is not None:
+            footer.layout().setParent(None)
+            layout.addLayout(footer.layout())
 
     def _add_error_label(self, layout: QVBoxLayout) -> None:
         layout.addWidget(self._error_label)
@@ -131,6 +218,7 @@ class TranscriptExportDialog(_Phase9Dialog):
         self.browse_button.setObjectName("transcriptExportBrowse")
         self.browse_button.clicked.connect(self.pick_destination)
         destination_row.addWidget(self.browse_button)
+        layout.addWidget(QLabel("Destination", self))
         layout.addLayout(destination_row)
         self._add_error_label(layout)
 
@@ -145,6 +233,7 @@ class TranscriptExportDialog(_Phase9Dialog):
         self.cancel_button.clicked.connect(self.reject)
         actions.addWidget(self.cancel_button)
         layout.addLayout(actions)
+        self._finish_ui(size=(620, 380))
 
     def scope(self) -> TranscriptScope:
         if self.scope_full_lineage.isChecked():
@@ -155,10 +244,11 @@ class TranscriptExportDialog(_Phase9Dialog):
         return self.destination_edit.text().strip()
 
     def pick_destination(self) -> None:
-        """Native picker seam; tests patch QFileDialog.getSaveFileName."""
+        """Themed Qt picker seam; tests patch QFileDialog.getSaveFileName."""
 
         path, _filter = QFileDialog.getSaveFileName(
-            self, "Export transcript", self.destination(), _MD_FILTER
+            self, "Export transcript", self.destination(), _MD_FILTER,
+            options=QFileDialog.Option.DontUseNativeDialog
         )
         if path:
             self.destination_edit.setText(path)
@@ -223,6 +313,7 @@ class ArchiveExportDialog(_Phase9Dialog):
         self.browse_button.setObjectName("archiveExportBrowse")
         self.browse_button.clicked.connect(self.pick_destination)
         destination_row.addWidget(self.browse_button)
+        layout.addWidget(QLabel("Destination", self))
         layout.addLayout(destination_row)
         self._add_error_label(layout)
 
@@ -237,6 +328,7 @@ class ArchiveExportDialog(_Phase9Dialog):
         self.cancel_button.clicked.connect(self.reject)
         actions.addWidget(self.cancel_button)
         layout.addLayout(actions)
+        self._finish_ui(size=(640, 460))
 
     def policy(self) -> AttachmentPolicy:
         return AttachmentPolicy(self.attachment_policy.currentData())
@@ -250,7 +342,8 @@ class ArchiveExportDialog(_Phase9Dialog):
 
     def pick_destination(self) -> None:
         path, _filter = QFileDialog.getSaveFileName(
-            self, "Export archive", self.destination(), _ARCHIVE_FILTER
+            self, "Export archive", self.destination(), _ARCHIVE_FILTER,
+            options=QFileDialog.Option.DontUseNativeDialog
         )
         if path:
             self.destination_edit.setText(path)
@@ -261,7 +354,7 @@ class ArchiveExportDialog(_Phase9Dialog):
 
         from PySide6.QtWidgets import QMessageBox
 
-        answer = QMessageBox.question(
+        answer = normalized_question(
             self,
             "Archive v2 required",
             "A lossless export of this chat requires Archive v2 because it "
@@ -319,11 +412,13 @@ class ArchiveImportAdmissionDialog(_Phase9Dialog):
         self.browse_button.setObjectName("archiveImportBrowse")
         self.browse_button.clicked.connect(self.pick_source)
         source_row.addWidget(self.browse_button)
+        layout.addWidget(QLabel("Archive package", self))
         layout.addLayout(source_row)
 
         layout.addWidget(QLabel("Resolver roots (optional, one-shot)", self))
         self.roots_list = QListWidget(self)
         self.roots_list.setObjectName("archiveImportResolverRoots")
+        self.roots_list.setFixedHeight(140)
         layout.addWidget(self.roots_list)
         roots_actions = QHBoxLayout()
         self.add_root_button = QPushButton("Add root…", self)
@@ -356,6 +451,10 @@ class ArchiveImportAdmissionDialog(_Phase9Dialog):
         self.cancel_button.clicked.connect(self.reject)
         actions.addWidget(self.cancel_button)
         layout.addLayout(actions)
+        self._finish_ui(size=(680, 600))
+        # The roots list is a bounded work surface; spare dialog height goes
+        # below the complete form, never between its label/control rows.
+        layout.addStretch(1)
 
     def source_path(self) -> str:
         return self.source_edit.text().strip()
@@ -367,10 +466,11 @@ class ArchiveImportAdmissionDialog(_Phase9Dialog):
         )
 
     def pick_source(self) -> None:
-        """Native picker seam; tests patch QFileDialog.getOpenFileName."""
+        """Themed Qt picker seam; tests patch QFileDialog.getOpenFileName."""
 
         path, _filter = QFileDialog.getOpenFileName(
-            self, "Import archive", self.source_path(), _ARCHIVE_FILTER
+            self, "Import archive", self.source_path(), _ARCHIVE_FILTER,
+            options=QFileDialog.Option.DontUseNativeDialog
         )
         if path:
             self.source_edit.setText(path)
@@ -378,7 +478,8 @@ class ArchiveImportAdmissionDialog(_Phase9Dialog):
 
     def add_resolver_root(self) -> None:
         directory = QFileDialog.getExistingDirectory(
-            self, "Add resolver root", "", QFileDialog.Option.ShowDirsOnly
+            self, "Add resolver root", "",
+            QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontUseNativeDialog
         )
         if not directory:
             return
@@ -626,7 +727,7 @@ class ContinuationResolutionDialog(_Phase9Dialog):
             self.missing_label.setWordWrap(True)
             layout.addWidget(self.missing_label)
             self.missing_acknowledgement = QCheckBox(
-                "Acknowledge the missing external attachments and continue without them",
+                "Continue without missing attachments",
                 self,
             )
             self.missing_acknowledgement.setObjectName("continuationMissingAcknowledgement")
@@ -646,6 +747,7 @@ class ContinuationResolutionDialog(_Phase9Dialog):
         self.cancel_button.clicked.connect(self.reject)
         actions.addWidget(self.cancel_button)
         layout.addLayout(actions)
+        self._finish_ui(size=(760, 680))
         self._sync_controls()
 
     # ------------------------------------------------------------------
@@ -865,6 +967,7 @@ class BackupCreationDialog(_Phase9Dialog):
         self.browse_button.setObjectName("backupCreationBrowse")
         self.browse_button.clicked.connect(self.pick_destination)
         destination_row.addWidget(self.browse_button)
+        layout.addWidget(QLabel("Destination", self))
         layout.addLayout(destination_row)
 
         self.overwrite_checkbox = QCheckBox("Overwrite existing package", self)
@@ -881,7 +984,7 @@ class BackupCreationDialog(_Phase9Dialog):
         self.progress_label.setVisible(False)
         layout.addWidget(self.progress_label)
 
-        self.summary_label = QLabel("", self)
+        self.summary_label = FittedWrappedLabel("", self)
         self.summary_label.setObjectName("backupCreationSummary")
         self.summary_label.setWordWrap(True)
         self.summary_label.setVisible(False)
@@ -898,6 +1001,7 @@ class BackupCreationDialog(_Phase9Dialog):
         self.cancel_button.clicked.connect(self.cancel)
         actions.addWidget(self.cancel_button)
         layout.addLayout(actions)
+        self._finish_ui(size=(680, 500))
 
     # ------------------------------------------------------------------
     # Selection
@@ -907,10 +1011,11 @@ class BackupCreationDialog(_Phase9Dialog):
         return self.destination_edit.text().strip()
 
     def pick_destination(self) -> None:
-        """Native picker seam; tests patch QFileDialog.getSaveFileName."""
+        """Themed Qt picker seam; tests patch QFileDialog.getSaveFileName."""
 
         path, _filter = QFileDialog.getSaveFileName(
-            self, "Create full backup", self.destination(), _BACKUP_FILTER
+            self, "Create full backup", self.destination(), _BACKUP_FILTER,
+            options=QFileDialog.Option.DontUseNativeDialog
         )
         if path:
             self.destination_edit.setText(path)
@@ -923,7 +1028,7 @@ class BackupCreationDialog(_Phase9Dialog):
             return
         overwrite = self.overwrite_checkbox.isChecked()
         if not overwrite and Path(destination).exists():
-            answer = QMessageBox.question(
+            answer = normalized_question(
                 self,
                 "Overwrite existing backup?",
                 f"{destination}\nalready exists.  Creating the backup with "
@@ -931,6 +1036,7 @@ class BackupCreationDialog(_Phase9Dialog):
                 "Overwrite it?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
+                destructive=True,
             )
             if answer != QMessageBox.StandardButton.Yes:
                 self.show_error(
@@ -1077,14 +1183,20 @@ class BackupVerificationDialog(_Phase9Dialog):
         self.browse_button.setObjectName("backupVerificationBrowse")
         self.browse_button.clicked.connect(self.pick_package)
         package_row.addWidget(self.browse_button)
+        layout.addWidget(QLabel("Backup package", self))
         layout.addLayout(package_row)
 
         self.expected_edit = QLineEdit(self)
         self.expected_edit.setObjectName("backupVerificationExpectedId")
         self.expected_edit.setPlaceholderText(
-            "Optional expected backup id (leave blank to skip the identity check)"
+            "Backup identity"
         )
+        layout.addWidget(QLabel("Expected backup identity (optional)", self))
         layout.addWidget(self.expected_edit)
+        identity_help = QLabel("Leave blank to use the package’s own verified identity.", self)
+        identity_help.setObjectName("botsHelp")
+        identity_help.setWordWrap(True)
+        layout.addWidget(identity_help)
         self._add_error_label(layout)
 
         self.status_label = QLabel("", self)
@@ -1093,7 +1205,7 @@ class BackupVerificationDialog(_Phase9Dialog):
         self.status_label.setVisible(False)
         layout.addWidget(self.status_label)
 
-        self.summary_label = QLabel("", self)
+        self.summary_label = FittedWrappedLabel("", self)
         self.summary_label.setObjectName("backupVerificationSummary")
         self.summary_label.setWordWrap(True)
         self.summary_label.setVisible(False)
@@ -1110,6 +1222,7 @@ class BackupVerificationDialog(_Phase9Dialog):
         self.cancel_button.clicked.connect(self.reject)
         actions.addWidget(self.cancel_button)
         layout.addLayout(actions)
+        self._finish_ui(size=(680, 460))
 
     # ------------------------------------------------------------------
     # Selection
@@ -1123,10 +1236,11 @@ class BackupVerificationDialog(_Phase9Dialog):
         return expected or None
 
     def pick_package(self) -> None:
-        """Native picker seam; tests patch QFileDialog.getOpenFileName."""
+        """Themed Qt picker seam; tests patch QFileDialog.getOpenFileName."""
 
         path, _filter = QFileDialog.getOpenFileName(
-            self, "Verify backup package", self.package_path(), _BACKUP_FILTER
+            self, "Verify backup package", self.package_path(), _BACKUP_FILTER,
+            options=QFileDialog.Option.DontUseNativeDialog
         )
         if path:
             self.package_edit.setText(path)
@@ -1321,15 +1435,20 @@ class RestoreHandoffDialog(_Phase9Dialog):
         self.browse_button.setObjectName("restoreHandoffBrowse")
         self.browse_button.clicked.connect(self.pick_package)
         package_row.addWidget(self.browse_button)
+        layout.addWidget(QLabel("Backup package", self))
         layout.addLayout(package_row)
 
         self.expected_edit = QLineEdit(self)
         self.expected_edit.setObjectName("restoreHandoffExpectedId")
         self.expected_edit.setPlaceholderText(
-            "Optional expected backup id (leave blank to accept the "
-            "package's own verified identity)"
+            "Backup identity"
         )
+        layout.addWidget(QLabel("Expected backup identity (optional)", self))
         layout.addWidget(self.expected_edit)
+        identity_help = QLabel("Leave blank to use the package’s own verified identity.", self)
+        identity_help.setObjectName("botsHelp")
+        identity_help.setWordWrap(True)
+        layout.addWidget(identity_help)
         self._add_error_label(layout)
 
         actions = QHBoxLayout()
@@ -1343,6 +1462,7 @@ class RestoreHandoffDialog(_Phase9Dialog):
         self.cancel_button.clicked.connect(self.reject)
         actions.addWidget(self.cancel_button)
         layout.addLayout(actions)
+        self._finish_ui(size=(680, 440))
 
     # ------------------------------------------------------------------
     # Selection
@@ -1356,10 +1476,11 @@ class RestoreHandoffDialog(_Phase9Dialog):
         return expected or None
 
     def pick_package(self) -> None:
-        """Native picker seam; tests patch QFileDialog.getOpenFileName."""
+        """Themed Qt picker seam; tests patch QFileDialog.getOpenFileName."""
 
         path, _filter = QFileDialog.getOpenFileName(
-            self, "Restore from backup", self.package_path(), _BACKUP_FILTER
+            self, "Restore from backup", self.package_path(), _BACKUP_FILTER,
+            options=QFileDialog.Option.DontUseNativeDialog
         )
         if path:
             self.package_edit.setText(path)
@@ -1387,6 +1508,14 @@ class RestoreHandoffDialog(_Phase9Dialog):
 
         box = self._build_consequence_message_box()
         box.exec()
+        clicked = box.clickedButton()
+        if clicked is not None:
+            # QMessageBox custom-button results are button indexes, not
+            # QDialog.Accepted. Only the existing explicit Proceed button
+            # carries AcceptRole; Cancel/Escape/window close cannot consent.
+            return box.buttonRole(clicked) == QMessageBox.ButtonRole.AcceptRole
+        # Preserve explicit programmatic acceptance used by the desktop
+        # harness; a dismissed real QMessageBox never returns Accepted here.
         return box.result() == QDialog.DialogCode.Accepted
 
     def _build_consequence_message_box(self) -> QMessageBox:
@@ -1401,6 +1530,7 @@ class RestoreHandoffDialog(_Phase9Dialog):
             _CANCEL_BUTTON_TEXT, QMessageBox.ButtonRole.RejectRole
         )
         box.setDefaultButton(cancel)
+        normalize_message_box(box, destructive=True)
         return box
 
 
@@ -1478,3 +1608,4 @@ class RestoreHandoffResultDialog(_Phase9Dialog):
         self.close_button.clicked.connect(self.accept)
         actions.addWidget(self.close_button)
         layout.addLayout(actions)
+        self._finish_ui(size=(760, 560))

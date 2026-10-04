@@ -16,8 +16,9 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.engine import Connection
+from sqlalchemy.exc import OperationalError
 
-from tests._authority_test_support import upgrade_to
+from tests._authority_test_support import downgrade_to, phase7_guarded_raw_mutation, upgrade_to
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -979,16 +980,18 @@ def test_message_state_exposes_the_tombstone(tmp_path: Path):
     assert MessageState.DELETED == "deleted"
 
 
-def test_0013_downgrade_drops_every_trigger_it_created(tmp_path: Path):
-    """A downgrade must not leave a trigger pointing at a dropped table."""
+def test_0013_upgrade_creates_the_organisation_triggers(tmp_path: Path):
+    """Check genuine 0013 upgrade objects; this provides no downgrade proof."""
     database = tmp_path / "state.sqlite3"
-    _upgrade_to_revision(database, HEAD)
+    _upgrade_to_revision(database, "0013_phase11_organisation")
 
-    engine = _engine_with_transition_guard(database)
-    with engine.connect() as conn:
+    with sqlite3.connect(database) as conn:
+        assert conn.execute("SELECT version_num FROM alembic_version").fetchone() == (
+            "0013_phase11_organisation",
+        )
         created = {
             str(row[0])
-            for row in conn.exec_driver_sql(
+            for row in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='trigger' "
                 "AND name LIKE 'phase11_%'"
             ).fetchall()
@@ -998,6 +1001,73 @@ def test_0013_downgrade_drops_every_trigger_it_created(tmp_path: Path):
         "phase11_is_pinned_check",
         "phase11_folder_delete_unfiles_members",
     }, f"unexpected Phase 11 trigger set: {created}"
+
+
+@pytest.mark.parametrize("populated", [False, True], ids=["empty", "populated"])
+def test_frozen_0013_downgrade_retains_accepted_partial_ddl_limitation(
+    tmp_path: Path, populated: bool
+):
+    """P11-02: unsupported reversal fails and leaves partial DDL, not 0012.
+
+    Mick accepted this historical limitation on 2026-10-04. Supported recovery
+    restores the prior source/backup; frozen 0013 is not a recovery procedure.
+    """
+    prior = "0012_phase9_archive_import"
+    organisation = "0013_phase11_organisation"
+    reference = tmp_path / "genuine-0012.sqlite3"
+    database = tmp_path / "downgrade-probe.sqlite3"
+    upgrade_to(reference, prior)
+    upgrade_to(database, prior)
+    with sqlite3.connect(reference) as conn:
+        reference_columns = {row[1] for row in conn.execute("PRAGMA table_info(chats)")}
+        assert not {"folder_id", "is_pinned"} & reference_columns
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE name IN ('folders', '_alembic_tmp_chats')"
+        ).fetchall() == []
+
+    if populated:
+        with sqlite3.connect(database) as conn:
+            with phase7_guarded_raw_mutation(conn, "test"):
+                conn.execute(
+                    "INSERT INTO chats(id, title, created_at, updated_at, revision) "
+                    "VALUES ('retained-chat', 'Retained', '2026-10-04T00:00:00.000Z', "
+                    "'2026-10-04T00:00:00.000Z', 0)"
+                )
+    upgrade_to(database, organisation)
+    triggers = {
+        "phase11_archive_clears_pin",
+        "phase11_is_pinned_check",
+        "phase11_folder_delete_unfiles_members",
+    }
+    with sqlite3.connect(database) as conn:
+        before_objects = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+        assert triggers | {"folders", "ix_chats_folder_id"} <= before_objects
+        assert "_alembic_tmp_chats" not in before_objects
+        assert conn.execute("SELECT version_num FROM alembic_version").fetchone() == (
+            organisation,
+        )
+        before_rows = conn.execute("SELECT * FROM chats ORDER BY id").fetchall()
+
+    with pytest.raises(
+        OperationalError,
+        match=r"error in trigger messages_active_head_parent_guard: no such table: main\.chats",
+    ) as failure:
+        downgrade_to(database, prior)
+    assert isinstance(failure.value.orig, sqlite3.OperationalError)
+    assert "ALTER TABLE _alembic_tmp_chats RENAME TO chats" in failure.value.statement
+
+    with sqlite3.connect(database) as conn:
+        assert conn.execute("SELECT version_num FROM alembic_version").fetchone() == (
+            organisation,
+        )
+        after_columns = {row[1] for row in conn.execute("PRAGMA table_info(chats)")}
+        assert after_columns == reference_columns | {"folder_id", "is_pinned"}
+        after_objects = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+        assert {"folders", "_alembic_tmp_chats"} <= after_objects
+        assert not (triggers | {"ix_chats_folder_id"}) & after_objects
+        assert conn.execute("SELECT * FROM chats ORDER BY id").fetchall() == before_rows
+        assert len(before_rows) == int(populated)
+        assert conn.execute("SELECT count(*) FROM _alembic_tmp_chats").fetchone() == (0,)
 
 
 def test_store_list_chats_floats_a_pinned_chat_to_the_top(tmp_path: Path):

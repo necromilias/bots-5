@@ -51,6 +51,12 @@ class ProviderHttpError(ProviderError):
         return 400 <= self.status_code < 500 and self.status_code not in (408, 429)
 
 
+class ContextAdmissionError(ProviderError):
+    """The provider rejected the selected context; no automatic rebudget/retry."""
+
+    definitive_rejection = True
+
+
 class ProviderResponseError(ProviderError):
     # A response WAS received (but is unusable): the provider-side outcome is
     # not unknown — displayed as failed-but-received, distinct from an

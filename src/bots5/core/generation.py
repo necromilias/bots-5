@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Protocol
+from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict
 
@@ -49,6 +49,8 @@ class GenerationRequest(BaseModel):
     system_prompt: str | None = None
     wire_representation: bytes | None = None
     context_plan_digest: str | None = None
+    accounting_mode: Literal["exact", "provider-managed", "developer-test"] | None = None
+    max_output_parameter: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

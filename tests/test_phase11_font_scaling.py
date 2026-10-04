@@ -7,7 +7,7 @@ These tests verify:
 - Theme stylesheet produces expected output
 - Campaign dock migrated from inline styles to tokens
 
-No test may be weakened, skipped, or deleted. This is additive-only.
+Colour assertions follow Mick's explicit colour-refinement authority; metric assertions remain unchanged.
 """
 
 from __future__ import annotations
@@ -24,17 +24,17 @@ from bots5.desktop.theme import (
 )
 
 
-def test_theme_tokens_preserve_draft1_colors():
-    """Verify semantic tokens use exact Draft 1 color values."""
-    # These must match the Draft 1 stylesheet exactly
+def test_theme_tokens_follow_colour_authority():
+    """Verify the shared palette uses the accepted colour targets."""
+    # These follow the explicit colour-refinement targets
     assert build_theme_stylesheet(scale=1.0).startswith("QWidget {")
-    # The stylesheet should contain key Draft 1 colors
+    # The stylesheet should contain the shared surface, frame and accent colours
     stylesheet = build_theme_stylesheet(scale=1.0)
-    assert "#11161b" in stylesheet  # SURFACE_BASE
-    assert "#171d24" in stylesheet  # SURFACE_PANEL
-    assert "#1b232b" in stylesheet  # SURFACE_BUBBLE
-    assert "#29343f" in stylesheet  # BORDER_DEFAULT
-    assert "#3b9ddd" in stylesheet  # ACCENT_BLUE
+    assert "#040B12" in stylesheet  # SURFACE_BASE
+    assert "#031120" in stylesheet  # SURFACE_PANEL
+    assert "#05101B" in stylesheet  # SURFACE_BUBBLE
+    assert "#21364C" in stylesheet  # BORDER_DEFAULT
+    assert "#0E67A5" in stylesheet  # ACCENT_BLUE
 
 
 def test_theme_scaling_produces_different_output_at_different_scales():
@@ -189,13 +189,8 @@ def test_apply_draft1_theme_function():
     apply_draft1_theme(app, scale=0.75)
 
 
-def test_stylesheet_byte_identical_at_scale_1():
-    """Verify theme produces Draft 1 output at scale 1.0.
-    
-    Note: This test checks the overall structure matches.
-    Exact byte-for-byte equivalence is maintained through
-    careful preservation of all values.
-    """
+def test_stylesheet_structure_preserved_at_scale_1():
+    """Verify the established selectors remain present at scale 1.0."""
     stylesheet = build_theme_stylesheet(scale=1.0)
     
     # Check key properties from Draft 1 are present
@@ -208,9 +203,9 @@ def test_stylesheet_byte_identical_at_scale_1():
     assert "QPlainTextEdit#composer {" in stylesheet
     assert "QPushButton#sendButton {" in stylesheet
     
-    # Check Draft 1 colors are preserved
-    assert "#11161b" in stylesheet  # base
-    assert "#171d24" in stylesheet  # panel
-    assert "#1b232b" in stylesheet  # bubble
-    assert "#29343f" in stylesheet  # border
-    assert "#3b9ddd" in stylesheet  # accent
+    # Check the current colour authority is applied
+    assert "#040B12" in stylesheet  # base
+    assert "#031120" in stylesheet  # panel
+    assert "#05101B" in stylesheet  # bubble
+    assert "#21364C" in stylesheet  # border
+    assert "#0E67A5" in stylesheet  # accent

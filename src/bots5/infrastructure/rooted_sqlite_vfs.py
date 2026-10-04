@@ -7,6 +7,7 @@ import ctypes
 import ctypes.util
 import os
 import sqlite3
+import sys
 import urllib.parse
 import uuid
 from pathlib import Path
@@ -27,8 +28,16 @@ def _load_library() -> ctypes.CDLL:
     configured = os.environ.get("BOTS5_ROOTED_VFS_LIBRARY")
     candidates = [] if configured is None else [Path(configured)]
     project = Path(__file__).resolve().parents[3]
+    # Nuitka standalone applications keep their executable and bundled data
+    # beside one another.  The package's __file__ is compiled into the
+    # executable, so the source-tree candidates below do not exist there.
+    # Keep the override first for controlled deployments, then resolve the
+    # library from the standalone payload without depending on the launch cwd.
+    bundle = Path(sys.executable).resolve().parent
     candidates.extend(
         (
+            bundle / "libbots5_rooted_sqlite_vfs.so",
+            bundle / "native" / "libbots5_rooted_sqlite_vfs.so",
             project / "build" / "native" / "libbots5_rooted_sqlite_vfs.so",
             project / "build" / "libbots5_rooted_sqlite_vfs.so",
         )

@@ -1,101 +1,104 @@
 """Theme system for B.O.T.S. Phase 11 M0.
 
 This module provides a tokenized theming system that enables scalable metrics
-and future theming while preserving the exact Draft 1 appearance at scale 1.0.
+and shared screenshot-authorized colour refinement.
 
 Token design principles:
-- Preserve all landed Draft 1 colours exactly (no visual regression)
+- Keep surface, frame, text, accent and status colours in shared tokens
 - Introduce semantic token layer (surface/panel/border/text/accent/status)
 - Parameterized stylesheet generator for configurable fonts and scaling
 - DPI rounding policy to avoid scattered int() casts
 - Campaign dock migration from inline styles to token rules
 
-The token values are derived from the existing DRAFT1_STYLE_SHEET and meet
-WCAG AA contrast requirements (verified at design acceptance R-14).
+The structural palette follows Mick's colour-refinement reference. Semantic
+status colours are retained; dimensions and scaling remain unchanged.
 
 No dependencies are added in M0; the system is built on existing Qt stylesheets.
 """
 
 from __future__ import annotations
 
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtGui import QColor, QGuiApplication, QPalette
 from PySide6.QtWidgets import QApplication
+from . import ui_icons  # Register bundled glyphs; no external asset lookup.
 
 
 # =============================================================================
 # Semantic token layer
 # =============================================================================
-# These are the exact hex values from Draft 1, preserved byte-for-byte.
-# The semantic layer provides meaningful names for future theming.
+# Shared palette and compatibility aliases for existing desktop widgets.
 # =============================================================================
 
-SURFACE_BASE = "#11161b"  # Main window background (DRAFT1: draft1Root)
-SURFACE_PANEL = "#171d24"  # TopBar, composerFrame, leftRail, dock widgets
-SURFACE_BUBBLE = "#1b232b"  # Message bubbles, composer, search input
-SURFACE_HISTORICAL = "#2a263c"  # Historical banner background
+# Mick's screenshot colour authority; all geometry and metrics remain unchanged.
+BASE_CANVAS = "#040B12"
+DEEP_PANEL = "#031120"
+RAISED_PANEL = "#05101B"
+HEADER_SURFACE = "#0B1A2A"
+HEADER_HIGH = "#1E344D"
+BORDER_SUBTLE = "#21364C"
+BORDER_STRONG = "#28405C"
+ACCENT_BLUE = "#0E67A5"
+ACCENT_BLUE_DARK = "#12395D"
+TEXT_PRIMARY = "#D9DBDB"
+TEXT_SECONDARY = "#A0A9B2"
+TEXT_MUTED = "#6B6E71"
+WARNING_SURFACE = "#34250D"
+WARNING_BORDER = "#96743A"
 
-BORDER_DEFAULT = "#29343f"  # Standard borders (DRAFT1: topBar border-bottom)
-BORDER_SUBTLE = "#33424e"  # Secondary borders (search inputs, composer)
-BORDER_ACCENT = "#3b9ddd"  # Active/selected state borders (DRAFT1: modelPill)
-BORDER_HISTORICAL = "#6d5fa0"  # Historical banner border
-BORDER_ACcent = "#2d6f99"  # User message bubble border
+# Shared role aliases keep existing widgets on the same palette.
+SURFACE_BASE = BASE_CANVAS
+SURFACE_PANEL = DEEP_PANEL
+SURFACE_BUBBLE = RAISED_PANEL
+SURFACE_SUNKEN = BASE_CANVAS
+SURFACE_CONTROL = RAISED_PANEL
+SURFACE_RAISED = RAISED_PANEL
+SURFACE_NAV = RAISED_PANEL
+BORDER_DEFAULT = BORDER_SUBTLE
+BORDER_HAIRLINE = BORDER_SUBTLE
+BORDER_ACCENT = ACCENT_BLUE
+BORDER_ACcent = ACCENT_BLUE_DARK  # Retained public spelling.
+TEXT_INACTIVE = TEXT_MUTED
+TEXT_DISABLED = TEXT_MUTED
+TEXT_ON_ACCENT = TEXT_PRIMARY
+ACCENT_BLUE_HOVER = ACCENT_BLUE_DARK
+ACCENT_BLUE_ACTIVE = ACCENT_BLUE
+ACCENT_BLUE_PILL = TEXT_PRIMARY
+ACCENT_BLUE_PRESSED = TEXT_PRIMARY
+ACCENT_STRUCTURE = ACCENT_BLUE
+ACCENT_STRUCTURE_DIM = ACCENT_BLUE_DARK
+ACCENT_STRUCTURE_PALE = TEXT_PRIMARY
 
-TEXT_PRIMARY = "#d9e2ea"  # Main body text (DRAFT1: QWidget color)
-TEXT_SECONDARY = "#aab8c4"  # Secondary labels, timestamps
-TEXT_INACTIVE = "#66727d"  # Disabled state text
-TEXT_DISABLED = "#6f7e8a"  # Empty state text
+# Preserve semantic status colours independently of the structural palette.
+SURFACE_HISTORICAL = "#2a263c"
+BORDER_HISTORICAL = "#6d5fa0"
+BORDER_GATED = "#4a3438"
+STATUS_SUCCESS = "#4caf50"
+STATUS_WARNING = "#ffc107"
+STATUS_HISTORICAL = "#d7cdfd"
+STATUS_BADGE = "#ffd79a"
+BADGE_ARCHIVE_BG = "#4a3520"
+BADGE_ARCHIVE_BORDER = "#9a6b32"
+BADGE_HISTORICAL_BG = "#4a3520"
+BADGE_HISTORICAL_BORDER = "#9a6b32"
+STATUS_OK = "#5dbb7a"
+STATUS_WARN = "#c9a54a"
+STATUS_ERROR = "#d97780"
+WARNING_TEXT = "#fff2cf"
 
-ACCENT_BLUE = "#3b9ddd"  # Primary accent (DRAFT1: modelPill border, sendButton)
-ACCENT_BLUE_HOVER = "#1c78ad"  # Hover state for blue actions
-ACCENT_BLUE_ACTIVE = "#17618e"  # Active/pressed blue state
-ACCENT_BLUE_PILL = "#8ed2ff"  # Pill text color
-ACCENT_BLUE_PRESSED = "#a8ddff"  # Pressed blue text
-
-STATUS_SUCCESS = "#4caf50"  # Success state
-STATUS_WARNING = "#ffc107"  # Warning state (amber)
-STATUS_ERROR = "#f44336"  # Error state
-STATUS_HISTORICAL = "#d7cdfd"  # Historical view label text
-STATUS_BADGE = "#ffd79a"  # Badge text (archived/historical)
-
-BADGE_ARCHIVE_BG = "#4a3520"  # Archived badge background
-BADGE_ARCHIVE_BORDER = "#9a6b32"  # Archived badge border
-BADGE_HISTORICAL_BG = "#4a3520"  # Historical badge background (same as archive)
-BADGE_HISTORICAL_BORDER = "#9a6b32"  # Historical badge border (same as archive)
-
-# =============================================================================
-# Phase 11 scope amendment: industrial surface / framing tokens
-# =============================================================================
-# Additive layered-work-surface and machine-framing tokens.  The retained
-# Draft 1 tokens above are untouched: base #11161b, panel #171d24,
-# bubble #1b232b, border #29343f, accent #3b9ddd.  The new layer builds ON
-# them: layered graphite surfaces (never pure black), hairline 1px framing
-# with chamfered machine-built geometry, restrained accent for active or
-# selected structure only, and status colour strictly subordinate.
-# =============================================================================
-
-SURFACE_SUNKEN = "#0d1216"  # Deep inset work surface (near-black, not pure black)
-SURFACE_CONTROL = "#121920"  # Input wells: line edits, spin boxes, combo boxes
-SURFACE_RAISED = "#1e262e"  # Layered card surface sitting above panel
-SURFACE_NAV = "#141b22"  # Navigation rail / section band surface
-
-BORDER_STRONG = "#3a4a58"  # Emphasized hairline for section frames
-BORDER_HAIRLINE = "#29343f"  # Alias of the retained default hairline border
-BORDER_GATED = "#4a3438"  # Disabled/gated control framing (muted, not red)
-
-ACCENT_STRUCTURE = "#3b9ddd"  # Retained accent: active/selected structure only
-ACCENT_STRUCTURE_DIM = "#2d6f99"  # Subordinate accent for hover on structure
-ACCENT_STRUCTURE_PALE = "#8ed2ff"  # Accent text on accent frames (retained pill tone)
-
-TEXT_MUTED = "#8fa0ad"  # Tertiary text: provenance, reasons, instrumentation
-TEXT_ON_ACCENT = "#d8f0ff"  # Text on accent-selected surfaces
-
-STATUS_OK = "#5dbb7a"  # Subordinate success tone (never decoration)
-STATUS_WARN = "#c9a54a"  # Subordinate warning tone (never decoration)
-STATUS_ERROR = "#d97780"  # Subordinate error tone (never decoration)
-
-CHAMFER_SIZE = 6  # Base chamfer cut size for machine-built panel corners (px @1.0)
+CHAMFER_SIZE = 4  # Base chamfer cut size for machine-built panel corners (px @1.0)
 CHAMFER_SIZE_SMALL = 4  # Chamfer cut for compact cards (px @1.0)
 
+
+# Presentation metrics shared by the desktop and secondary surfaces.
+PANEL_INSET = 12
+ROW_GAP = 7
+SECTION_GAP = 16
+CONTROL_HEIGHT = 30
+DIALOG_INSET = 16
+MAIN_SIZE = (1280, 800)
+SETTINGS_SIZE = (1080, 760)
+TUNE_SIZE = (880, 700)
+PICKER_SIZE = (820, 620)
 
 # =============================================================================
 # Scalable metrics (base values)
@@ -240,8 +243,8 @@ def build_theme_stylesheet(
 ) -> str:
     """Build a parameterized stylesheet from semantic tokens.
     
-    At scale 1.0 with default fonts, this produces byte-identical output
-    to the original Draft 1 stylesheet.
+    Phase 11 recomposition adds shared shell and dialog rules to the landed
+    palette, with configurable metrics and fonts.
     
     Args:
         scale: Scaling factor for all metrics (1.0 = original size)
@@ -308,7 +311,7 @@ def build_theme_stylesheet(
     border_width = scale_value(1, scale)
     
     # Build the stylesheet
-    # At scale 1.0 with default font config, produce byte-identical output to Draft 1
+    # Default font-family remains platform-selected unless explicitly configured.
     # Only include font-family if it differs from the original (no font-family in Draft 1)
     font_family_clause = ""
     if font_config.transcript_family != "System UI":
@@ -321,6 +324,9 @@ def build_theme_stylesheet(
 QMainWindow, QWidget#draft1Root {{
     background: {SURFACE_BASE};
 }}
+QLabel#developerProviderTestBanner {{
+    background: {WARNING_SURFACE}; color: {WARNING_TEXT}; border: 2px solid {WARNING_BORDER}; padding: 8px; font-weight: bold;
+}}
 QFrame#topBar, QFrame#composerFrame, QWidget#leftRail, QDockWidget > QWidget {{
     background: {SURFACE_PANEL};
 }}
@@ -328,12 +334,12 @@ QFrame#topBar {{
     border-bottom: {border_width}px solid {BORDER_DEFAULT};
 }}
 QLabel#brandLabel {{
-    color: #f2f7fb;
+    color: {TEXT_PRIMARY};
     font-size: {font_size_2xlarge}px;
     font-weight: 700;
 }}
 QLabel#modelPill {{
-    background: #202b36;
+    background: {HEADER_SURFACE};
     border: {border_width}px solid {ACCENT_BLUE};
     border-radius: {radius_3xl}px;
     color: {ACCENT_BLUE_PILL};
@@ -368,15 +374,15 @@ QToolButton, QPushButton {{
     background: transparent;
     border: {border_width}px solid transparent;
     border-radius: {radius_medium}px;
-    color: #c5d0d9;
+    color: {TEXT_SECONDARY};
     padding: {scale_value(5, scale)}px {scale_value(8, scale)}px;
 }}
 QToolButton:hover, QPushButton:hover {{
-    background: #233342;
-    border-color: #31536a;
+    background: {HEADER_SURFACE};
+    border-color: {BORDER_STRONG};
 }}
 QToolButton:checked, QPushButton:pressed {{
-    background: #18354a;
+    background: {ACCENT_BLUE_DARK};
     border-color: {ACCENT_BLUE};
     color: {ACCENT_BLUE_PRESSED};
 }}
@@ -390,17 +396,17 @@ QToolButton#railIcon {{
     min-height: {scale_value(28, scale)}px;
     max-height: {scale_value(28, scale)}px;
     padding: 0;
-    background: #202a34;
-    border-color: #2a3946;
+    background: {HEADER_SURFACE};
+    border-color: {BORDER_STRONG};
 }}
 QToolButton#railIcon:hover, QToolButton#railIcon:checked {{
-    background: #173a52;
+    background: {ACCENT_BLUE_DARK};
     border-color: {ACCENT_BLUE};
     color: {ACCENT_BLUE_PRESSED};
 }}
 QToolButton#disabledAffordance {{
-    background: #1b2229;
-    border-color: #27313a;
+    background: {RAISED_PANEL};
+    border-color: {BORDER_STRONG};
 }}
 QListWidget#chatList {{
     background: transparent;
@@ -413,8 +419,8 @@ QListWidget#chatList::item {{
     padding: {scale_value(7, scale)}px {scale_value(8, scale)}px;
 }}
 QListWidget#chatList::item:selected {{
-    background: #1a3b52;
-    color: #d8f0ff;
+    background: {ACCENT_BLUE_DARK};
+    color: {TEXT_PRIMARY};
 }}
 QScrollArea#transcriptView {{
     background: {SURFACE_BASE};
@@ -425,18 +431,18 @@ QWidget#transcriptContent {{
 }}
 QFrame#messageBubble {{
     background: {SURFACE_BUBBLE};
-    border: {border_width}px solid #2b3945;
+    border: {border_width}px solid {BORDER_STRONG};
     border-radius: {radius_2xl}px;
 }}
 QFrame#messageBubble[role="user"] {{
-    background: #193247;
+    background: {ACCENT_BLUE_DARK};
     border-color: {BORDER_ACcent};
 }}
 QLabel#messageBody {{
-    color: #dce6ed;
+    color: {TEXT_PRIMARY};
 }}
 QLabel#messageState {{
-    color: #7f93a2;
+    color: {TEXT_SECONDARY};
     font-size: {font_size_small}px;
 }}
 QLabel#messageActivity, QLabel#generationIndicator {{
@@ -448,12 +454,12 @@ QLabel#messageActivity {{
     padding-top: {scale_value(1, scale)}px;
 }}
 QFrame#messageBubble[generationActive="true"] {{
-    background: #1c3b52;
+    background: {ACCENT_BLUE_DARK};
     border-color: {ACCENT_BLUE};
 }}
 QFrame#messageBubble[searchFocus="true"] {{
-    border: {scale_value(2, scale)}px solid #70c7ff;
-    background: #213c4e;
+    border: {scale_value(2, scale)}px solid {ACCENT_BLUE};
+    background: {ACCENT_BLUE_DARK};
 }}
 QLabel#assistantAvatar, QLabel#userAvatar {{
     border-radius: {radius_large}px;
@@ -462,12 +468,12 @@ QLabel#assistantAvatar, QLabel#userAvatar {{
     qproperty-alignment: AlignCenter;
 }}
 QLabel#assistantAvatar {{
-    background: #1e4f6d;
-    color: #a9defd;
+    background: {ACCENT_BLUE_DARK};
+    color: {TEXT_PRIMARY};
 }}
 QLabel#userAvatar {{
-    background: #344553;
-    color: #e3edf4;
+    background: {HEADER_SURFACE};
+    color: {TEXT_PRIMARY};
 }}
 QFrame#composerFrame {{
     border-top: {border_width}px solid {BORDER_DEFAULT};
@@ -476,9 +482,9 @@ QPlainTextEdit#composer {{
     background: {SURFACE_BUBBLE};
     border: {border_width}px solid {BORDER_SUBTLE};
     border-radius: {radius_xl}px;
-    color: #e5edf2;
+    color: {TEXT_PRIMARY};
     padding: {scale_value(7, scale)}px;
-    selection-background-color: #245d80;
+    selection-background-color: {ACCENT_BLUE_DARK};
 }}
 QPlainTextEdit#composer:focus {{
     border-color: {ACCENT_BLUE};
@@ -486,7 +492,7 @@ QPlainTextEdit#composer:focus {{
 QPushButton#sendButton {{
     background: {ACCENT_BLUE_ACTIVE};
     border-color: {ACCENT_BLUE};
-    color: #eff9ff;
+    color: {TEXT_PRIMARY};
     font-weight: 700;
     padding: {padding_large}px {padding_4xl}px;
 }}
@@ -513,7 +519,7 @@ QDockWidget::title {{
     padding: {padding_medium}px;
 }}
 QLabel#inspectorValue {{
-    color: #becbd4;
+    color: {TEXT_SECONDARY};
 }}
 QLabel#emptyTranscript {{
     color: {TEXT_DISABLED};
@@ -523,7 +529,7 @@ QWidget#searchPanel {{
     background: {SURFACE_PANEL};
 }}
 QLabel#searchTitle {{
-    color: #f2f7fb;
+    color: {TEXT_PRIMARY};
     font-size: {font_size_xlarge}px;
     font-weight: 700;
 }}
@@ -532,7 +538,7 @@ QComboBox#searchState, QListWidget#searchResults {{
     background: {SURFACE_BASE};
     border: {border_width}px solid {BORDER_SUBTLE};
     border-radius: {radius_small}px;
-    color: #dce6ed;
+    color: {TEXT_PRIMARY};
     padding: {scale_value(5, scale)}px;
 }}
 QListWidget#searchResults::item {{
@@ -540,7 +546,7 @@ QListWidget#searchResults::item {{
     padding: {scale_value(8, scale)}px {scale_value(5, scale)}px;
 }}
 QListWidget#searchResults::item:selected {{
-    background: #1a3b52;
+    background: {ACCENT_BLUE_DARK};
 }}
 QLabel#searchStatus {{
     color: {TEXT_SECONDARY};
@@ -599,7 +605,7 @@ QTableWidget#campaignStagesTable::item {{
     padding: {scale_value(4, scale)}px;
 }}
 QTableWidget#campaignStagesTable::item:selected {{
-    background: #1a3b52;
+    background: {ACCENT_BLUE_DARK};
     color: {TEXT_PRIMARY};
 }}
 QTextEdit#campaignPricingEvidence {{
@@ -634,7 +640,7 @@ QPushButton#campaignLoadJobButton:hover, QPushButton#campaignValidateButton:hove
 QPushButton#campaignApproveButton:hover, QPushButton#campaignClearButton:hover,
 QPushButton#campaignMakeCurrentButton:hover, QPushButton#campaignRegenerateButton:hover,
 QPushButton#campaignRerunSynthesisButton:hover, QPushButton#campaignCancelButton:hover {{
-    background: #233342;
+    background: {HEADER_SURFACE};
     border-color: {ACCENT_BLUE};
 }}
 QPushButton#campaignLoadJobButton:disabled, QPushButton#campaignValidateButton:disabled,
@@ -649,7 +655,7 @@ QPushButton#campaignApproveButton {{
     color: {ACCENT_BLUE_PILL};
 }}
 QPushButton#campaignApproveButton:hover {{
-    background: #1c78ad;
+    background: {ACCENT_BLUE};
 }}
 """
     
@@ -672,28 +678,28 @@ QFrame#botsChamferedCard {{
     border: {border_width}px solid {BORDER_DEFAULT};
 }}
 QLabel#botsSectionTitle {{
-    color: #f2f7fb;
+    color: {TEXT_PRIMARY};
     font-size: {font_size_medium}px;
     font-weight: 700;
     letter-spacing: 1px;
 }}
 QLabel#botsSectionSubtitle {{
-    color: {TEXT_MUTED};
+    color: {TEXT_SECONDARY};
     font-size: {font_size_small}px;
 }}
 QLabel#botsFieldLabel {{
     color: {TEXT_SECONDARY};
 }}
 QLabel#botsReason {{
-    color: {TEXT_INACTIVE};
+    color: {TEXT_SECONDARY};
     font-size: {font_size_small}px;
 }}
 QLabel#botsProvenance {{
-    color: {TEXT_MUTED};
+    color: {TEXT_SECONDARY};
     font-size: {font_size_small}px;
 }}
 QLabel#botsStateBadge {{
-    color: {TEXT_MUTED};
+    color: {TEXT_SECONDARY};
     border: {border_width}px solid {BORDER_DEFAULT};
     padding: 0 {padding_small}px;
     font-size: {font_size_small}px;
@@ -727,9 +733,9 @@ QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QPlainTextEdit {{
     background: {SURFACE_CONTROL};
     border: {border_width}px solid {BORDER_DEFAULT};
     border-radius: 0px;
-    color: #dce6ed;
+    color: {TEXT_PRIMARY};
     padding: {padding_small}px {padding_medium}px;
-    selection-background-color: #245d80;
+    selection-background-color: {ACCENT_BLUE_DARK};
 }}
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QPlainTextEdit:focus {{
     border-color: {ACCENT_STRUCTURE};
@@ -749,7 +755,7 @@ QCheckBox:disabled {{
 QPushButton#botsPrimaryAction {{
     background: {ACCENT_BLUE_ACTIVE};
     border: {border_width}px solid {ACCENT_STRUCTURE};
-    color: #eff9ff;
+    color: {TEXT_PRIMARY};
     font-weight: 700;
     padding: {padding_medium}px {padding_4xl}px;
     border-radius: 0px;
@@ -790,11 +796,143 @@ QLabel#botsInstrumentValue {{
     font-size: {font_size_small}px;
 }}
 QLabel#botsInstrumentLabel {{
-    color: {TEXT_MUTED};
+    color: {TEXT_SECONDARY};
     font-size: {font_size_small}px;
 }}
 """
     
+    # Complete the common Qt surface palette. App-owned pop-outs and item
+    # views must share the working-panel language, including Qt popup views.
+    stylesheet += f"""
+QPlainTextEdit#botsConfirmationText {{ background: transparent; border: none; padding: 0; }}
+QDialog, QMessageBox, QFileDialog {{ background: {SURFACE_BASE}; }}
+QDialog[botsOwnedDialog="true"] {{ border: 1px solid {BORDER_STRONG}; }}
+QWidget#workspace, QWidget#leftRail, QWidget#inspectorPanel {{
+    background: {SURFACE_PANEL}; border: 1px solid {BORDER_DEFAULT};
+}}
+QFrame#topBar {{ background: {SURFACE_NAV}; border: 1px solid {BORDER_DEFAULT}; }}
+QLabel#brandLabel {{ font-size: {scale_value(18, scale)}px; }}
+QLabel#shellContext {{ color: {TEXT_SECONDARY}; }}
+QLabel#chatTitle {{ color: {TEXT_PRIMARY}; font-weight: 600; }}
+QLabel#emptyTranscript {{ color: {TEXT_SECONDARY}; font-size: {font_size_large}px; padding: {scale_value(12, scale)}px; }}
+QListWidget, QTreeView, QTableView, QAbstractItemView {{
+    background: {SURFACE_CONTROL}; alternate-background-color: {SURFACE_PANEL};
+    color: {TEXT_PRIMARY}; border: 1px solid {BORDER_DEFAULT};
+    selection-background-color: {ACCENT_BLUE_DARK}; selection-color: {TEXT_ON_ACCENT}; outline: 0;
+}}
+QListWidget::item {{ padding: {scale_value(7, scale)}px; }}
+QListWidget::item:selected {{ background: {ACCENT_BLUE_DARK}; color: {TEXT_ON_ACCENT}; }}
+QHeaderView::section {{ background: {SURFACE_RAISED}; color: {TEXT_SECONDARY};
+    border: 0; border-bottom: 1px solid {BORDER_DEFAULT}; padding: {scale_value(7, scale)}px;
+}}
+QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
+    background: {SURFACE_CONTROL}; color: {TEXT_PRIMARY};
+    border: 1px solid {BORDER_SUBTLE}; border-radius: 2px;
+    padding: {scale_value(5, scale)}px; selection-background-color: {ACCENT_BLUE_DARK};
+}}
+QLineEdit:focus, QPlainTextEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {{
+    border-color: {ACCENT_STRUCTURE_DIM};
+}}
+QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled {{
+    color: {TEXT_INACTIVE}; background: {SURFACE_BASE}; border-color: {BORDER_DEFAULT};
+}}
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{ image: url(:/bots/icons/up.svg); width: 10px; height: 6px; }}
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{ image: url(:/bots/icons/down.svg); width: 10px; height: 6px; }}
+QComboBox QAbstractItemView {{ background: {SURFACE_CONTROL}; color: {TEXT_PRIMARY}; }}
+QToolButton, QPushButton {{ border-radius: 2px; }}
+QPushButton {{ background: {SURFACE_RAISED}; border: 1px solid {BORDER_STRONG}; }}
+QPushButton:disabled {{ background: {SURFACE_PANEL}; border-color: {BORDER_DEFAULT}; color: {TEXT_INACTIVE}; }}
+QPushButton[role="primary"] {{ background: {ACCENT_BLUE_DARK}; border-color: {ACCENT_STRUCTURE_DIM}; color: {TEXT_ON_ACCENT}; }}
+QPushButton[role="destructive"] {{ background: #302226; border-color: #74515a; color: #e8b9be; }}
+QScrollBar:vertical {{ background: {SURFACE_BASE}; width: {scale_value(10, scale)}px; margin: 0; }}
+QScrollBar:horizontal {{ background: {SURFACE_BASE}; height: {scale_value(10, scale)}px; margin: 0; }}
+QScrollBar::handle {{ background: {BORDER_STRONG}; min-height: {scale_value(24, scale)}px; min-width: {scale_value(24, scale)}px; }}
+QScrollBar::handle:hover {{ background: {TEXT_INACTIVE}; }}
+QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
+QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
+QMenu, QMenuBar {{ background: {SURFACE_NAV}; color: {TEXT_SECONDARY}; border: 0; }}
+QMenu::item {{ padding: {scale_value(7, scale)}px {scale_value(18, scale)}px; }}
+QMenu::item:selected, QMenuBar::item:selected {{ background: {ACCENT_BLUE_DARK}; color: {TEXT_PRIMARY}; }}
+QMenu::item:disabled, QMenu::item:disabled:selected {{ color: {TEXT_INACTIVE}; background: {SURFACE_NAV}; }}
+QMainWindow#botsMainWindow {{ border: 1px solid {BORDER_STRONG}; background: {SURFACE_BASE}; }}
+QToolButton[iconOnly="true"], QPushButton[iconOnly="true"] {{ padding: 4px; min-width: 20px; min-height: 20px; }}
+QToolButton[iconOnly="true"]:hover, QPushButton[iconOnly="true"]:hover {{ background: {ACCENT_BLUE_DARK}; border-color: {ACCENT_STRUCTURE_DIM}; }}
+QToolButton[iconOnly="true"]:focus, QPushButton[iconOnly="true"]:focus {{ border: 1px solid {ACCENT_STRUCTURE}; }}
+QToolButton[iconOnly="true"]:pressed, QPushButton[iconOnly="true"]:pressed {{ background: {ACCENT_BLUE_DARK}; }}
+QToolButton#modelTuneCog {{ background: transparent; border-color: transparent; }}
+QToolButton#modelTuneCog:hover, QToolButton#modelTuneCog:focus {{ background: {ACCENT_BLUE_DARK}; border-color: {ACCENT_STRUCTURE_DIM}; }}
+QToolButton#windowClose:hover, QToolButton#dialogClose:hover {{ background: #62333d; border-color: #97515e; }}
+QPushButton#stopButton:enabled {{ background: #42272e; border-color: #995562; }}
+
+QMenu::separator {{ height: 1px; background: {BORDER_DEFAULT}; margin: 4px; }}
+QStatusBar {{ background: {SURFACE_NAV}; color: {TEXT_SECONDARY}; border-top: 1px solid {BORDER_DEFAULT}; }}
+QFrame#messageBubble {{ border-radius: 2px; background: {SURFACE_PANEL}; }}
+QFrame#messageBubble[role="user"] {{ background: {SURFACE_RAISED}; border-color: {BORDER_STRONG}; }}
+QPlainTextEdit#composer {{ border-radius: 2px; background: {SURFACE_CONTROL}; }}
+QFrame#composerFrame {{ border: 1px solid {BORDER_DEFAULT}; }}
+QPushButton#sendButton:disabled, QPushButton[role="primary"]:disabled, QPushButton[role="destructive"]:disabled {{
+    background: {SURFACE_PANEL}; border-color: {BORDER_DEFAULT}; color: {TEXT_INACTIVE}; font-weight: 400;
+}}
+QPushButton#stopButton:disabled {{ background: transparent; border-color: transparent; color: {TEXT_INACTIVE}; }}
+QDockWidget::title {{ background: {SURFACE_NAV}; padding: {scale_value(9, scale)}px; border: 1px solid {BORDER_DEFAULT}; }}
+QLabel#botsDialogTitle {{ color: {TEXT_PRIMARY}; font-size: {font_size_xlarge}px; font-weight: 600; }}
+QLabel#botsDialogDescription, QLabel#botsHelp {{ color: {TEXT_SECONDARY}; }}
+QFrame#botsDialogFooter {{ background: {SURFACE_NAV}; border-top: 1px solid {BORDER_DEFAULT}; }}
+"""
+
+    # Structural console surfaces: only major work boundaries carry frames.
+    # The header is hosted above QMainWindow's docks, and transcript rows flow
+    # within their shared work well instead of each becoming another panel.
+    stylesheet += f"""
+QToolBar#consoleToolbar {{ background: {SURFACE_BASE}; border: 0; padding: 0; spacing: 0; }}
+QWidget#consoleHeader {{ background: {SURFACE_BASE}; }}
+QFrame#topBar {{ border: none; }}
+QFrame#consoleIdentity {{ background: {SURFACE_RAISED}; border: 1px solid {BORDER_STRONG}; }}
+QFrame#consoleModelContext {{ background: {SURFACE_NAV}; border: 1px solid {BORDER_DEFAULT}; }}
+QFrame#consoleReadinessContext {{ background: {SURFACE_NAV}; border: 1px solid {BORDER_DEFAULT}; }}
+QLabel#consoleReadiness {{ color: {TEXT_SECONDARY}; }}
+QLabel#brandLabel {{ font-size: {scale_value(22, scale)}px; letter-spacing: {scale_value(2, scale)}px; }}
+QLabel#consoleCaption {{ color: {TEXT_SECONDARY}; font-size: {font_size_small}px; letter-spacing: 1px; }}
+QWidget#consoleNavigation {{ background: {SURFACE_NAV}; border-top: 1px solid {BORDER_DEFAULT}; }}
+QWidget#consoleNavigation QToolButton {{ min-height: {scale_value(24, scale)}px; padding: {scale_value(3, scale)}px {scale_value(18, scale)}px; border: 1px solid {BORDER_DEFAULT}; }}
+QWidget#consoleNavigation QToolButton:checked {{ background: {ACCENT_BLUE_DARK}; border-color: {ACCENT_STRUCTURE_DIM}; }}
+QFrame#leftRail, QFrame#workspace {{ border: none; }}
+QFrame#conversationHeader, QFrame#railHeading, QFrame#workPanelHeading {{
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {HEADER_HIGH}, stop:1 {HEADER_SURFACE});
+    border-bottom: 1px solid {BASE_CANVAS};
+}}
+QFrame#utilityHeading {{
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {HEADER_HIGH}, stop:1 {HEADER_SURFACE});
+    border: 3px solid {BORDER_SUBTLE}; border-top-color: {BORDER_STRONG}; border-left-color: {BORDER_STRONG};
+}}
+QFrame#utilityHeading QLabel, QLabel#chatTitle, QLabel#workPanelTitle {{ font-weight: 600; color: {TEXT_PRIMARY}; }}
+QMenuBar#consoleMenuBar {{ background: transparent; padding: {scale_value(3, scale)}px 0; }}
+QMenuBar#consoleMenuBar::item {{ padding: {scale_value(5, scale)}px {scale_value(9, scale)}px; border: 1px solid transparent; }}
+QMenuBar#consoleMenuBar::item:selected {{ border-color: {ACCENT_STRUCTURE_DIM}; background: {ACCENT_BLUE_DARK}; }}
+QLabel#chatTitle {{ padding: 0; font-size: {font_size_large}px; }}
+QScrollArea#transcriptView, QWidget#transcriptContent {{ background: {SURFACE_SUNKEN}; }}
+QFrame#messageBubble, QFrame#messageBubble[role="user"] {{ background: transparent; border: none; border-radius: 0; }}
+QFrame#messageBubble[generationActive="true"] {{ background: transparent; border-left: 1px solid {ACCENT_STRUCTURE_DIM}; }}
+QFrame#messageBubble[searchFocus="true"] {{ background: {ACCENT_BLUE_DARK}; border-left: 2px solid {ACCENT_STRUCTURE}; }}
+QLabel#messageRoleLabel {{ font-weight: 600; color: {TEXT_PRIMARY}; }}
+QLabel#messageState {{ color: {TEXT_SECONDARY}; }}
+QWidget#messageActions QToolButton {{ font-size: {font_size_small}px; padding: {scale_value(2, scale)}px {scale_value(5, scale)}px; }}
+QLabel#messageError {{ color: {STATUS_ERROR}; padding: {scale_value(5, scale)}px; border-left: 2px solid {STATUS_ERROR}; background: #241d22; }}
+QFrame#composerFrame {{ background: {SURFACE_PANEL}; border: none; border-top: 1px solid {BORDER_STRONG}; }}
+QPlainTextEdit#composer {{ background: {SURFACE_CONTROL}; border: none; border-radius: 0; padding: {scale_value(5, scale)}px; }}
+QPlainTextEdit#composer:focus {{ border-bottom: 1px solid {ACCENT_STRUCTURE_DIM}; }}
+QLabel#composerReadiness {{ color: {TEXT_SECONDARY}; font-size: {font_size_small}px; }}
+QPushButton#sendButton, QPushButton#stopButton {{ padding: {scale_value(4, scale)}px {scale_value(12, scale)}px; }}
+QWidget#consoleNavigation QToolButton[iconOnly="true"], QPushButton#sendButton[iconOnly="true"], QPushButton#stopButton[iconOnly="true"] {{ padding: 4px; min-width: 20px; min-height: 20px; }}
+QWidget#inspectorPanel {{ background: {SURFACE_PANEL}; border: none; }}
+QLabel#inspectorSectionTitle {{ font-weight: 600; color: {TEXT_PRIMARY}; border-bottom: 1px solid {BORDER_DEFAULT}; padding-bottom: {scale_value(4, scale)}px; }}
+QLabel#workPanelTitle {{ color: {TEXT_PRIMARY}; font-weight: 600; }}
+QLabel#generationGroupHeading {{ color: {TEXT_PRIMARY}; font-weight: 600; border-bottom: 1px solid {BORDER_DEFAULT}; padding-top: {scale_value(12, scale)}px; padding-bottom: {scale_value(5, scale)}px; }}
+QListWidget#tuneSectionNav {{ background: {SURFACE_NAV}; }}
+QListWidget#tuneSectionNav::item:selected {{ border-left: 2px solid {ACCENT_STRUCTURE}; background: {SURFACE_RAISED}; }}
+QDockWidget::title {{ background: {SURFACE_NAV}; padding: {scale_value(8, scale)}px {scale_value(10, scale)}px; border: 1px solid {BORDER_DEFAULT}; }}
+"""
+
     return stylesheet
 
 
@@ -806,13 +944,27 @@ QLabel#botsInstrumentLabel {{
 def apply_draft1_theme(application: QApplication, *, scale: float = 1.0) -> None:
     """Apply the Draft 1 theme to the application.
     
-    At scale 1.0 (default), this produces byte-identical output to the
-    original DRAFT1_STYLE_SHEET.
+    Apply the current shared desktop visual system and Fusion palette.
     
     Args:
         application: The QApplication instance
         scale: Scaling factor for metrics (1.0 = original size)
     """
+    application.setStyle("Fusion")
+    palette = QPalette()
+    for role, color in (
+        (QPalette.ColorRole.Window, SURFACE_BASE),
+        (QPalette.ColorRole.WindowText, TEXT_PRIMARY),
+        (QPalette.ColorRole.Base, SURFACE_CONTROL),
+        (QPalette.ColorRole.AlternateBase, SURFACE_PANEL),
+        (QPalette.ColorRole.Text, TEXT_PRIMARY),
+        (QPalette.ColorRole.Button, SURFACE_RAISED),
+        (QPalette.ColorRole.ButtonText, TEXT_PRIMARY),
+        (QPalette.ColorRole.Highlight, ACCENT_STRUCTURE_DIM),
+        (QPalette.ColorRole.HighlightedText, TEXT_ON_ACCENT),
+    ):
+        palette.setColor(role, QColor(color))
+    application.setPalette(palette)
     stylesheet = build_theme_stylesheet(scale=scale)
     application.setStyleSheet(stylesheet)
 

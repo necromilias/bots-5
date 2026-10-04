@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 
 from ..core.urls import canonical_http_base_url
-from ..errors import ProviderError, ProviderHttpError, ProviderResponseError
+from ..errors import ContextAdmissionError, ProviderError, ProviderHttpError, ProviderResponseError
 from .base import (
     CompletionRequest,
     CompletionResult,
@@ -49,6 +49,22 @@ def _validated_base_url(value: str) -> str:
     )
 
 
+def _check_context_admission(data: Any) -> None:
+    if type(data) is not dict or type(data.get("error")) is not dict:
+        return
+    error = data["error"]
+    code = error.get("code")
+    message = error.get("message", "")
+    if code in ("context_length_exceeded", "context_window_exceeded") or (
+        type(message) is str and any(phrase in message.lower() for phrase in (
+            "maximum context length", "context length exceeded", "context window exceeded",
+            "exceeds the context", "exceed context", "too many tokens",
+        ))
+    ):
+        # Do not echo arbitrary upstream text, endpoints, or credentials.
+        raise ContextAdmissionError("Provider rejected the selected context as too large. The recorded selection was not retried or changed.")
+
+
 class OpenRouterProvider:
     def __init__(
         self,
@@ -81,6 +97,7 @@ class OpenRouterProvider:
     ) -> CompletionResult:
         if type(data) is not dict:
             raise ProviderResponseError("malformed_provider_response")
+        _check_context_admission(data)
         choices = data.get("choices")
         if type(choices) is not list or not choices:
             raise ProviderResponseError("empty_model_response")
@@ -136,6 +153,7 @@ class OpenRouterProvider:
     def _normalize_stream_chunk(self, data: Any) -> CompletionStreamEvent:
         if type(data) is not dict:
             raise ProviderResponseError("malformed_provider_response")
+        _check_context_admission(data)
         choices = data.get("choices")
         if type(choices) is not list:
             raise ProviderResponseError("malformed_provider_response")
@@ -187,16 +205,30 @@ class OpenRouterProvider:
         stream: bool,
         include_empty_system: bool = True,
     ) -> dict[str, Any]:
+        if request.max_output_parameter not in {"max_tokens", "max_completion_tokens"}:
+            raise ProviderError("unsupported output-token parameter")
+        if request.accounting_mode not in {None, "exact", "provider-managed", "developer-test"}:
+            raise ProviderError("unregistered context accounting mode")
+        if request.context_messages is not None and request.accounting_mode != "provider-managed":
+            raise ProviderError("context material requires provider-managed mode")
         messages = []
         if request.system or include_empty_system:
             messages.append({"role": "system", "content": request.system})
         messages.append({"role": "user", "content": request.user})
+        if request.accounting_mode == "provider-managed":
+            if not request.context_messages or any(role not in {"system", "user", "assistant"} or type(content) is not str for role, content in request.context_messages):
+                raise ProviderError("invalid provider-managed messages")
+            messages = [{"role": role, "content": content} for role, content in request.context_messages]
         return {
             "model": request.model,
             "messages": messages,
             "temperature": request.temperature,
-            "max_tokens": request.max_output_tokens,
+            request.max_output_parameter: request.max_output_tokens,
             "stream": stream,
+            # Model advertisements span routes. Require the selected endpoint
+            # to honor every transmitted parameter instead of ignoring it.
+            "provider": {"require_parameters": True},
+            **({"plugins": [{"id": "context-compression", "enabled": False}]} if request.accounting_mode == "provider-managed" else {}),
             **(
                 {"reasoning_effort": request.reasoning_effort}
                 if request.reasoning_effort is not None
@@ -244,6 +276,10 @@ class OpenRouterProvider:
 
         duration = time.monotonic() - started
         if not 200 <= response.status_code < 300:
+            try:
+                _check_context_admission(response.json())
+            except ValueError:
+                pass
             body = self._sanitize(response.text.replace("\n", " "))[:200]
             raise ProviderHttpError(
                 response.status_code,
@@ -274,6 +310,10 @@ class OpenRouterProvider:
                 ) as response:
                     if not 200 <= response.status_code < 300:
                         body = (await response.aread()).decode("utf-8", errors="replace")
+                        try:
+                            _check_context_admission(json.loads(body))
+                        except ValueError:
+                            pass
                         body = self._sanitize(body.replace("\n", " "))[:200]
                         raise ProviderHttpError(
                             response.status_code,

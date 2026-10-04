@@ -23,12 +23,13 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QLineEdit,
-    QListWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from .actions import ActionDefinition, ActionRegistry
+from .dialog_primitives import DialogHeader, WorkPanel, fit_dialog_to_screen
+from .theme import DIALOG_INSET, ROW_GAP
 
 
 class PaletteFilter(QObject):
@@ -108,19 +109,22 @@ class CommandPaletteDialog(QDialog):
         self.setWindowTitle("Command Palette")
         self.setObjectName("commandPaletteDialog")
         self.setModal(True)
-        self.setMinimumWidth(600)
-        self.setMinimumHeight(400)
+        self.setMinimumSize(320, 240)
+        self.resize(720, 540)
+        fit_dialog_to_screen(self)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(DIALOG_INSET, DIALOG_INSET, DIALOG_INSET, 0)
+        layout.setSpacing(ROW_GAP)
+        masthead = DialogHeader(self)
+        layout.addWidget(masthead)
 
         # Search input
         search_layout = QHBoxLayout()
         search_layout.setContentsMargins(0, 0, 0, 0)
-        search_layout.setSpacing(8)
+        search_layout.setSpacing(ROW_GAP)
 
-        search_label = QLabel("🔍", self)
+        search_label = QLabel("Search", self)
         search_label.setObjectName("paletteSearchIcon")
         search_layout.addWidget(search_label)
 
@@ -128,7 +132,7 @@ class CommandPaletteDialog(QDialog):
         self._search_edit.setObjectName("paletteSearchEdit")
         self._search_edit.setPlaceholderText("Type to filter actions...")
         self._search_edit.textChanged.connect(self._on_search_changed)
-        search_layout.addWidget(self._search_edit)
+        search_layout.addWidget(self._search_edit, 1)
 
         # Shortcuts hint
         shortcuts_hint = QLabel("Enter: select  Esc: cancel", self)
@@ -136,9 +140,11 @@ class CommandPaletteDialog(QDialog):
         shortcuts_hint.setStyleSheet(
             "QLabel#paletteShortcutsHint { color: #888; font-size: 11px; }"
         )
-        search_layout.addWidget(shortcuts_hint)
-
-        layout.addLayout(search_layout)
+        shortcuts_hint.setWordWrap(True)
+        masthead.content_layout.addWidget(shortcuts_hint)
+        masthead.content_layout.addLayout(search_layout)
+        results = WorkPanel("Registered actions", self)
+        layout.addWidget(results, 1)
 
         # Phase 11 M1: shortcut conflicts must be visible to the operator and must
         # never be silently accepted.  The palette is where shortcut ownership is
@@ -157,20 +163,22 @@ class CommandPaletteDialog(QDialog):
             self._conflict_banner.setStyleSheet(
                 "QLabel#paletteConflictBanner { color: #ffd79a; font-size: 11px; }"
             )
-            layout.addWidget(self._conflict_banner)
+            results.body_layout.addWidget(self._conflict_banner)
 
         # Results list (grouped by category)
         self._list_widget = QListWidget(self)
         self._list_widget.setObjectName("paletteResultList")
         self._list_widget.itemActivated.connect(self._on_item_activated)
         self._list_widget.currentItemChanged.connect(self._on_current_item_changed)
-        layout.addWidget(self._list_widget, 1)
+        self._list_widget.setMinimumWidth(0)
+        self._list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        results.body_layout.addWidget(self._list_widget, 1)
 
         # Footer
         footer = QWidget(self)
-        footer.setObjectName("paletteFooter")
+        footer.setObjectName("botsDialogFooter")
         footer_layout = QHBoxLayout(footer)
-        footer_layout.setContentsMargins(0, 0, 0, 0)
+        footer_layout.setContentsMargins(0, 8, 0, 8)
         footer_layout.setSpacing(12)
 
         self._status_label = QLabel("", footer)
@@ -235,12 +243,12 @@ class CommandPaletteDialog(QDialog):
                 # Category header
                 header = QListWidgetItem(f"  {action.category.upper()}")
                 header.setFlags(header.flags() & ~Qt.ItemFlag.ItemIsEnabled)
-                header.setCheckState(Qt.CheckState.Unchecked)
                 self._list_widget.addItem(header)
                 current_category = action.category
 
             # Action item
-            item = QListWidgetItem(f"  {action.title}")
+            chord = action.default_shortcut
+            item = QListWidgetItem(f"  {action.title}" + (f"    {chord}" if chord else ""))
             item.setData(Qt.ItemDataRole.UserRole, action.action_id)
             shortcut_text = action.default_shortcut if action.default_shortcut else ""
             item.setToolTip(f"{action.title} ({shortcut_text})")

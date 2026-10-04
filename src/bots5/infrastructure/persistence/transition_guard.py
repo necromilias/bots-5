@@ -19,6 +19,8 @@ _STATE_KEY = "bots5_transition_guard"
 
 
 def install_transition_guard(dbapi_connection: Any, connection_record: Any | None) -> None:
+    from .provider_managed_validation import valid_plan_json
+    dbapi_connection.create_function("bots5_provider_managed_plan_valid", 1, valid_plan_json, deterministic=True)
     state = {
         "phase": None,
         "message_id": None,

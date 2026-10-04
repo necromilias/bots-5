@@ -10,7 +10,9 @@ from bots5.domain.provider import (
     BackendType,
     CatalogueRefreshFailureClass,
     ProviderConnection,
+    ProviderProfile,
 )
+from bots5.domain.openrouter_capabilities import sanitize_openrouter_metadata
 from bots5.errors import ProviderError
 
 
@@ -106,6 +108,13 @@ class OpenAICompatibleModelDiscoverer:
                     value = item.get(key)
                     if type(value) in {str, int} and not isinstance(value, bool):
                         metadata[key] = value
+                if connection.profile is ProviderProfile.OPENROUTER:
+                    metadata.update(sanitize_openrouter_metadata(item))
+                    top_provider = item.get("top_provider")
+                    if isinstance(top_provider, dict):
+                        limit = top_provider.get("max_completion_tokens")
+                        if type(limit) is int and 0 < limit <= 2**63 - 1:
+                            metadata["max_output_tokens"] = limit
                 result.append(DiscoveredModel(item["id"], item["id"], metadata))
             return tuple(result)
         except ProviderError:

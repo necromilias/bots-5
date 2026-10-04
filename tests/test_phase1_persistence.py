@@ -64,6 +64,7 @@ def test_real_migration_creates_state_schema_and_enables_sqlite_safety(tmp_path:
                 "archive_object_derivations",
                 "chat_drafts",
                 "context_plans",
+                "provider_managed_context_plans",
                 "dock_layout",
                 "font_scale_settings",
                 "keybinding_overrides",
@@ -81,7 +82,7 @@ def test_real_migration_creates_state_schema_and_enables_sqlite_safety(tmp_path:
             with store.engine.connect() as connection:
                 assert connection.execute(text("PRAGMA foreign_keys")).scalar_one() == 1
                 assert connection.execute(text("PRAGMA journal_mode")).scalar_one().lower() == "delete"
-                assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0019_phase11_generation_settings"
+                assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0020_provider_managed_context"
 
         now = datetime.now(timezone.utc)
         chat = Chat(str(uuid4()), "Test", now, now)

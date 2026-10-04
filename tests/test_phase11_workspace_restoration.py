@@ -25,7 +25,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 REPO = Path(__file__).resolve().parents[1]
-HEAD = "0019_phase11_generation_settings"
+HEAD = "0020_provider_managed_context"
 PRIOR_HEAD = "0015_phase11_duplicate_admission"
 
 # --- Phase 11 M0a/M4b/M6 desktop wiring test support ------------------------

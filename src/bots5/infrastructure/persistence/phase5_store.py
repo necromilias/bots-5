@@ -15,6 +15,7 @@ from bots5.core.errors import RevisionConflict, StateError
 from bots5.core.secrets import is_forbidden_secret_key
 from bots5.core.urls import canonical_http_base_url
 from bots5.domain.clock import parse_utc, utc_iso
+from bots5.domain.openrouter_capabilities import sanitize_openrouter_metadata
 from bots5.domain.provider import (
     BackendType,
     CAPABILITY_KEYS,
@@ -126,6 +127,9 @@ def _discovery_metadata(value: object) -> dict[str, object]:
             if type(item) is not int or not 0 <= item <= 2**63 - 1:
                 raise StateError("model discovery metadata is malformed")
             result[key] = item
+    # Keep provider-advertised evidence in the existing bounded metadata plane.
+    # Interpretation remains profile-scoped in capability resolution.
+    result.update(sanitize_openrouter_metadata(value))
     return result
 
 
@@ -581,6 +585,14 @@ class Phase5StoreMixin:
         if type(provider_model_id) is not str or not provider_model_id.strip():
             raise StateError("provider model ID must not be empty")
         existing = self.get_model_catalogue_entry_by_provider_id(connection_id, provider_model_id)
+        connection = self.get_provider_connection(connection_id)
+        # A manual metadata replacement cannot impersonate a fresh OpenRouter
+        # advertisement. A subsequent actual refresh re-establishes evidence.
+        discovery_reset = (
+            {"discovery_revision": None, "discovered_at": None}
+            if connection is not None and connection.profile is ProviderProfile.OPENROUTER
+            else {}
+        )
         now = _now()
         metadata = metadata or {}
         if not isinstance(metadata, dict) or len(metadata) > 32:
@@ -608,7 +620,21 @@ class Phase5StoreMixin:
                     display_name=(display_name or existing.display_name)[:256], metadata_json=encoded,
                     origin=origin, availability=CatalogueAvailability.AVAILABLE.value,
                     revision=existing.revision + 1, updated_at=now,
+                    **discovery_reset,
                 ))
+                if discovery_reset:
+                    # Reset both evidence planes atomically. The separate
+                    # manual override table retains operator assertions.
+                    db.execute(delete(capability_facts).where(
+                        capability_facts.c.model_entry_id == existing.id,
+                        (
+                            (capability_facts.c.source == CapabilitySource.PROVIDER_METADATA.value)
+                            | (
+                                (capability_facts.c.source == CapabilitySource.TRUSTED_REGISTRY.value)
+                                & (capability_facts.c.capability_key == "generation.streaming")
+                            )
+                        ),
+                    ))
         return self.get_model_catalogue_entry_by_provider_id(connection_id, provider_model_id)  # type: ignore[return-value]
 
     def refresh_model_catalogue(self, connection_id: str, discovered: tuple[dict[str, object], ...], *, success: bool, failure_class: CatalogueRefreshFailureClass | None = None, expected_catalogue_revision: int | None = None, expected_connection_revision: int | None = None) -> tuple[ModelCatalogueEntry, ...]:

@@ -195,6 +195,10 @@ class SettingDefinition:
 
     def serialization_for(self, family: PayloadFamily, profile: str | None) -> PayloadMapping | None:
         """Return the payload mapping for a family/profile, when truthful."""
+        if profile == "openrouter" and self.key == "logit_bias":
+            # This registry setting is token TEXT; OpenRouter requires tokenizer
+            # token IDs. A manual support flag cannot supply that conversion.
+            return None
         for mapping in self.serialization:
             if mapping.family is not family:
                 continue
@@ -406,7 +410,10 @@ SETTING_DEFINITIONS: tuple[SettingDefinition, ...] = (
         minimum=0.5,
         maximum=2.0,
         ui_step=0.05,
-        serialization=_openai("repeat_penalty", note=LLAMACPP_NOTE),
+        serialization=(
+            *_openai("repetition_penalty", profile="openrouter"),
+            *_openai("repeat_penalty", note=LLAMACPP_NOTE),
+        ),
     ),
     SettingDefinition(
         key="repetition_window",

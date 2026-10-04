@@ -43,6 +43,7 @@ class ArchiveVersionRequired(ExportError):
 
 def select_archive_version(
     *, requested: int | None, has_import_provenance: bool, has_missing_external_reference: bool,
+    has_provider_managed_evidence: bool = False,
 ) -> int:
     """Choose the only lossless format before any output publication.
 
@@ -50,8 +51,14 @@ def select_archive_version(
     from its coherent store-owned export cut; this pure policy never guesses
     from a migration version or source archive format.
     """
-    if requested not in {None, 1, 2}:
+    if requested not in {None, 1, 2, 3}:
         raise ExportError("requested archive version is unsupported")
+    if has_provider_managed_evidence:
+        if requested in {1, 2}:
+            raise ArchiveVersionRequired(3)
+        return 3
+    if requested == 3:
+        return 3
     requires_v2 = has_import_provenance or has_missing_external_reference
     if requested == 1 and requires_v2:
         raise ArchiveVersionRequired(2)
@@ -118,11 +125,15 @@ class ChatExportSource:
     continuation_history: Mapping[str, object] | None = None
     history_bindings: tuple[Mapping[str, object], ...] = ()
     archived_attempt_provenance: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
+    provider_managed_plans: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
+    requires_v3: bool = False
+    migration_revision: str = "0016_phase11_workspace_state"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "message_attachments", _freeze(self.message_attachments))
         object.__setattr__(self, "attempt_attachments", _freeze(self.attempt_attachments))
         object.__setattr__(self, "context_plans", _freeze(self.context_plans))
+        object.__setattr__(self, "provider_managed_plans", _freeze(self.provider_managed_plans))
         object.__setattr__(self, "chat_configuration", _freeze(self.chat_configuration))
         object.__setattr__(self, "object_provenance", _freeze(self.object_provenance))
         if self.continuation_history is not None:
@@ -597,10 +608,10 @@ def _archive_snapshot(attempt: GenerationAttempt, user_content: str | None = Non
         return {"status": "unsupported"}
     # Phase 11 scope amendment: v4 is the additive generation-settings
     # snapshot.  It projects the complete normalized settings evidence.
-    if version not in {None, 2, 3, 4}:
+    if version not in {None, 2, 3, 4, 5}:
         return {"status": "unsupported"}
     try:
-        if version in {2, 3, 4}:
+        if version in {2, 3, 4, 5}:
             from bots5.infrastructure.persistence.phase3_validation import validate_request_snapshot
             validated = validate_request_snapshot(
                 attempt_id=attempt.id, chat_id=attempt.chat_id,
@@ -634,8 +645,13 @@ def _archive_snapshot(attempt: GenerationAttempt, user_content: str | None = Non
             if version == 3:
                 result["settings_revisions"] = validated.get("settings_revisions")
                 result["context"] = _safe_context(validated)
-            if version == 4:
+            if version == 4 or (version == 5 and "generation_settings" in validated):
                 result["generation_settings"] = validated.get("generation_settings")
+            if version == 5:
+                from bots5.infrastructure.archive_v3_context import validate_safe_plan
+                validate_safe_plan(validated["provider_managed_plan"])
+                for key in ("accounting_mode", "provider_managed_plan", "settings_revisions", "serialization", "generation_authority"):
+                    result[key] = validated[key]
             return result
         from bots5.infrastructure.persistence.phase3_validation import is_phase3_record, validate_request_snapshot
         if is_phase3_record(backend_id=attempt.backend_id, provider_id=attempt.provider_id, snapshot=parsed):
@@ -963,6 +979,14 @@ def _safe_imported_context(
     }
 
 
+def _has_provider_managed_snapshot(raw: str) -> bool:
+    try:
+        value = strict_json_loads(raw)
+    except (ValueError, TypeError):
+        return False
+    return isinstance(value, dict) and value.get("snapshot_version") == 5
+
+
 def build_archive_projection(
     *, archive_id: str, created_at: datetime, chat: Chat, messages: tuple[Message, ...],
     attempts: tuple[GenerationAttempt, ...], message_attachments: Mapping[str, tuple[Attachment | ExportAttachment, ...]],
@@ -972,11 +996,18 @@ def build_archive_projection(
     context_plans: Mapping[str, Mapping[str, object]] | None = None,
     archived_attempt_provenance: Mapping[str, Mapping[str, object]] | None = None,
     allow_missing_external: bool = False,
+    wire_version: int = 1,
+    provider_managed_plans: Mapping[str, Mapping[str, object]] | None = None,
 ) -> ArchiveProjection:
     if any(item.state is AttemptState.RUNNING for item in attempts) or any(
         item.state in {MessageState.SENDING, MessageState.STREAMING} for item in messages
     ):
         raise ExportError("Archive v1 refuses chats with a running generation")
+    pm_plans = provider_managed_plans or {}
+    if wire_version < 3 and (pm_plans or any(_has_provider_managed_snapshot(a.request_snapshot) for a in attempts) or any(p.get("snapshot_version") == 5 for p in (archived_attempt_provenance or {}).values())):
+        raise ArchiveVersionRequired(3)
+    if wire_version not in (1, 2, 3):
+        raise ExportError("unsupported archive wire version")
     active = _active_path(chat, messages)
     by_id = {item.id: item for item in messages}
     if len(by_id) != len(messages) or any(item.chat_id != chat.id for item in messages):
@@ -1039,6 +1070,8 @@ def build_archive_projection(
         raise ExportError("persisted context row references an unknown attempt")
     if not set(imported_provenance) <= {item.id for item in attempts}:
         raise ExportError("archived attempt provenance references an unknown attempt")
+    if set(pm_plans) & set(supplied_contexts):
+        raise ExportError("conflicting exact/provider-managed ownership")
     context_rows = []
     for attempt in attempts:
         try:
@@ -1066,7 +1099,7 @@ def build_archive_projection(
         })),
         ArchiveLogicalEntry("domain/messages.jsonl", "application/x-ndjson", True, canonical_jsonl_bytes(_message_row(item) for item in sorted(messages, key=lambda item: (item.sequence, item.id)))),
         ArchiveLogicalEntry("domain/attempts.jsonl", "application/x-ndjson", True, canonical_jsonl_bytes(
-            _attempt_row(item, by_id[item.user_message_id].content, imported_provenance.get(item.id))
+            _attempt_row_for_wire(item, by_id[item.user_message_id].content, imported_provenance.get(item.id), wire_version)
             for item in sorted(attempts, key=lambda item: (utc_timestamp(item.started_at), item.id))
         )),
         ArchiveLogicalEntry("domain/context-plans.jsonl", "application/x-ndjson", True, canonical_jsonl_bytes(
@@ -1078,11 +1111,14 @@ def build_archive_projection(
         ArchiveLogicalEntry("domain/chat-configuration.json", "application/json", True, canonical_json_bytes(_json_value(_safe_chat_configuration(chat_configuration)))),
         ArchiveLogicalEntry("domain/provenance.json", "application/json", True, canonical_json_bytes(provenance)),
     ]
+    if wire_version == 3:
+        entries.append(ArchiveLogicalEntry("domain/provider-managed-context-plans.jsonl", "application/x-ndjson", True,
+            canonical_jsonl_bytes(_json_value(row) for _, row in sorted(pm_plans.items()))))
     entries.extend(payload_entries)
     return ArchiveProjection(
         archive_id=archive_id, created_at=created_at, chat_id=chat.id, chat_title=chat.title,
         attachment_policy=attachment_policy, entries=tuple(entries),
-        manifest_base={"format": "org.necromilias.bots5.chat-archive", "archive_version": 1,
+        manifest_base={"format": "org.necromilias.bots5.chat-archive", "archive_version": wire_version,
             "archive_id": archive_id, "created_at": utc_timestamp(created_at),
             "source_application_version": application_version, "source_db_migration_revision": migration_revision,
             "source_chat": {"source_id": chat.id, "title": chat.title},
@@ -1103,6 +1139,8 @@ def build_archive_v2_projection(
     continuation_history: Mapping[str, object] | None = None,
     history_bindings: tuple[Mapping[str, object], ...] = (),
     archived_attempt_provenance: Mapping[str, Mapping[str, object]] | None = None,
+    wire_version: int = 2,
+    provider_managed_plans: Mapping[str, Mapping[str, object]] | None = None,
 ) -> ArchiveProjection:
     """Build deterministic v2 bytes with complete identity provenance.
 
@@ -1120,7 +1158,7 @@ def build_archive_v2_projection(
         archived_attempt_provenance=archived_attempt_provenance,
         # Archive v1 remains frozen: only the v2 writer can carry an honest
         # payload-absence conclusion for an externally referenced object.
-        allow_missing_external=True,
+        allow_missing_external=True, wire_version=wire_version, provider_managed_plans=provider_managed_plans,
     )
     entries = {item.path: item.content for item in v1.entries}
     # V2 makes the payload-presence conclusion explicit.  V1's attachment
@@ -1186,12 +1224,14 @@ def build_archive_v2_projection(
         "resources": existing_provenance["resources"],
     })
     manifest = dict(v1.manifest_base)
-    manifest["archive_version"] = 2
+    manifest["archive_version"] = wire_version
     manifest["features"] = [
         "attachments", "chat-lineage", "context-plans", "continuation-history-v1",
         "generation-outcomes", "history-bindings-v1", "import-provenance-v1",
         "request-time-provenance",
     ]
+    if wire_version == 3:
+        manifest["features"] = sorted([*manifest["features"], "provider-managed-context-v1"])
     return ArchiveProjection(
         archive_id=archive_id, created_at=created_at, chat_id=chat.id, chat_title=chat.title,
         attachment_policy=attachment_policy,
@@ -1205,3 +1245,14 @@ def build_archive_v2_projection(
         ),
         manifest_base=manifest,
     )
+
+
+def _attempt_row_for_wire(attempt, user_content, provenance, wire_version):
+    row = _attempt_row(attempt, user_content, provenance)
+    if wire_version == 3 and row["request_time_provenance"].get("snapshot_version") == 3:
+        row["request_time_provenance"]["accounting_mode"] = "exact"
+    return row
+
+
+def build_archive_v3_projection(**kwargs):
+    return build_archive_v2_projection(**kwargs, wire_version=3)

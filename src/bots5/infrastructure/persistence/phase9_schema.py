@@ -307,6 +307,15 @@ def validate_phase9_schema(connection, *, exact_ddl: bool = True) -> None:
         match = re.match(r"\s*CREATE\s+(TABLE|INDEX|TRIGGER)\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][A-Za-z0-9_]*)", statement, re.I)
         if match is not None:
             expected_ddl[(match.group(1).lower(), match.group(2))] = re.sub(r"\s+", " ", statement.strip().rstrip(";")).casefold()
+    revision = connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one_or_none()
+    if revision == "0020_provider_managed_context":
+        from .provider_managed_schema import evolve_archive_table_sql, reference_guards
+        for table in ("archive_import_operations", "archive_lineage_nodes"):
+            expected_ddl[("table", table)] = evolve_archive_table_sql(expected_ddl[("table", table)].replace(" in ", " IN ")).casefold()
+        for name, sql in reference_guards().items():
+            key = ("trigger", name)
+            if key in expected_ddl:
+                expected_ddl[key] = re.sub(r"\s+", " ", sql.strip().rstrip(";")).casefold()
     installed_ddl = {
         (str(kind), str(name)): re.sub(r"\s+", " ", str(sql).strip().rstrip(";")).casefold()
         for kind, name, sql in connection.exec_driver_sql(
@@ -322,6 +331,8 @@ def validate_phase9_schema(connection, *, exact_ddl: bool = True) -> None:
     if exact_ddl:
         for key, expected in expected_ddl.items():
             actual = installed_ddl.get(key)
+            if revision == "0020_provider_managed_context" and key in {( "table", "archive_import_operations"), ("table", "archive_lineage_nodes")} and actual:
+                actual = actual.replace('"'+key[1]+'"', key[1])
             if actual != expected:
                 raise RuntimeError("Phase 9 import schema definition is contradictory")
     rows = connection.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='table'").fetchall()

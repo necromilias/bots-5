@@ -26,7 +26,7 @@ from tests._authority_test_support import SQLiteAppStateStore, downgrade_to, upg
 
 HEAD_16 = "0016_phase11_workspace_state"
 HEAD_17 = "0017_phase11_integrity"
-HEAD_18 = "0019_phase11_generation_settings"  # the CURRENT head the open path migrates to (amendment 0019)
+HEAD_18 = "0020_provider_managed_context"  # the CURRENT head the open path migrates to (amendment 0019)
 NOW = datetime(2026, 9, 3, tzinfo=timezone.utc)
 
 

@@ -94,7 +94,7 @@ def _snapshot_fields(attempt: GenerationAttempt, user_content: str | None) -> tu
     if not isinstance(snapshot, dict):
         return "corrupt request snapshot", ()
     version = snapshot.get("snapshot_version")
-    if version in (2, 3):
+    if version in (2, 3, 5):
         try:
             # Persistence owns historical snapshot validation.  Import it only
             # once the core projection is actually requested: importing the
@@ -179,6 +179,19 @@ def _snapshot_fields(attempt: GenerationAttempt, user_content: str | None) -> tu
                         "representation_id", "representation_digest",
                     )})
             fields.append(InspectionField("Context sources", _safe_json(safe_sources)))
+    if version == 5:
+        evidence = snapshot["provider_managed_plan"]
+        plan = json.loads(evidence["canonical_representation"])
+        fields.append(InspectionField("Context accounting", "Provider-managed"))
+        fields.append(InspectionField("Provider final admission", "yes; exact token fit is not claimed"))
+        for name, value in (
+            ("Context digest", evidence["canonical_digest"]),
+            ("Context included", plan["included_sources"]),
+            ("Context excluded", plan["excluded_sources"]),
+            ("Advertised context evidence", plan["context_capability"]),
+            ("Local estimation policy", plan["policy"]),
+        ):
+            fields.append(InspectionField(name, _value(value)))
     return "available", tuple(fields)
 
 

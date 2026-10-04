@@ -1,5 +1,78 @@
 # B.O.T.S. Linux v0.1 — Phase 11 Implementation Report
 
+## Final candidate reconciliation addendum — 2026-10-04
+
+This addendum records the current boundaries before final candidate sealing and T4.
+The older sections below remain historical implementation snapshots; their former
+heads, OPEN entries, counts and incomplete milestones are not current dispositions.
+
+- M7 is substantively accepted under Mick's retained acceptance record. Its host,
+  Secret Service, Python/Nuitka and retained diagnostic limits remain carried.
+- P11-02 is closed as accepted/carried, with the exact partial-DDL limitation below.
+  Frozen migration 0013 is unchanged; supported recovery restores prior source or
+  verified backup and migrates forward, rather than invoking historical downgrade.
+- Amendment-B is technically complete. Its scoped migration reseal is SHA-256
+  `0d820d345ff470e1b7a7f2251674ea8bc577ce5d4e8eb386775ed611a6143b4b`, binding exactly
+  0015–0019 and additive reconciliation to Mick's Option-B authority. Historical
+  design/implementation v5 seals and all six proof-harness waves remain preserved.
+- The current sole migration head is `0020_provider_managed_context`, after
+  `0019_phase11_generation_settings`. This is a separately authorized provider-managed
+  persistence/Archive v3 evolution, outside the Amendment-B scoped seal. Exact Phase 6
+  v3 plans retain their meaning; provider-managed plans use a separate durable plane
+  and snapshot v5 with normal attachment references. Evidence-bearing 0020 downgrade
+  refuses instead of destroying provider-managed/Archive v3 evidence. See
+  `PROVIDER_MANAGED_CONTEXT_ARCHIVE_V3.md` for the contract.
+- Three stale T4 baseline identifiers now point to the existing owned-frameless-chrome,
+  scale-1 stylesheet-structure and current-colour-authority tests. The original chrome
+  and palette expectations were explicitly superseded by Mick's later UI authority.
+  Those inventory corrections change no assertions, fixtures or test semantics. All 1,940
+  reviewed baseline entries remain required; canonical collection includes additional
+  tests and is reconciled separately.
+- A final-reconciliation harness repair limits frameless-dialog fixture cleanup to
+  Qt widgets created by that fixture invocation, following the existing shell-test
+  ownership rule. It preserves every test assertion and avoids closing foreign
+  windows whose earlier test runtime/store has already shut down. The failed
+  combined checkpoint and ownership controls remain retained; no product code changed.
+
+The final-job immutable parcel, exact old/new UI mapping and bodies, migration/authority
+lineages, evidence-applicability matrix, final candidate seal and resulting T4 records
+are retained under `work/campaign-evidence/phase11/final-reconciliation/20261004-01/`.
+Those records identify the actual sealed subject and outcome; no earlier T4, live run
+or packaging validation is represented as execution against later documentation bytes.
+The prior provider-managed live run's unresolved stream-cleanup diagnostics are retained
+as an observed, unadjudicated limitation: functional persistence/usage/archive evidence
+does not establish clean shutdown or absence of resource leaks. This addendum does not
+accept that limitation or claim a new live run. Final substantive acceptance and all
+Git/publication consequences remain Mick's separate decisions.
+
+---
+
+## P11-02 disposition — 2026-10-04
+
+Mick **accepted/carried P11-02** as a known unsupported historical reversibility limitation.
+Frozen `0013_phase11_organisation.py` remains SHA-256
+`b17b05b19841a544ed6256750892068e64a13d17f725c6c08fe5fd54443bcc87`; no forward product
+migration is required or authorized for this issue. Its real Alembic downgrade to 0012 fails
+while renaming `_alembic_tmp_chats`, because `messages_active_head_parent_guard` references
+the temporarily absent `chats`. The failure leaves partial DDL: revision remains 0013,
+organisation columns/folders remain, organisation triggers and the folder index are missing,
+and a scratch table remains. It does not produce an acceptable 0012 database.
+
+Supported recovery restores an attributable prior source or verified pre-upgrade backup;
+normal startup migrates supported older schemas forward. The former
+`test_0013_downgrade_drops_every_trigger_it_created` only inspected triggers after upgrade
+to 0016 and supplied no downgrade proof. It is replaced by a genuine-0013 upgrade test and
+an empty/populated disposable-database test of the accepted failure and partial DDL.
+Human disposition, preserved investigation and successor candidate/validation identity are
+recorded under `work/campaign-evidence/phase11/p11-02-disposition/20261004-01/`, linked to
+the unchanged `p11-02-adjudication/20261004-01/` evidence.
+
+This resolves the P11-02 disposition only. Amendment-B, T4, Git publication and final
+Phase 11 acceptance remain outside this authority. The sections below preserve earlier
+implementation snapshots and their historical status/head/validation claims.
+
+---
+
 Status: **implementation complete except M7 (stopped for Mick on a tool dependency) and M8 (deferred).**
 This report is the M9 deliverable. It is written at the **pre-commit boundary**: nothing has been staged,
 committed, pushed, or had any ref mutated.

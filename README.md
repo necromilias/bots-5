@@ -242,3 +242,6 @@ Key records include:
 - `docs/CI_V1.md` — CI v1 authoritative T4 reference and its stated limitations;
 - `docs/SQLITE_COMPATIBILITY_REPAIR.md` — SQLite ≤ 3.45.1 parser-compatibility repair record;
 - `docs/LINUX_V0_1_DESIGN.md` — accepted Linux v0.1 build-facing contract.
+
+The additive production OpenRouter accounting and Archive v3 contract is specified in
+[Provider-managed context and Archive v3](docs/PROVIDER_MANAGED_CONTEXT_ARCHIVE_V3.md).

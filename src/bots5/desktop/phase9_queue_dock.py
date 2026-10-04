@@ -26,19 +26,24 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDockWidget,
+    QFrame,
     QHBoxLayout,
     QHeaderView,
+    QGridLayout,
     QLabel,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
+    QSizePolicy,
 )
 
 from bots5.core.import_queue import ImportQueueState, QueueDisplayPage
 
+from .theme import PANEL_INSET, ROW_GAP
 from .phase9_imports import ImportQueueViewModel, QueueRowView
+from .dialog_primitives import ChamferedPanel, SectionHeader, WorkPanel
 
 
 # Bounded refresh: the timer interval must never exceed POLL_MAX_INTERVAL_MS.
@@ -70,6 +75,15 @@ class ImportQueueDockWidget(QDockWidget):
         content = QWidget(self)
         content.setObjectName("importQueueContent")
         layout = QVBoxLayout(content)
+        layout.setContentsMargins(PANEL_INSET, PANEL_INSET, PANEL_INSET, PANEL_INSET)
+        layout.setSpacing(ROW_GAP)
+        masthead = ChamferedPanel(content, chamfer=8, header=True)
+        head_layout = QVBoxLayout(masthead)
+        head_layout.setContentsMargins(12, 8, 12, 8)
+        head_layout.addWidget(SectionHeader("Import Queue", "Durable imports, waiting order and completed history.", masthead))
+        layout.addWidget(masthead)
+        records = WorkPanel("Imports / durable state", content)
+        layout.addWidget(records, 1)
 
         self.table = QTableWidget(content)
         self.table.setObjectName("importQueueTable")
@@ -80,50 +94,69 @@ class ImportQueueDockWidget(QDockWidget):
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         header = self.table.horizontalHeader()
-        header.setStretchLastSection(True)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        for column, width in enumerate((210, 130, 80, 230, 150, 150, 150)):
+            header.resizeSection(column, width)
+        self.table.setAlternatingRowColors(True)
+        self.table.setMinimumSize(0, 100)
         self.table.itemSelectionChanged.connect(self._sync_controls)
-        layout.addWidget(self.table, 1)
+        records.body_layout.addWidget(self.table, 1)
 
-        controls = QHBoxLayout()
+        controls = QGridLayout()
+        controls.setHorizontalSpacing(ROW_GAP)
+        controls.setVerticalSpacing(ROW_GAP)
         self.refresh_button = QPushButton("Refresh", content)
         self.refresh_button.setObjectName("importQueueRefreshButton")
         self.refresh_button.setToolTip("Reload the queue from the durable store now")
         self.refresh_button.clicked.connect(self.reload_now)
-        controls.addWidget(self.refresh_button)
+        controls.addWidget(self.refresh_button, 0, 0)
         self.cancel_button = QPushButton("Cancel", content)
         self.cancel_button.setObjectName("importQueueCancelButton")
         self.cancel_button.setToolTip(
             "Cancel the selected queued or preflighting import (pre-cutoff only)"
         )
         self.cancel_button.clicked.connect(self._on_cancel)
-        controls.addWidget(self.cancel_button)
+        controls.addWidget(self.cancel_button, 0, 1)
         self.remove_button = QPushButton("Remove waiting", content)
         self.remove_button.setObjectName("importQueueRemoveButton")
         self.remove_button.setToolTip("Remove the selected still-waiting import")
         self.remove_button.clicked.connect(self._on_remove)
-        controls.addWidget(self.remove_button)
+        controls.addWidget(self.remove_button, 0, 2)
         self.retry_button = QPushButton("Retry", content)
         self.retry_button.setObjectName("importQueueRetryButton")
         self.retry_button.setToolTip("Explicitly retry a failed import as a fresh row")
         self.retry_button.clicked.connect(self._on_retry)
-        controls.addWidget(self.retry_button)
+        controls.addWidget(self.retry_button, 0, 3)
         self.move_up_button = QPushButton("Move up", content)
         self.move_up_button.setObjectName("importQueueMoveUpButton")
         self.move_up_button.setToolTip("Move the selected waiting import earlier")
         self.move_up_button.clicked.connect(lambda: self._on_move(-1))
-        controls.addWidget(self.move_up_button)
+        controls.addWidget(self.move_up_button, 1, 0)
         self.move_down_button = QPushButton("Move down", content)
         self.move_down_button.setObjectName("importQueueMoveDownButton")
         self.move_down_button.setToolTip("Move the selected waiting import later")
         self.move_down_button.clicked.connect(lambda: self._on_move(1))
-        controls.addWidget(self.move_down_button)
+        controls.addWidget(self.move_down_button, 1, 1)
         self.clear_button = QPushButton("Clear history", content)
         self.clear_button.setObjectName("importQueueClearHistoryButton")
         self.clear_button.setToolTip("Remove all terminal rows from the queue history")
         self.clear_button.clicked.connect(self._on_clear_history)
-        controls.addWidget(self.clear_button)
-        controls.addStretch(1)
-        layout.addLayout(controls)
+        controls.addWidget(self.clear_button, 1, 2)
+        controls.setColumnStretch(4, 1)
+        self._controls_layout = controls
+        self._control_buttons = (
+            self.refresh_button, self.cancel_button, self.remove_button,
+            self.retry_button, self.move_up_button, self.move_down_button, self.clear_button,
+        )
+        footer = QFrame(content)
+        footer.setObjectName("botsDialogFooter")
+        footer_layout = QVBoxLayout(footer)
+        footer_layout.setContentsMargins(0, 8, 0, 0)
+        footer_layout.addLayout(controls)
+        layout.addWidget(footer)
+        for button in self._control_buttons:
+            button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        self._fit_controls()
 
         self.status_label = QLabel(
             "Queue rows follow the durable import store.", content
@@ -132,11 +165,26 @@ class ImportQueueDockWidget(QDockWidget):
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
         self.setWidget(content)
+        self.resize(1000, 360)
 
         self._poll_timer = self._build_poll_timer()
         self.visibilityChanged.connect(self._on_visibility_changed)
         self._sync_controls()
         self._sync_polling()
+
+    def _fit_controls(self) -> None:
+        columns = 4 if self.width() >= 600 else (3 if self.width() >= 430 else 2)
+        for column in range(5):
+            self._controls_layout.setColumnStretch(column, 0)
+        for index, button in enumerate(self._control_buttons):
+            self._controls_layout.removeWidget(button)
+            self._controls_layout.addWidget(button, index // columns, index % columns)
+        self._controls_layout.setColumnStretch(columns, 1)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if hasattr(self, "_controls_layout"):
+            self._fit_controls()
 
     def _build_poll_timer(self):
         from PySide6.QtCore import QTimer

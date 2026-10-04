@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 
-from PySide6.QtCore import QPoint, Qt, Signal
+from PySide6.QtCore import QEvent, QPoint, Qt, Signal
 from PySide6.QtGui import QAction, QClipboard, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import (
     QDialog,
@@ -15,7 +15,9 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QToolButton,
+    QToolBar,
     QVBoxLayout,
     QWidget,
 )
@@ -48,11 +50,12 @@ from bots5.domain.provider import BackendType, CapabilityOverride, CapabilitySta
 from bots5.domain.search import SearchDocumentKind, SearchFilters, SearchResult
 from bots5.providers.discovery import discoverer_for_connection
 
+from .dialog_primitives import ChamferedPanel, ContentFitLabel, ElidingLabel, scrollable, normalized_question, position_dialog_at_anchor
 from .phase9 import Phase9DesktopController
 from .phase9_queue_dock import ImportQueueDockWidget
 from .profile import DesktopSessionInfo
 from .session import DesktopSessionController
-from .theme import apply_draft1_theme, build_theme_stylesheet
+from .theme import MAIN_SIZE, PANEL_INSET, ROW_GAP, apply_draft1_theme, build_theme_stylesheet
 from .widgets import (
     AddConnectionDialog,
     ComposerEdit,
@@ -70,7 +73,9 @@ from .widgets import (
 )
 from .actions import ActionDefinition, ActionRegistry
 from .campaign_dock import CampaignDockWidget
-from .model_selector import ModelSelectorEntry, ModelSelectorPopup
+from .model_selector import ModelSelectorEntry, ModelSelectorPopup, model_readiness, readiness_details
+from .icons import icon_action
+from .window_chrome import NativeWindowEdges
 from .palette import CommandPaletteDialog
 
 
@@ -146,7 +151,12 @@ class MainWindow(QMainWindow):
         campaign_bridge_factory=None,
     ) -> None:
         super().__init__()
+        self.setObjectName("botsMainWindow")
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self._application = application
+        self._developer_provider_test_mode = (
+            getattr(application, "developer_provider_test_mode", False) is True
+        )
         self._session = session or DesktopSessionInfo("fake", "fake-v0.1")
         self._workspace = workspace or DesktopSessionController(application, self._session)
         self._owns_workspace = workspace is None
@@ -176,6 +186,7 @@ class MainWindow(QMainWindow):
         self._activity: dict[str, ChatActivity] = {}
         self._workspace_attached = True
         self._phase5 = getattr(application, "_configuration", None) is not None
+        self._model_known_blocked = False
         self._tune_dialog: TuneDialog | None = None
         self._tune_chat_id: str | None = None
         self._settings_dialog: SettingsDialog | None = None
@@ -202,7 +213,9 @@ class MainWindow(QMainWindow):
         self._default_shortcut_by_action_id: dict[str, str] = {}
 
         self.setWindowTitle("B.O.T.S. 5")
-        self.resize(1180, 760)
+        if self._developer_provider_test_mode:
+            self.setWindowTitle("B.O.T.S. 5 — INEXACT / PROVIDER TEST MODE")
+        self.resize(*MAIN_SIZE)
         # Additive Phase 9 delegation controller (task orchestration only);
         # created before _build_ui so the docks and menus can attach to it.
         self._phase9 = Phase9DesktopController(
@@ -214,6 +227,7 @@ class MainWindow(QMainWindow):
         if application_instance is not None:
             apply_draft1_theme(application_instance)
         self._build_ui()
+        self._native_edges = NativeWindowEdges(self)
         self._workspace.event_received.connect(self._on_event)
         self._workspace.activity_changed.connect(self._on_activity_changed)
 
@@ -257,22 +271,55 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
 
-        self.top_bar = TopBar(self._session, root, phase5=self._phase5)
+        # The global console lives above QMainWindow's dock region. Keeping it
+        # in the central widget lets an open Details dock steal its width.
+        self.console_header = QWidget(self)
+        self.console_header.setObjectName("consoleHeader")
+        self.console_header.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        console_layout = QVBoxLayout(self.console_header)
+        console_layout.setContentsMargins(6, 4, 6, 6)
+        console_layout.setSpacing(4)
+
+        self.provider_test_banner = ContentFitLabel(
+            "INEXACT / PROVIDER TEST MODE — developer-only; not Phase 6 compliant.\n"
+            "Current message only. Deterministic context budgeting, history and attachment guarantees are unavailable.",
+            self.console_header,
+        )
+        self.provider_test_banner.setObjectName("developerProviderTestBanner")
+        self.provider_test_banner.setWordWrap(True)
+        self.provider_test_banner.setVisible(self._developer_provider_test_mode)
+        console_layout.addWidget(self.provider_test_banner)
+
+        self.top_bar = TopBar(self._session, self.console_header, phase5=self._phase5)
         self.top_bar.rail_toggle_requested.connect(self._toggle_rail)
         self.top_bar.search_toggled.connect(self._toggle_search)
         self.top_bar.details_toggled.connect(self._toggle_inspector)
         self.top_bar.model_selected.connect(self._on_model_selected)
         self.top_bar.tune_requested.connect(self._on_tune_requested)
         self.top_bar.settings_requested.connect(self._on_settings_requested)
+        self.top_bar.move_requested.connect(self._start_system_move)
+        self.top_bar.minimize_requested.connect(self.showMinimized)
+        self.top_bar.maximize_requested.connect(self._toggle_window_maximized)
+        self.top_bar.close_requested.connect(self.close)
         # Phase 11 F8: the selector button only requests the popup; the
         # durable selection still runs through the landed command path.
         self.top_bar.model_selector.open_requested.connect(self._open_model_selector)
-        root_layout.addWidget(self.top_bar)
+        console_layout.addWidget(self.top_bar)
+        self.console_toolbar = QToolBar(self)
+        self.console_toolbar.setObjectName("consoleToolbar")
+        self.console_toolbar.setMovable(False)
+        self.console_toolbar.setFloatable(False)
+        self.console_toolbar.setAllowedAreas(Qt.ToolBarArea.TopToolBarArea)
+        # This global navigation and permanent test-mode notice are not an
+        # optional tool palette. Disable Qt's default context-menu hide action.
+        self.console_toolbar.toggleViewAction().setEnabled(False)
+        self.console_toolbar.addWidget(self.console_header)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self.console_toolbar)
 
         body = QWidget(root)
         body_layout = QHBoxLayout(body)
-        body_layout.setContentsMargins(0, 0, 0, 0)
-        body_layout.setSpacing(0)
+        body_layout.setContentsMargins(6, 0, 6, 6)
+        body_layout.setSpacing(6)
 
         self.rail = LeftRail(body)
         self.rail.new_chat_requested.connect(self._on_new_chat)
@@ -282,16 +329,20 @@ class MainWindow(QMainWindow):
         self.chat_list = self.rail.chat_list
         self.new_chat_button = self.rail.new_chat_button
 
-        workspace = QWidget(body)
+        workspace = ChamferedPanel(body, chamfer=8)
         workspace.setObjectName("workspace")
         workspace_layout = QVBoxLayout(workspace)
-        workspace_layout.setContentsMargins(18, 10, 18, 12)
-        workspace_layout.setSpacing(8)
+        workspace_layout.setContentsMargins(4, 4, 4, 4)
+        workspace_layout.setSpacing(0)
 
-        chat_header = QHBoxLayout()
-        self.chat_title = QLabel("New chat", workspace)
+        self.chat_header = QFrame(workspace)
+        self.chat_header.setObjectName("conversationHeader")
+        self.chat_header.setMinimumHeight(40)
+        chat_header = QHBoxLayout(self.chat_header)
+        chat_header.setContentsMargins(12, 5, 10, 5)
+        self.chat_title = ElidingLabel("New chat", self.chat_header)
         self.chat_title.setObjectName("chatTitle")
-        chat_header.addWidget(self.chat_title)
+        chat_header.addWidget(self.chat_title, 1)
         self.archived_badge = QLabel("Archived", workspace)
         self.archived_badge.setObjectName("archivedBadge")
         self.archived_badge.setVisible(False)
@@ -303,7 +354,7 @@ class MainWindow(QMainWindow):
         self.archive_button.setToolTip("Archive this chat")
         self.archive_button.clicked.connect(self._on_archive_chat)
         chat_header.addWidget(self.archive_button)
-        workspace_layout.addLayout(chat_header)
+        workspace_layout.addWidget(self.chat_header)
 
         self.historical_banner = QFrame(workspace)
         self.historical_banner.setObjectName("historicalBanner")
@@ -332,11 +383,11 @@ class MainWindow(QMainWindow):
         self.continuation_banner = ContinuationBanner(workspace)
         workspace_layout.addWidget(self.continuation_banner)
 
-        self.composer_frame = QFrame(workspace)
+        self.composer_frame = ChamferedPanel(workspace, chamfer=8)
         self.composer_frame.setObjectName("composerFrame")
         composer_layout = QVBoxLayout(self.composer_frame)
-        composer_layout.setContentsMargins(10, 8, 10, 8)
-        composer_layout.setSpacing(5)
+        composer_layout.setContentsMargins(10, 4, 10, 5)
+        composer_layout.setSpacing(2)
 
         editing_row = QHBoxLayout()
         self.editing_label = QLabel("Editing message", self.composer_frame)
@@ -363,8 +414,10 @@ class MainWindow(QMainWindow):
         composer_controls.setSpacing(6)
         self.attachment_button = QToolButton(self.composer_frame)
         self.attachment_button.setObjectName("attachmentAffordance")
-        self.attachment_button.setText("Attach")
+        icon_action(self.attachment_button, "attach", "Attach file")
         self.attachment_button.setToolTip("Attach a UTF-8 text file to the next message")
+        if self._developer_provider_test_mode:
+            self.attachment_button.setToolTip("Attachments are unavailable in INEXACT / PROVIDER TEST MODE")
         self.attachment_button.clicked.connect(self._on_attach_file)
         composer_controls.addWidget(self.attachment_button)
 
@@ -372,24 +425,38 @@ class MainWindow(QMainWindow):
             "Tools",
             "Tool invocation is not implemented in this UI slice.",
         )
+        icon_action(self.tool_button, "tools", "Tools (not available)")
         composer_controls.addWidget(self.tool_button)
+        self.model_readiness_label = QLabel("", self.composer_frame)
+        self.model_readiness_label.setObjectName("composerReadiness")
+        self.model_readiness_label.setWordWrap(True)
+        self.model_readiness_label.setMinimumWidth(0)
+        self.model_readiness_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        composer_controls.addWidget(self.model_readiness_label, 1)
+        self.model_recovery_button = QToolButton(self.composer_frame)
+        self.model_recovery_button.setText("View connection")
+        self.model_recovery_button.clicked.connect(self._on_model_recovery)
+        self.model_recovery_button.setVisible(False)
+        composer_controls.addWidget(self.model_recovery_button)
 
         self.composer = ComposerEdit(self.composer_frame)
         self.composer.setPlaceholderText("Message")
-        self.composer.setMinimumHeight(56)
-        self.composer.setMaximumHeight(112)
+        self.composer.setMinimumHeight(52)
+        self.composer.setMaximumHeight(60)
         self.composer.send_requested.connect(self._on_send)
         self.composer.textChanged.connect(self._update_controls)
-        composer_controls.addWidget(self.composer, 1)
+        composer_layout.addWidget(self.composer)
 
         self.send_button = QPushButton("Send", self.composer_frame)
         self.send_button.setObjectName("sendButton")
+        icon_action(self.send_button, "send", "Send message")
         self.send_button.setToolTip("Send message (Enter)")
         self.send_button.clicked.connect(self._on_send)
         composer_controls.addWidget(self.send_button)
 
         self.cancel_button = QPushButton("Stop", self.composer_frame)
         self.cancel_button.setObjectName("stopButton")
+        icon_action(self.cancel_button, "stop", "Stop generation")
         self.cancel_button.setToolTip("Stop the active generation")
         self.cancel_button.clicked.connect(self._on_cancel)
         composer_controls.addWidget(self.cancel_button)
@@ -404,10 +471,16 @@ class MainWindow(QMainWindow):
         self.inspector_dock.setObjectName("inspectorDock")
         self.inspector_dock.setAllowedAreas(Qt.DockWidgetArea.RightDockWidgetArea)
         self.inspector_dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetClosable)
-        self.inspector_dock.setMinimumWidth(310)
-        self.inspector_dock.setWidget(self.inspector)
+        self.inspector_dock.setMinimumWidth(180)
+        self.inspector_dock.setTitleBarWidget(self._dock_heading("Details", self.inspector_dock))
+        inspector_frame = ChamferedPanel(self.inspector_dock, chamfer=8)
+        inspector_layout = QVBoxLayout(inspector_frame)
+        inspector_layout.setContentsMargins(4, 4, 4, 4)
+        inspector_layout.addWidget(scrollable(self.inspector, inspector_frame))
+        self.inspector_dock.setWidget(inspector_frame)
         self.inspector_dock.visibilityChanged.connect(self._sync_inspector_button)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.inspector_dock)
+        self.resizeDocks([self.inspector_dock], [310], Qt.Orientation.Horizontal)
         self.inspector_dock.hide()
 
         self.search_panel = SearchPanel(self)
@@ -421,8 +494,13 @@ class MainWindow(QMainWindow):
             Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
         )
         self.search_dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetClosable)
-        self.search_dock.setMinimumWidth(350)
-        self.search_dock.setWidget(self.search_panel)
+        self.search_dock.setMinimumWidth(220)
+        self.search_dock.setTitleBarWidget(self._dock_heading("Search", self.search_dock))
+        search_frame = ChamferedPanel(self.search_dock, chamfer=8)
+        search_layout = QVBoxLayout(search_frame)
+        search_layout.setContentsMargins(4, 4, 4, 4)
+        search_layout.addWidget(self.search_panel)
+        self.search_dock.setWidget(search_frame)
         self.search_dock.visibilityChanged.connect(self._sync_search_button)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.search_dock)
         self.search_dock.hide()
@@ -462,7 +540,17 @@ class MainWindow(QMainWindow):
             self._campaign_dock.visibilityChanged.connect(self._on_dock_layout_changed)
 
         self._build_phase9_menus()
+        self._native_menu_bar = super().menuBar()
+        def keep_shortcuts_reachable(actions):
+            for action in actions:
+                self.addAction(action)
+                if action.menu() is not None:
+                    keep_shortcuts_reachable(action.menu().actions())
+        keep_shortcuts_reachable(self._native_menu_bar.actions())
+        self._console_menu_bar = self.top_bar.install_menu_actions(tuple(self._native_menu_bar.actions()), self.top_bar.utilities)
+        self._native_menu_bar.hide()
         self._update_controls()
+        self._fit_workspace_panels()
 
         # Phase 11 M1: Detect and report any shortcut conflicts
         conflicts = self._action_registry.detect_conflicts()
@@ -486,6 +574,62 @@ class MainWindow(QMainWindow):
             action_id: qaction.shortcut().toString()
             for action_id, qaction in self._qaction_by_action_id.items()
         }
+
+    def menuBar(self):
+        # Public callers keep the actual visible menu and the original action
+        # identities after navigation moves into the full-width console.
+        if hasattr(self, "_console_menu_bar"):
+            return self._console_menu_bar
+        return super().menuBar()
+
+    def _dock_heading(self, title: str, dock: QDockWidget) -> QWidget:
+        heading = QFrame(dock)
+        heading.setObjectName("utilityHeading")
+        heading.setMinimumHeight(40)
+        layout = QHBoxLayout(heading)
+        layout.setContentsMargins(10, 5, 8, 5)
+        layout.addWidget(QLabel(title, heading), 1)
+        close = QToolButton(heading)
+        close.setText("×")
+        close.setAccessibleName("Close " + title)
+        close.setToolTip("Close " + title)
+        close.clicked.connect(dock.close)
+        layout.addWidget(close)
+        return heading
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if hasattr(self, "search_dock"):
+            self._fit_workspace_panels()
+
+    def _start_system_move(self) -> None:
+        handle = self.windowHandle()
+        accepted = bool(handle is not None and handle.startSystemMove())
+        self._last_system_chrome_operation = ("move", None, accepted)
+
+    def _toggle_window_maximized(self) -> None:
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange and hasattr(self, "top_bar"):
+            self.top_bar.set_window_maximized(self.isMaximized())
+
+    def _fit_workspace_panels(self) -> None:
+        # Width adaptation is presentation-only: it does not overwrite the
+        # operator's persisted rail preference.
+        if not hasattr(self, "search_dock"):
+            return
+        side_open = not self.inspector_dock.isHidden() or not self.search_dock.isHidden()
+        self.rail.set_compact_for_width(self.width() < (1180 if side_open else 900))
+        self.top_bar.set_rail_collapsed(self.rail.effective_collapsed)
+        narrow = self.width() < 1180
+        if narrow != getattr(self, "_narrow_workspace", None):
+            self._narrow_workspace = narrow
+            self.resizeDocks([self.inspector_dock], [270 if narrow else 300], Qt.Orientation.Horizontal)
 
     def _register_standard_actions(self) -> None:
         """Register Phase 11 M1 standard actions with the action registry.
@@ -1026,6 +1170,9 @@ class MainWindow(QMainWindow):
                 restored = False
         finally:
             self._applying_dock_layout = False
+            # Advisory Qt layout state may include a hidden global toolbar.
+            # It cannot suppress navigation or the explicit runtime warning.
+            self.console_toolbar.show()
         if not restored:
             # The blob is an advisory, Qt-version-tied opaque payload: a
             # malformed or incompatible layout falls back to the default
@@ -1279,7 +1426,8 @@ class MainWindow(QMainWindow):
         self._select_chat_row(chat_id)
 
     def _toggle_rail(self) -> None:
-        self.rail.set_collapsed(not self.rail.collapsed)
+        self.rail.set_collapsed(not self.rail.effective_collapsed)
+        self.top_bar.set_rail_collapsed(self.rail.effective_collapsed)
         self._schedule(self._save_workspace())
 
     def _open_global_search(self, _checked: bool = False) -> None:
@@ -1310,6 +1458,7 @@ class MainWindow(QMainWindow):
             self._schedule(self._refresh_search_status())
 
     def _sync_search_button(self, visible: bool) -> None:
+        self._fit_workspace_panels()
         if self.top_bar.search_button.isChecked() != visible:
             self.top_bar.search_button.blockSignals(True)
             self.top_bar.search_button.setChecked(visible)
@@ -1618,6 +1767,10 @@ class MainWindow(QMainWindow):
             try:
                 connections = await self._application.list_provider_connections()
                 models = await self._application.list_model_catalogue()
+                credential_statuses = {}
+                for connection in connections:
+                    credential = await self._application.provider_credential_status(connection.id)
+                    credential_statuses[connection.id] = "unknown" if credential is None else credential.status
                 selection = (
                     None
                     if self._current_chat_id is None
@@ -1665,13 +1818,19 @@ class MainWindow(QMainWindow):
                             else None
                         ),
                         metadata=metadata,
+                        connection_retired=bool(connection is not None and connection.retired),
+                        connection_enabled=bool(connection is not None and connection.enabled),
+                        context_accounting=("provider-managed" if connection is not None and connection.backend_type is BackendType.OPENAI_COMPATIBLE_HTTP and connection.profile is ProviderProfile.OPENROUTER and not self._developer_provider_test_mode else ""),
+                        credential_status=credential_statuses.get(model.connection_id, "unknown"),
+                        credential_required=bool(connection is not None and connection.backend_type is not BackendType.FAKE and (connection.profile is ProviderProfile.OPENROUTER or connection.credential_source is not CredentialSource.NONE)),
+                        catalogue_freshness=("never refreshed" if connection is None or connection.catalogue_refresh_at is None else f"state recorded {connection.catalogue_refresh_at.isoformat()}"),
                     )
                 )
                 if selection is not None and model.id == selection.model_entry_id:
                     selected_model = (connection, model)
             self._model_selector_records = records
             self._model_selector_selected_id = None if selection is None else selection.model_entry_id
-            self.top_bar.set_models(entries, self._model_selector_selected_id, records=records)
+            self.top_bar.set_models(entries, None if selection is None or selection.selection_required else self._model_selector_selected_id, records=records)
             if selection is None or selection.selection_required or selected_model is None:
                 self.top_bar.model_pill.setText("Selection required")
                 self.top_bar.model_pill.setToolTip("This chat has no durable current model selection.")
@@ -1681,6 +1840,8 @@ class MainWindow(QMainWindow):
                 self.top_bar.model_pill.setToolTip(
                     f"{connection.name} / {model.provider_model_id} — {model.availability.value}"
                 )
+            selected_entry = next((entry for entry in records if entry.model_entry_id == self._model_selector_selected_id), None)
+            self._present_model_readiness(selected_entry, selection_required=selection is None or selection.selection_required)
             await self._refresh_settings_dialog_unlocked()
             await self._refresh_tune_dialog_unlocked()
 
@@ -1705,11 +1866,60 @@ class MainWindow(QMainWindow):
         dialog = ModelSelectorPopup(self)
         dialog.set_entries(self._model_selector_records, self._model_selector_selected_id)
         dialog.model_entry_chosen.connect(self._on_model_selected)
+        dialog.view_connection_requested.connect(self._on_view_model_connection)
         dialog.finished.connect(lambda _result: self._clear_model_selector_popup(dialog))
         anchor = self.top_bar.model_selector
-        dialog.move(anchor.mapToGlobal(QPoint(0, anchor.height())))
+        anchor_point = anchor.mapToGlobal(QPoint(0, anchor.height()))
         self._model_selector_popup = dialog
         dialog.show()
+        position_dialog_at_anchor(dialog, anchor_point)
+
+    def _present_model_readiness(self, selected_entry: ModelSelectorEntry | None, *, selection_required: bool = False) -> None:
+        self.top_bar.tune_button.setEnabled(self._phase5 and selected_entry is not None and not selection_required)
+        if selected_entry is None or selection_required:
+            self._model_known_blocked = True
+            self.model_readiness_label.setText("Choose a model")
+            self.top_bar.readiness_label.setText("Choose a model")
+            self.top_bar.readiness_label.setToolTip("This chat has no current model selection.")
+            self.model_recovery_button.setText("Choose model")
+            self.model_recovery_button.setVisible(True)
+            self.transcript.empty_label.setText("Start a conversation\n\nChoose a model, then write a message below.")
+        else:
+            heading, reason = model_readiness(selected_entry)
+            self._model_known_blocked = heading.startswith("Unavailable")
+            if selected_entry.context_accounting == "provider-managed":
+                reason += "\nB.O.T.S. selects context deterministically. Exact upstream tokenization is unavailable; the provider performs final context admission."
+                heading += " · Context accounting: Provider-managed"
+            self.model_readiness_label.setText(heading)
+            self.top_bar.readiness_label.setText(heading)
+            self.top_bar.readiness_label.setToolTip(reason + "\n" + readiness_details(selected_entry))
+            self.model_recovery_button.setText("View connection")
+            self.model_recovery_button.setVisible(self._model_known_blocked)
+            self.model_readiness_label.setToolTip(reason + "\n" + readiness_details(selected_entry))
+            self.transcript.empty_label.setText("Start a conversation\n\n" + (reason if self._model_known_blocked else "Write a message below to start this chat."))
+        self.send_button.setToolTip(self.model_readiness_label.text() if self._model_known_blocked else "Send message (Enter)")
+        self._update_controls()
+
+    def _on_model_recovery(self) -> None:
+        if self.model_recovery_button.text() == "Choose model":
+            if self.top_bar.model_selector.has_entries():
+                self._open_model_selector()
+            else:
+                self._on_settings_requested()
+        else:
+            selected = next((entry for entry in self._model_selector_records if entry.model_entry_id == self._model_selector_selected_id), None)
+            if selected is not None:
+                self._on_view_model_connection(selected.connection_id)
+
+    def _on_view_model_connection(self, connection_id: str) -> None:
+        self._on_settings_requested()
+        self._schedule(self._show_model_connection(connection_id))
+
+    async def _show_model_connection(self, connection_id: str) -> None:
+        await self._refresh_settings_dialog()
+        if self._settings_dialog is not None:
+            self._settings_dialog.show_connection(connection_id)
+            self._settings_dialog.raise_()
 
     def _clear_model_selector_popup(self, dialog: ModelSelectorPopup) -> None:
         if self._model_selector_popup is dialog:
@@ -2217,6 +2427,8 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(str(exc))
 
     def _on_attach_file(self) -> None:
+        if self._developer_provider_test_mode:
+            return
         if (
             self._generation_busy
             or self._historical_leaf_message_id is not None
@@ -2228,11 +2440,15 @@ class MainWindow(QMainWindow):
             "Attach file",
             "",
             "Text or data files (*)",
+            options=QFileDialog.Option.DontUseNativeDialog,
         )
         if path:
             self._schedule(self._attach_file(path))
 
     async def _attach_file(self, path: str) -> None:
+        if self._developer_provider_test_mode:
+            self.statusBar().showMessage("Attachments are unavailable in INEXACT / PROVIDER TEST MODE")
+            return
         chat_id = self._current_chat_id
         if chat_id is None or self._historical_leaf_message_id is not None:
             return
@@ -2250,6 +2466,9 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(str(exc))
 
     async def _refresh_pending_attachment_button(self, chat_id: str) -> None:
+        if self._developer_provider_test_mode:
+            self.attachment_button.setToolTip("Attachments are unavailable in INEXACT / PROVIDER TEST MODE")
+            return
         try:
             pending = await self._application.pending_attachments(chat_id)
         except Exception:
@@ -2262,6 +2481,9 @@ class MainWindow(QMainWindow):
         )
 
     def _on_send(self) -> None:
+        if self._model_known_blocked:
+            self.statusBar().showMessage(self.model_readiness_label.text())
+            return
         self._schedule(self._send_message())
 
     async def _send_message(self) -> None:
@@ -2438,10 +2660,11 @@ class MainWindow(QMainWindow):
         self.chat_list.setEnabled(True)
         self.new_chat_button.setEnabled(True)
         self.send_button.setEnabled(
-            not busy and not historical and bool(self.composer.toPlainText().strip())
+            not busy and not historical and not self._model_known_blocked and bool(self.composer.toPlainText().strip())
         )
         self.attachment_button.setEnabled(
-            not busy and not historical and self._current_chat_id is not None
+            not self._developer_provider_test_mode
+            and not busy and not historical and self._current_chat_id is not None
         )
         self.cancel_button.setEnabled(busy and self._active_attempt_id is not None)
         self.rail.chat_button.setEnabled(True)
@@ -2454,10 +2677,12 @@ class MainWindow(QMainWindow):
         self.send_button.setEnabled(
             not self._generation_busy
             and not historical
+            and not self._model_known_blocked
             and bool(self.composer.toPlainText().strip())
         )
         self.attachment_button.setEnabled(
-            not self._generation_busy
+            not self._developer_provider_test_mode
+            and not self._generation_busy
             and not historical
             and self._current_chat_id is not None
         )
@@ -2587,8 +2812,54 @@ class MainWindow(QMainWindow):
         if generation != self._refresh_generation or chat_id != self._current_chat_id:
             return
         self._render_transcript_projection(chat, messages)
+        await self._refresh_message_model_identities(chat_id, generation)
+        await self._refresh_message_errors(chat_id, generation)
         if self.inspector_dock.isVisible():
             await self._refresh_inspector()
+
+    async def _refresh_message_model_identities(self, chat_id: str, generation: int) -> None:
+        """Show only identity belonging to each message's persisted attempt."""
+        list_attempts = getattr(self._application, "list_generation_attempts", None)
+        if not callable(list_attempts):
+            return
+        try:
+            attempts = await list_attempts(chat_id)
+        except Exception:
+            return
+        if generation != self._refresh_generation or chat_id != self._current_chat_id:
+            return
+        identities: dict[str, set[str]] = {}
+        for attempt in attempts:
+            identity = getattr(attempt, "returned_model", None) or getattr(attempt, "model", None)
+            if identity:
+                identities.setdefault(attempt.assistant_message_id, set()).add(identity)
+        for message_id, values in identities.items():
+            row = self.transcript.message_rows.get(message_id)
+            if row is not None and row.message.role is MessageRole.ASSISTANT and len(values) == 1:
+                identity = next(iter(values))
+                row.model_identity_label.setText(identity)
+                row.model_identity_label.setToolTip(identity)
+                row.model_identity_label.setVisible(True)
+
+    async def _refresh_message_errors(self, chat_id: str, generation: int) -> None:
+        """Give failed turns the same display-safe reason as Inspect details."""
+        inspect = getattr(self._application, "inspect_chat", None)
+        if not callable(inspect):
+            return
+        failed = tuple(row.message.id for row in self.transcript.message_rows.values() if row.message.state is MessageState.FAILED)
+        for message_id in failed:
+            try:
+                projection = await inspect(chat_id, message_id=message_id, historical_leaf_message_id=self._historical_leaf_message_id)
+            except Exception:
+                # The existing Inspect action remains available if the
+                # optional presentation refresh cannot obtain its projection.
+                continue
+            if generation != self._refresh_generation or chat_id != self._current_chat_id:
+                return
+            row = self.transcript.message_rows.get(message_id)
+            if row is not None and projection.selected_message_id == message_id:
+                reasons = [field.value for field in projection.fields if field.name.startswith("Attempt ") and field.name.endswith(" error") and field.value != "none"]
+                row.show_error_detail("\n".join(reasons))
 
     def _render_transcript_projection(
         self,
@@ -2675,6 +2946,7 @@ class MainWindow(QMainWindow):
             self._schedule(self._refresh_inspector())
 
     def _sync_inspector_button(self, visible: bool) -> None:
+        self._fit_workspace_panels()
         if self.top_bar.details_button.isChecked() != visible:
             self.top_bar.details_button.blockSignals(True)
             self.top_bar.details_button.setChecked(visible)
@@ -2779,7 +3051,7 @@ class MainWindow(QMainWindow):
             and self._workspace.is_last_window(self._window_id)
             and self._application.has_active_generations()
         ):
-            answer = QMessageBox.question(
+            answer = normalized_question(
                 self,
                 "Stop active generations?",
                 "Active generations will be cancelled and their partial output preserved.",

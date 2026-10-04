@@ -16,7 +16,7 @@ PHASE9 = "0012_phase9_archive_import"
 # The application's migration head, which is what a normal startup now reaches.
 # Kept separate from PHASE9 because that constant still names the Phase 9
 # revision this module explicitly upgrades to.
-HEAD = "0019_phase11_generation_settings"
+HEAD = "0020_provider_managed_context"
 PRE_LEGACY = "0008_catalogue_refresh_outcomes"
 
 

@@ -108,7 +108,7 @@ def test_phase3_outcome_columns_are_additive_and_nullable(tmp_path: Path):
         with store.command_admission():
             with store.engine.connect() as connection:
                 assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-                    "0019_phase11_generation_settings"
+                    "0020_provider_managed_context"
                 )
     finally:
         store.close()
@@ -1322,6 +1322,7 @@ def test_nonstreaming_provider_preserves_empty_system_message(provider_kind: str
         "temperature": 0.0,
         "max_tokens": 16,
         "stream": False,
+        **({"provider": {"require_parameters": True}} if provider_kind == "openrouter" else {}),
     }
 
 
