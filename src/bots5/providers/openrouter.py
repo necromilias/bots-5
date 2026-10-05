@@ -17,6 +17,7 @@ from .base import (
     CompletionStreamEvent,
     serialize_generation_settings,
 )
+from .openai_compatible import _owned_response_lines
 
 
 _BEARER_RE = re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+")
@@ -319,19 +320,20 @@ class OpenRouterProvider:
                             response.status_code,
                             f"provider_http_error status={response.status_code} body={body!r}",
                         )
-                    async for line in response.aiter_lines():
-                        if not line.startswith("data:"):
-                            continue
-                        payload = line[5:].strip()
-                        if not payload:
-                            continue
-                        if payload == "[DONE]":
-                            return
-                        try:
-                            data = json.loads(payload)
-                        except ValueError:
-                            raise ProviderResponseError("malformed_provider_response") from None
-                        yield self._normalize_stream_chunk(data)
+                    async with _owned_response_lines(response) as lines:
+                        async for line in lines:
+                            if not line.startswith("data:"):
+                                continue
+                            payload = line[5:].strip()
+                            if not payload:
+                                continue
+                            if payload == "[DONE]":
+                                return
+                            try:
+                                data = json.loads(payload)
+                            except ValueError:
+                                raise ProviderResponseError("malformed_provider_response") from None
+                            yield self._normalize_stream_chunk(data)
         except httpx.HTTPError as exc:
             raise ProviderError(f"provider_transport_error: {self._sanitize(str(exc))}") from None
         except ProviderError:

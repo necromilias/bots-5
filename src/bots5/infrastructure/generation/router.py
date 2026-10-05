@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 
 from bots5.core.generation import GenerationBackend, GenerationEvent, GenerationRequest
 from bots5.infrastructure.secrets import (
@@ -72,11 +73,13 @@ class BuiltinProviderRouter(GenerationBackend):
 
     async def stream(self, request: GenerationRequest) -> AsyncIterator[GenerationEvent]:
         if request.backend_id == "fake":
-            async for event in self._fake.stream(request):
-                yield event
+            async with aclosing(self._fake.stream(request)) as stream:
+                async for event in stream:
+                    yield event
             return
         if request.backend_id != "openai_compatible_http":
             raise ValueError("unsupported Phase 5 backend")
         backend = self._openai_backend(request)
-        async for event in backend.stream(request):
-            yield event
+        async with aclosing(backend.stream(request)) as stream:
+            async for event in stream:
+                yield event

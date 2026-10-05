@@ -159,18 +159,22 @@ def _fake_capability_facts(model_entry_id: str, observed_at):
     )
 
 
-def _abandon_task(task: asyncio.Task[object]) -> None:
-    """Cancel a child without allowing a cancellation-resistant backend to hold us up."""
-    if not task.done():
-        task.cancel()
-
-    def consume(completed: asyncio.Task[object]) -> None:
-        try:
-            completed.result()
-        except BaseException:
-            pass
-
-    task.add_done_callback(consume)
+async def _settle_generation_stream(iterator, child, *, child_consumed: bool) -> None:
+    """Join the current advance before closing the exclusively owned iterator."""
+    child_failure = None
+    if child is not None:
+        result, = await asyncio.gather(child, return_exceptions=True)
+        if (
+            not child_consumed
+            and isinstance(result, BaseException)
+            and not isinstance(result, (asyncio.CancelledError, StopAsyncIteration))
+        ):
+            child_failure = result
+    close = getattr(iterator, "aclose", None)
+    if close is not None:
+        await close()
+    if child_failure is not None:
+        raise child_failure
 
 
 def _observe_background_task(task: asyncio.Task[object]) -> None:
@@ -2631,6 +2635,9 @@ class BotsApplication:
         current_attempt = attempt
         terminal_persisted = False
         dispatch_may_have_occurred = False
+        iterator = None
+        next_event = None
+        child_consumed = True
         try:
             ready.set()
             await asyncio.sleep(0)
@@ -2651,6 +2658,7 @@ class BotsApplication:
                 else:
                     remaining = deadline - asyncio.get_running_loop().time()
                     next_event = asyncio.create_task(iterator.__anext__())
+                    child_consumed = False
                     # Always give an already-available backend event one event
                     # loop turn.  Durable local persistence can consume the
                     # remaining wall-clock budget, but must not discard output
@@ -2667,20 +2675,18 @@ class BotsApplication:
                             deadline_wait.cancel()
                             await asyncio.gather(deadline_wait, return_exceptions=True)
                             try:
+                                child_consumed = True
                                 event = next_event.result()
                             except StopAsyncIteration:
                                 break
                         else:
-                            _abandon_task(next_event)
                             raise GenerationTimeout
                     finally:
                         if not next_event.done():
-                            _abandon_task(next_event)
+                            next_event.cancel()
                         if not deadline_wait.done():
                             deadline_wait.cancel()
                         await asyncio.gather(deadline_wait, return_exceptions=True)
-                        if next_event.done():
-                            _abandon_task(next_event)
                 if event.attempt_id != attempt.id:
                     raise StateError("generation backend returned an event for another attempt")
                 if attempt.id in self._cancel_requested:
@@ -2883,12 +2889,6 @@ class BotsApplication:
         except asyncio.CancelledError:
             if terminal_persisted:
                 raise
-            close_stream = getattr(iterator, "aclose", None)
-            if close_stream is not None:
-                try:
-                    await close_stream()
-                except BaseException:
-                    pass
             with self._application_effect_scope(independent=True):
                 now = self._clock.now()
                 message = replace(message, state=MessageState.ABORTED)
@@ -2944,6 +2944,17 @@ class BotsApplication:
                     error_message=current_attempt.error_message,
                 )
         finally:
+            if iterator is not None:
+                # No wait on the user-visible timeout/Stop critical path. The
+                # existing execution owner drains this release obligation even
+                # when shutdown is what cancelled the generation task.
+                self._execution.start(
+                    _settle_generation_stream(
+                        iterator, next_event, child_consumed=child_consumed
+                    ),
+                    name=f"bots5-stream-cleanup-{attempt.id}",
+                    cleanup=True,
+                )
             self._pending_generations.pop(attempt.id, None)
             self._generation_tasks.pop(attempt.id, None)
             self._generation_terminal_events.pop(attempt.id, None)

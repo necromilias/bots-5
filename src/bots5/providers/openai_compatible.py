@@ -3,8 +3,10 @@ from __future__ import annotations
 import os
 import json
 import re
+import sys
 import time
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, contextmanager
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -22,6 +24,101 @@ from .base import (
 
 _BEARER_RE = re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+")
 _SQLITE_INTEGER_MAX = 2**63 - 1
+
+
+class _ResponseReadStep:
+    """Observe generator creation only while synchronously stepping a read."""
+
+    def __init__(self, awaitable, owner):
+        self._iterator = awaitable.__await__()
+        self._owner = owner
+
+    def __await__(self):
+        return self
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self.send(None)
+
+    def send(self, value):
+        with self._owner.capture():
+            return self._iterator.send(value)
+
+    def throw(self, *args):
+        with self._owner.capture():
+            return self._iterator.throw(*args)
+
+    def close(self):
+        with self._owner.capture():
+            return self._iterator.close()
+
+
+class _ResponseIterators:
+    """Keep every nested body/decoder generator until explicit awaited close."""
+
+    def __init__(self, response):
+        self._lines = response.aiter_lines()
+        self._generators = [self._lines]
+
+    @contextmanager
+    def capture(self):
+        hooks = sys.get_asyncgen_hooks()
+
+        def firstiter(generator):
+            if generator not in self._generators:
+                self._generators.append(generator)
+            if hooks.firstiter is not None:
+                hooks.firstiter(generator)
+
+        # A read step restores the original hooks before yielding to the loop.
+        # Other tasks never run under this capture; finalizer hooks are retained.
+        sys.set_asyncgen_hooks(firstiter=firstiter)
+        try:
+            yield
+        finally:
+            sys.set_asyncgen_hooks(*hooks)
+
+    async def lines(self):
+        while True:
+            try:
+                line = await _ResponseReadStep(anext(self._lines), self)
+            except StopAsyncIteration:
+                return
+            yield line
+
+    async def aclose(self):
+        failures = []
+        index = 0
+        # Outer close can drop a suspended inner iterator, but these strong
+        # references prevent destructor-driven finalization. Close each one,
+        # including any generators opened by close itself, without anext().
+        while index < len(self._generators):
+            generator = self._generators[index]
+            index += 1
+            try:
+                await _ResponseReadStep(generator.aclose(), self)
+            except BaseException as error:
+                failures.append(error)
+        if failures:
+            raise failures[0]
+
+
+@asynccontextmanager
+async def _owned_response_lines(response: httpx.Response):
+    owner = _ResponseIterators(response)
+    lines = owner.lines()
+    try:
+        yield lines
+    finally:
+        try:
+            await response.aclose()
+        finally:
+            try:
+                await lines.aclose()
+            finally:
+                await owner.aclose()
 
 
 def _optional_int(value: Any) -> int | None:
@@ -302,19 +399,20 @@ class OpenAICompatibleProvider:
                             response.status_code,
                             f"provider_http_error status={response.status_code} body={body!r}",
                         )
-                    async for line in response.aiter_lines():
-                        if not line.startswith("data:"):
-                            continue
-                        payload = line[5:].strip()
-                        if not payload:
-                            continue
-                        if payload == "[DONE]":
-                            return
-                        try:
-                            data = json.loads(payload)
-                        except ValueError:
-                            raise ProviderResponseError("malformed_provider_response") from None
-                        yield self._normalize_stream_chunk(data)
+                    async with _owned_response_lines(response) as lines:
+                        async for line in lines:
+                            if not line.startswith("data:"):
+                                continue
+                            payload = line[5:].strip()
+                            if not payload:
+                                continue
+                            if payload == "[DONE]":
+                                return
+                            try:
+                                data = json.loads(payload)
+                            except ValueError:
+                                raise ProviderResponseError("malformed_provider_response") from None
+                            yield self._normalize_stream_chunk(data)
         except httpx.HTTPError as exc:
             raise ProviderError(f"provider_transport_error: {self._sanitize(str(exc))}") from None
         except ProviderError:

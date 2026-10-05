@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from dataclasses import replace
 
 from bots5.core.generation import (
@@ -172,49 +173,54 @@ class OpenAICompatibleStreamingBackend:
         metadata = CompletionStreamEvent()
         finish_reason: str | None = None
         output_text = ""
+        failure_event: GenerationFailed | None = None
         try:
-            async for chunk in self._provider.stream(completion_request):
-                if (
-                    chunk.finish_reason is not None
-                    and finish_reason is not None
-                    and chunk.finish_reason != finish_reason
-                ):
-                    raise ProviderResponseError("conflicting_finish_reason")
-                metadata = self._merge_metadata(metadata, chunk)
-                if any(
-                    value is not None
-                    for value in (
-                        metadata.returned_model,
-                        metadata.request_id,
-                        metadata.prompt_tokens,
-                        metadata.completion_tokens,
-                        metadata.reasoning_tokens,
-                        metadata.total_tokens,
-                        metadata.known_cost_usd,
-                    )
-                ):
-                    yield GenerationMetadata(
-                        attempt_id=request.attempt_id,
-                        returned_model=metadata.returned_model,
-                        request_id=metadata.request_id,
-                        prompt_tokens=metadata.prompt_tokens,
-                        completion_tokens=metadata.completion_tokens,
-                        reasoning_tokens=metadata.reasoning_tokens,
-                        total_tokens=metadata.total_tokens,
-                        known_cost_usd=metadata.known_cost_usd,
-                    )
-                if chunk.text:
-                    output_text += chunk.text
-                    yield GenerationDelta(attempt_id=request.attempt_id, text=chunk.text)
-                if chunk.finish_reason is not None:
-                    finish_reason = chunk.finish_reason
+            async with aclosing(self._provider.stream(completion_request)) as stream:
+                async for chunk in stream:
+                    if (
+                        chunk.finish_reason is not None
+                        and finish_reason is not None
+                        and chunk.finish_reason != finish_reason
+                    ):
+                        raise ProviderResponseError("conflicting_finish_reason")
+                    metadata = self._merge_metadata(metadata, chunk)
+                    if any(
+                        value is not None
+                        for value in (
+                            metadata.returned_model,
+                            metadata.request_id,
+                            metadata.prompt_tokens,
+                            metadata.completion_tokens,
+                            metadata.reasoning_tokens,
+                            metadata.total_tokens,
+                            metadata.known_cost_usd,
+                        )
+                    ):
+                        yield GenerationMetadata(
+                            attempt_id=request.attempt_id,
+                            returned_model=metadata.returned_model,
+                            request_id=metadata.request_id,
+                            prompt_tokens=metadata.prompt_tokens,
+                            completion_tokens=metadata.completion_tokens,
+                            reasoning_tokens=metadata.reasoning_tokens,
+                            total_tokens=metadata.total_tokens,
+                            known_cost_usd=metadata.known_cost_usd,
+                        )
+                    if chunk.text:
+                        output_text += chunk.text
+                        yield GenerationDelta(attempt_id=request.attempt_id, text=chunk.text)
+                    if chunk.finish_reason is not None:
+                        finish_reason = chunk.finish_reason
         except ProviderError as exc:
-            yield GenerationFailed(
+            failure_event = GenerationFailed(
                 attempt_id=request.attempt_id,
                 error_type=type(exc).__name__,
                 error_message=str(exc)[:500],
                 remote_outcome_unknown=self._provider_failure_is_uncertain(exc),
             )
+
+        if failure_event is not None:
+            yield failure_event
             return
 
         if finish_reason == "stop" and not output_text.strip():
