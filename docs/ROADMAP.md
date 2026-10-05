@@ -28,6 +28,10 @@ Phases **1 through 8 and Phase 9 Slices A and B are implemented, validated, comm
 Phase 9 Slices C, D, and E are likewise implemented, validated, and landed, so **Phase 9 is closed**.
 **Phase 10 — campaign desktop integration — is landed** at
 `9762170099889ecd87d451341a15a29ce7aceae8`.
+**Phase 11 — product finishing and standalone packaging — is closed and landed** at
+`59265916abeb2e9f6cbf953726f22a9f7c00f3b5`; see the [Phase 11 closure record](LINUX_V0_1_PHASE11_CLOSURE_REPORT.md).
+Final retained validation: **2189 passed / 1 permitted skip / 0 failures / 0 errors** on T4,
+**71/71** frozen cleanup and **156/156** M7 checks. The validated standalone remains local and unreleased.
 
 - Phase 1: native walking skeleton, core, persistence, events, fake streaming backend.
 - Phase 2: conversation truth, immutable lineage/revisions, and deterministic fake generation.
@@ -108,9 +112,9 @@ SQLite ≤ 3.45.1 parser-compatibility repair landed at
 `58fca2c7b1b4111d982733980c303565bf91695e` rather than `5bb7833` or any later `main` descendant
 (`docs/CI_V1.md`).
 
-**Phase 11 — product finishing and standalone packaging — is next in the accepted sequence and is not
-authorized by this repository state.** Its final visual basis is not yet adjudicated (see
-§Current product target).
+**Phase 12: Linux v0.1 torture run and separate closure adjudication** is next. Phase 11 is
+closed and landed as recorded above. Phase 12 design and execution are not authorized by this
+documentation reconciliation; detailed planning remains a later inspect/propose/approve boundary.
 
 The accepted desktop sequence remains:
 
@@ -125,8 +129,8 @@ The accepted desktop sequence remains:
 9. Phase 8: inspection/provenance UX — **closed and landed**;
 10. Phase 9: import/export, backup, verification, and restore — **closed; Slices A through E landed**;
 11. Phase 10: campaign desktop integration — **closed and landed**;
-12. Phase 11: product finishing and standalone packaging — **next; not authorized**;
-13. Phase 12: Linux v0.1 torture run and separate closure adjudication.
+12. Phase 11: product finishing and standalone packaging — **closed and landed**;
+13. Phase 12: Linux v0.1 torture run and separate closure adjudication — **next; not authorized**.
 
 Every phase retains inspect -> propose -> approve -> edit -> validate -> separate commit approval ->
 separate push/landing approval.
@@ -137,10 +141,9 @@ Linux v0.1 remains a real native Linux desktop application centred on persistent
 lineage, concurrent streaming generation, deterministic context construction, reusable attachments,
 search, provenance/inspection, backup/recovery, and a thin operational campaign surface.
 
-The landed Draft 1 shell is current implementation truth. `docs/LINUX_V0_1_UI_UX_DRAFT_1.md` remains a
-provisional design document, and the later visual-design candidate is a draft; neither is promoted to
-final design authority here. The final visual/aesthetic basis for Phase 11 is not yet adjudicated and
-remains a separate human decision.
+The landed Phase 11 shell follows the accepted later chrome/colour authority recorded in the
+[closure report](LINUX_V0_1_PHASE11_CLOSURE_REPORT.md). Historical Draft 1 and later visual candidate
+documents retain their provisional/draft scope; they are not promoted wholesale by this reconciliation.
 
 ## Deferred beyond Linux v0.1
 

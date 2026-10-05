@@ -9,7 +9,8 @@ The original campaign harness baseline is closed and preserved. V0.2 adds the bu
 `local_openai` provider while preserving the bounded manifest-driven execution model.
 
 Linux v0.1 is implemented, validated, and landed through **Phase 9 closure (Slices A–E)** and
-**Phase 10 — native desktop surface over the headless campaign engine**:
+**Phase 10 — native desktop surface over the headless campaign engine** and
+**Phase 11 — product finishing and standalone packaging**:
 
 1. native walking skeleton;
 2. conversation truth, immutable lineage/revisions, and deterministic fake generation;
@@ -36,6 +37,8 @@ Linux v0.1 is implemented, validated, and landed through **Phase 9 closure (Slic
     with `selection.json`, one-shot preflight approval binding, truthful cancellation, cumulative
     versus selected cost accounting, worker regeneration, synthesis rerun with mechanical staleness,
     and headless CLI parity (`inspect --attempt`, `regenerate`, `rerun-synthesis`).
+15. Phase 11 product finishing, generation settings, provider-managed OpenRouter context/Archive v3,
+    explicit provider-stream cleanup and validated standalone CLI/desktop packaging.
 
 The landed Phase 6 implementation is commit
 `20847c7a49e26679d0d3dfe99798a2c211bec436`. Its final reserved acceptance gates were
@@ -76,8 +79,11 @@ the workflow dispatch-only. The authoritative CI v1 run exercised candidate
 `58fca2c7b1b4111d982733980c303565bf91695e`, not `5bb7833` or any later `main` descendant
 (`docs/CI_V1.md`).
 
-**Phase 11 — product finishing and standalone packaging — is next in the accepted sequence and is
-not authorized by this repository state.**
+**Phase 11 — product finishing and standalone packaging — is closed and landed** at
+`59265916abeb2e9f6cbf953726f22a9f7c00f3b5`. See the [Phase 11 closure record](docs/LINUX_V0_1_PHASE11_CLOSURE_REPORT.md).
+The validated standalone remains local; no public release or deployment occurred.
+**Phase 12: Linux v0.1 torture run and separate closure adjudication** is next; this status
+reconciliation does not authorize its design or execution.
 
 The build-facing Linux v0.1 contract remains `docs/LINUX_V0_1_DESIGN.md`. The cumulative Phase 6
 implementation history remains in `docs/LINUX_V0_1_PHASE6_IMPLEMENTATION_REPORT.md` and the later
@@ -87,10 +93,9 @@ change the landed Phase 6 disposition. The Phase 9 Slice A and Slice B closure r
 historical interchange/export/import landing boundaries, the Slice E closure report records Phase 9
 technical closure, and `docs/LINUX_V0_1_PHASE10_CLOSURE_REPORT.md` records the Phase 10 landing.
 
-The landed Draft 1 shell is current implementation truth. `docs/LINUX_V0_1_UI_UX_DRAFT_1.md` remains
-a provisional design document, and the later visual-design candidate is a draft; neither is promoted
-to final design authority here. The final visual/aesthetic basis for Phase 11 is therefore not yet
-adjudicated and remains a separate human decision.
+The landed Phase 11 shell follows the accepted later chrome/colour authority recorded in the
+closure report. Historical Draft 1 and later visual candidate documents retain their own
+provisional/draft status; this reconciliation does not promote them wholesale.
 
 ## Campaign harness
 
@@ -239,6 +244,8 @@ Key records include:
 - `docs/LINUX_V0_1_PHASE9_SLICE_B_CLOSURE_REPORT.md` — authoritative Phase 9 Slice B closure and landing record;
 - `docs/LINUX_V0_1_PHASE9_SLICE_E_CLOSURE_REPORT.md` — Phase 9 technical-closure record;
 - `docs/LINUX_V0_1_PHASE10_CLOSURE_REPORT.md` — authoritative Phase 10 closure and landing record;
+- [Phase 11 closure report](docs/LINUX_V0_1_PHASE11_CLOSURE_REPORT.md) — final accepted source/package and landing record;
+- [Final Phase 11 authority/effect supplement](docs/UNIFIED_AUTHORITY_EFFECT_INVENTORY_PHASE11_FINAL_SUPPLEMENT.md) — additive post-M3 participation accounting;
 - `docs/CI_V1.md` — CI v1 authoritative T4 reference and its stated limitations;
 - `docs/SQLITE_COMPATIBILITY_REPAIR.md` — SQLite ≤ 3.45.1 parser-compatibility repair record;
 - `docs/LINUX_V0_1_DESIGN.md` — accepted Linux v0.1 build-facing contract.

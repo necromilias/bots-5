@@ -16,10 +16,11 @@ Phase 9 A-E technical contract and its validation evidence, and
 SQLite ≤ 3.45.1 parser-compatibility repair is recorded in `SQLITE_COMPATIBILITY_REPAIR.md`, and CI
 v1 in `CI_V1.md`.
 
-**Phase 11 — product finishing and standalone packaging — is next in the accepted sequence and is
-not authorized by this repository state.** Its final visual/aesthetic basis is not yet adjudicated:
-the landed Draft 1 shell is current implementation truth, while `LINUX_V0_1_UI_UX_DRAFT_1.md` remains
-provisional and the later visual-design candidate is a draft.
+**Phase 11 — product finishing and standalone packaging — is closed and landed** at
+`59265916abeb2e9f6cbf953726f22a9f7c00f3b5`; see the [Phase 11 closure record](LINUX_V0_1_PHASE11_CLOSURE_REPORT.md).
+Its accepted later chrome/colour authority is recorded there; historical visual drafts retain their
+own scope. **Phase 12: Linux v0.1 torture run and separate closure adjudication** is next, with
+design and execution requiring separate authority.
 
 This document remains the build-facing technical contract for the first native Linux B.O.T.S. desktop
 application. Organisational Memory owns the broader decision rationale and supersession history; this
@@ -444,8 +445,8 @@ Build through validated vertical slices:
 9. Phase 8: inspection/provenance UX — **closed and landed**;
 10. Phase 9: import/export, backup, verification, and restore — **closed; Slices A through E landed**;
 11. Phase 10: campaign desktop integration — **closed and landed**;
-12. Phase 11: product finishing and standalone packaging — **next; not authorized**;
-13. Phase 12: Linux v0.1 torture run and separate closure adjudication.
+12. Phase 11: product finishing and standalone packaging — **closed and landed**;
+13. Phase 12: Linux v0.1 torture run and separate closure adjudication — **next; not authorized**.
 
 Every phase retains inspect -> propose -> approve -> edit -> validate -> separate commit approval ->
 separate push/landing approval.

@@ -25,7 +25,8 @@ limit. Unknown provider cost remains unknown.
 
 ## Linux desktop authority boundary
 
-Linux v0.1 is landed through Phase 10. It has consequential local persistence and therefore a stronger,
+Linux v0.1 is closed and landed through Phase 11; see the
+[Phase 11 closure record](LINUX_V0_1_PHASE11_CLOSURE_REPORT.md). It has consequential local persistence and therefore a stronger,
 explicit ownership boundary than the old campaign harness.
 
 One `DataRootAuthority` owns an authoritative data root. Forward application/store/database/event/filesystem
@@ -43,8 +44,19 @@ The finite participation accounting and closure evidence are:
 - `UNIFIED_AUTHORITY_EFFECT_INVENTORY.md` — landed Phase 6 base inventory, authoritative for its own
   closure scope and not superseded;
 - `UNIFIED_AUTHORITY_EFFECT_INVENTORY_PHASE7_10_SUPPLEMENT.md` — landed Phase 7–10 participation deltas;
+- [Phase 11 M3 supplement](UNIFIED_AUTHORITY_EFFECT_INVENTORY_PHASE11_SUPPLEMENT.md) — its historical M3 scope;
+- [Final Phase 11 supplement](UNIFIED_AUTHORITY_EFFECT_INVENTORY_PHASE11_FINAL_SUPPLEMENT.md) — additive post-M3 participation through final landing;
 - `LINUX_V0_1_PHASE6_IMPLEMENTATION_REPORT.md`;
 - `LINUX_V0_1_PHASE6_CLOSURE_REPORT.md`.
+
+The [provider-managed context/Archive v3 contract](PROVIDER_MANAGED_CONTEXT_ARCHIVE_V3.md)
+adds a separate provider-managed evidence plane; it does not weaken Phase 6 exact-accounting
+semantics or bypass data-root persistence admission. Final provider-stream ownership closes
+router/backend/provider generators and response/client/transport resources explicitly.
+ExecutionManager owns and drains deferred cleanup before application store release, surfacing
+real cleanup failures. Valid terminal completion does not consume irrelevant post-DONE tail;
+genuine failures retain their failure semantics. Retained general diagnostics are not a global
+resource-cleanliness guarantee.
 
 Future Android/remote clients must talk to the authority; they must not independently open the live
 authoritative database.
