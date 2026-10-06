@@ -19,6 +19,7 @@ from .base import (
     CompletionResult,
     CompletionStreamEvent,
     serialize_generation_settings,
+    transport_timeout,
 )
 
 
@@ -346,7 +347,7 @@ class OpenAICompatibleProvider:
         started = time.monotonic()
         try:
             async with httpx.AsyncClient(
-                timeout=None,
+                timeout=transport_timeout(request.timeout_seconds),
                 transport=self._transport,
             ) as client:
                 response = await client.post(
@@ -383,7 +384,7 @@ class OpenAICompatibleProvider:
         started = time.monotonic()
         try:
             async with httpx.AsyncClient(
-                timeout=None,
+                timeout=transport_timeout(request.timeout_seconds),
                 transport=self._transport,
             ) as client:
                 async with client.stream(

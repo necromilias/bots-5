@@ -17,7 +17,12 @@ from bots5.core.generation import (
 )
 from bots5.core.urls import canonical_http_base_url
 from bots5.domain.generation_settings_registry import SETTING_KEY_BY_CAPABILITY_KEY
-from bots5.errors import ContextAdmissionError, ProviderError, ProviderHttpError, ProviderResponseError
+from bots5.errors import (
+    ContextAdmissionError,
+    ProviderError,
+    ProviderResponseError,
+    provider_side_outcome_unknown,
+)
 from bots5.providers.base import (
     CompletionRequest,
     CompletionStreamEvent,
@@ -129,9 +134,14 @@ class OpenAICompatibleStreamingBackend:
     def _provider_failure_is_uncertain(error: ProviderError) -> bool:
         if isinstance(error, ContextAdmissionError):
             return False
-        if isinstance(error, ProviderHttpError):
-            return error.status_code >= 500
-        return True
+        # Delegate to the canonical Rule D-9 classification (RP-F-01, RP-F-05):
+        # every remaining class is decided by its own ``definitive_rejection``
+        # flag.  A definitive 4xx rejection (not 408/429) is a known remote
+        # outcome, as is ProviderResponseError (failed-but-received); 408/429,
+        # any 5xx, a plain ProviderError and a ProviderTimeoutError stay
+        # conservatively unknown.  No parallel per-class heuristic is
+        # maintained here, so no future exception class can diverge this way.
+        return provider_side_outcome_unknown(error)
 
     async def stream(self, request: GenerationRequest) -> AsyncIterator[GenerationEvent]:
         if request.backend_id != self.backend_id:

@@ -16,6 +16,7 @@ from .base import (
     CompletionResult,
     CompletionStreamEvent,
     serialize_generation_settings,
+    transport_timeout,
 )
 from .openai_compatible import _owned_response_lines
 
@@ -260,7 +261,7 @@ class OpenRouterProvider:
         started = time.monotonic()
         try:
             async with httpx.AsyncClient(
-                timeout=None,
+                timeout=transport_timeout(request.timeout_seconds),
                 transport=self._transport,
             ) as client:
                 response = await client.post(
@@ -300,7 +301,7 @@ class OpenRouterProvider:
         started = time.monotonic()
         try:
             async with httpx.AsyncClient(
-                timeout=None,
+                timeout=transport_timeout(request.timeout_seconds),
                 transport=self._transport,
             ) as client:
                 async with client.stream(

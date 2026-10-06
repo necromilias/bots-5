@@ -1581,7 +1581,11 @@ def test_conflicting_stream_finish_reasons_fail_closed(tmp_path: Path):
             assert kinds[-1] == "generation_failed"
             assert stored.state is AttemptState.FAILED
             assert stored.finish_reason is None
-            assert stored.remote_outcome_unknown is True
+            # RP-F-05: a conflicting-finish-reason stream raises
+            # ProviderResponseError — failed-but-received, a KNOWN remote
+            # outcome under the canonical Rule D-9 classification.  The
+            # attempt still fails closed (state FAILED, terminal, no retry).
+            assert stored.remote_outcome_unknown is False
             assert messages[-1].state is MessageState.FAILED
             assert messages[-1].content == "partial"
         finally:

@@ -172,6 +172,19 @@ For a local-only schema-v2 campaign job, set `providers.local_openai.base_url`. 
 optional; when `api_key_env` is present, only that named environment variable is read. A local-only job
 does not require `OPENROUTER_API_KEY`.
 
+### Known standalone limitation
+
+Known standalone limitation: the current Linux standalone build aborts during startup if any component
+of the full path to either executable contains non-ASCII characters. This includes non-ASCII ancestor
+directories such as a user's home directory. Source execution is unaffected. This is currently
+classified as a frozen/toolchain limitation; use an ASCII-only installation path. Broader path
+compatibility requires separate toolchain qualification.
+
+This affects the packaged `bots5` and `bots5-desktop` executables only, not the source installation
+described above. It is a fail-fast startup abort with no data-loss or security consequence. It is
+therefore accepted for current Mick/Forge use, but is **not** acceptable as an undocumented general
+Linux release property.
+
 ## Validate and run campaign jobs
 
 ```bash

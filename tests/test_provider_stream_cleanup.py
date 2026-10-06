@@ -620,7 +620,11 @@ async def _lifetime_scenario(tmp_path, provider, case, tcp, loop_kind, monkeypat
             expected = "aborted" if case.startswith(("cancel", "shutdown")) else "failed" if case in ("failure", "malformed", "conflict", "timeout") else "complete"
             assert stored.state.value == expected and message.state.value == expected
             assert message.content == "partial"
-            assert stored.remote_outcome_unknown is (expected != "complete")
+            # RP-F-05: malformed/conflict raise ProviderResponseError —
+            # failed-but-received, a KNOWN remote outcome under the canonical
+            # Rule D-9 classification.  failure/timeout stay unknown.
+            expected_unknown = expected != "complete" and case not in ("malformed", "conflict")
+            assert stored.remote_outcome_unknown is expected_unknown
             if case == "timeout":
                 assert stored.error_type == "timeout"
             if expected == "complete":

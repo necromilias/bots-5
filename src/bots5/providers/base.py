@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Literal, Mapping, Protocol
 
+import httpx
+
 from bots5.domain.generation_settings_registry import (
     GenerationSettingsPayload,
     PayloadFamily,
@@ -13,6 +15,25 @@ from bots5.domain.generation_settings_registry import (
 
 
 ReasoningEffort = Literal["none"]
+
+
+def transport_timeout(timeout_seconds: float | None) -> httpx.Timeout | None:
+    """Map the caller-supplied completion deadline onto an httpx transport backstop.
+
+    ``CompletionRequest.timeout_seconds`` is a B.O.T.S.-owned deadline plumbed
+    from ``GenerationRequest.timeout_seconds`` (0.0 / unset means "no caller
+    deadline").  Without this mapping the value was dead at the transport
+    layer: every provider client constructed ``AsyncClient(timeout=None)``, so
+    a hung connect/TLS or a stalled stream had no backstop below the
+    application-level absolute deadline.  The mapping bounds each transport
+    operation (connect/read/write/pool) by the declared deadline; it is a
+    backstop, not a duplicate of the application deadline, which remains the
+    sole enforcement of the total budget.  Requests without a caller deadline
+    keep the previous unbounded transport behaviour.
+    """
+    if timeout_seconds is None or not (timeout_seconds > 0):
+        return None
+    return httpx.Timeout(timeout_seconds)
 
 
 def serialize_generation_settings(
