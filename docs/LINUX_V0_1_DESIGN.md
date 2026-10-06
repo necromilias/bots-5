@@ -19,8 +19,11 @@ v1 in `CI_V1.md`.
 **Phase 11 — product finishing and standalone packaging — is closed and landed** at
 `59265916abeb2e9f6cbf953726f22a9f7c00f3b5`; see the [Phase 11 closure record](LINUX_V0_1_PHASE11_CLOSURE_REPORT.md).
 Its accepted later chrome/colour authority is recorded there; historical visual drafts retain their
-own scope. **Phase 12: Linux v0.1 torture run and separate closure adjudication** is next, with
-design and execution requiring separate authority.
+own scope. **Phase 12 — Linux v0.1 torture run and separate closure adjudication — is closed
+and accepted as PASS_WITH_LIMITATIONS**, with repairs landed at
+`ba72d16aa3540218cb70e377fa9f452252b7c360`. See the
+[Phase 12 closure record](LINUX_V0_1_PHASE12_CLOSURE_REPORT.md) for the retained validation and
+standalone limitation.
 
 This document remains the build-facing technical contract for the first native Linux B.O.T.S. desktop
 application. Organisational Memory owns the broader decision rationale and supersession history; this
@@ -446,7 +449,13 @@ Build through validated vertical slices:
 10. Phase 9: import/export, backup, verification, and restore — **closed; Slices A through E landed**;
 11. Phase 10: campaign desktop integration — **closed and landed**;
 12. Phase 11: product finishing and standalone packaging — **closed and landed**;
-13. Phase 12: Linux v0.1 torture run and separate closure adjudication — **next; not authorized**.
+13. Phase 12: Linux v0.1 torture run and separate closure adjudication — **closed; accepted with limitations; repairs landed**.
+
+Linux v0.1 is complete for current Mick/Forge use. The Phase 12 result is PASS_WITH_LIMITATIONS;
+repairs landed at `ba72d16aa3540218cb70e377fa9f452252b7c360`. The
+[Phase 12 closure record](LINUX_V0_1_PHASE12_CLOSURE_REPORT.md) preserves the retained evidence and
+DEP-01 standalone path limitation. This closure does not qualify general Linux distribution support
+or authorize deferred post-v0.1 work.
 
 Every phase retains inspect -> propose -> approve -> edit -> validate -> separate commit approval ->
 separate push/landing approval.

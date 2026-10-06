@@ -10,7 +10,8 @@ The original campaign harness baseline is closed and preserved. V0.2 adds the bu
 
 Linux v0.1 is implemented, validated, and landed through **Phase 9 closure (Slices A–E)** and
 **Phase 10 — native desktop surface over the headless campaign engine** and
-**Phase 11 — product finishing and standalone packaging**:
+**Phase 11 — product finishing and standalone packaging**, with
+**Phase 12 — torture validation and separate closure adjudication — closed with limitations**:
 
 1. native walking skeleton;
 2. conversation truth, immutable lineage/revisions, and deterministic fake generation;
@@ -82,8 +83,12 @@ the workflow dispatch-only. The authoritative CI v1 run exercised candidate
 **Phase 11 — product finishing and standalone packaging — is closed and landed** at
 `59265916abeb2e9f6cbf953726f22a9f7c00f3b5`. See the [Phase 11 closure record](docs/LINUX_V0_1_PHASE11_CLOSURE_REPORT.md).
 The validated standalone remains local; no public release or deployment occurred.
-**Phase 12: Linux v0.1 torture run and separate closure adjudication** is next; this status
-reconciliation does not authorize its design or execution.
+**Phase 12 — Linux v0.1 torture run and separate closure adjudication — is closed and accepted
+as PASS_WITH_LIMITATIONS. Linux v0.1 is complete for current Mick/Forge use.** The Phase 12 repairs
+landed at `ba72d16aa3540218cb70e377fa9f452252b7c360`; final retained T4 recorded
+**2240 passed / 1 permitted skip / 0 failures / 0 errors**. See the
+[Phase 12 and Linux v0.1 closure record](docs/LINUX_V0_1_PHASE12_CLOSURE_REPORT.md).
+The rebuilt standalone remains local and unreleased; broader Linux compatibility is unqualified.
 
 The build-facing Linux v0.1 contract remains `docs/LINUX_V0_1_DESIGN.md`. The cumulative Phase 6
 implementation history remains in `docs/LINUX_V0_1_PHASE6_IMPLEMENTATION_REPORT.md` and the later
@@ -259,6 +264,8 @@ Key records include:
 - `docs/LINUX_V0_1_PHASE10_CLOSURE_REPORT.md` — authoritative Phase 10 closure and landing record;
 - [Phase 11 closure report](docs/LINUX_V0_1_PHASE11_CLOSURE_REPORT.md) — final accepted source/package and landing record;
 - [Final Phase 11 authority/effect supplement](docs/UNIFIED_AUTHORITY_EFFECT_INVENTORY_PHASE11_FINAL_SUPPLEMENT.md) — additive post-M3 participation accounting;
+- [Phase 12 and Linux v0.1 closure report](docs/LINUX_V0_1_PHASE12_CLOSURE_REPORT.md) — accepted
+  torture result, landed repairs, and retained standalone limitation;
 - `docs/CI_V1.md` — CI v1 authoritative T4 reference and its stated limitations;
 - `docs/SQLITE_COMPATIBILITY_REPAIR.md` — SQLite ≤ 3.45.1 parser-compatibility repair record;
 - `docs/LINUX_V0_1_DESIGN.md` — accepted Linux v0.1 build-facing contract.

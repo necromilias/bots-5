@@ -112,9 +112,14 @@ SQLite ≤ 3.45.1 parser-compatibility repair landed at
 `58fca2c7b1b4111d982733980c303565bf91695e` rather than `5bb7833` or any later `main` descendant
 (`docs/CI_V1.md`).
 
-**Phase 12: Linux v0.1 torture run and separate closure adjudication** is next. Phase 11 is
-closed and landed as recorded above. Phase 12 design and execution are not authorized by this
-documentation reconciliation; detailed planning remains a later inspect/propose/approve boundary.
+**Phase 12 — Linux v0.1 torture run and separate closure adjudication — is closed and accepted
+as PASS_WITH_LIMITATIONS. Linux v0.1 is complete for current Mick/Forge use.** Repairs landed at
+`ba72d16aa3540218cb70e377fa9f452252b7c360`. Final retained T4 recorded
+**2240 passed / 1 permitted skip / 0 failures / 0 errors**, from 2241 canonical tests.
+See the [Phase 12 and Linux v0.1 closure record](LINUX_V0_1_PHASE12_CLOSURE_REPORT.md).
+The rebuilt standalone remains local and unreleased. DEP-01 requires an ASCII-only executable path;
+broader install-path and Linux distribution compatibility require separate qualification.
+Deferred post-v0.1 work retains its own inspect/propose/approve boundary.
 
 The accepted desktop sequence remains:
 
@@ -130,7 +135,7 @@ The accepted desktop sequence remains:
 10. Phase 9: import/export, backup, verification, and restore — **closed; Slices A through E landed**;
 11. Phase 10: campaign desktop integration — **closed and landed**;
 12. Phase 11: product finishing and standalone packaging — **closed and landed**;
-13. Phase 12: Linux v0.1 torture run and separate closure adjudication — **next; not authorized**.
+13. Phase 12: Linux v0.1 torture run and separate closure adjudication — **closed; accepted with limitations; repairs landed**.
 
 Every phase retains inspect -> propose -> approve -> edit -> validate -> separate commit approval ->
 separate push/landing approval.
