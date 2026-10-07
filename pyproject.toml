@@ -37,6 +37,20 @@ bots5-desktop = "bots5.bootstrap.desktop:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"bots5.desktop" = ["assets/application/*.svg", "assets/application/*.qrc"]
+
+[tool.setuptools.data-files]
+"share/applications" = ["share/applications/*.desktop"]
+"share/icons/hicolor/scalable/apps" = ["share/icons/hicolor/scalable/apps/*.svg"]
+"share/icons/hicolor/16x16/apps" = ["share/icons/hicolor/16x16/apps/*.png"]
+"share/icons/hicolor/24x24/apps" = ["share/icons/hicolor/24x24/apps/*.png"]
+"share/icons/hicolor/32x32/apps" = ["share/icons/hicolor/32x32/apps/*.png"]
+"share/icons/hicolor/48x48/apps" = ["share/icons/hicolor/48x48/apps/*.png"]
+"share/icons/hicolor/64x64/apps" = ["share/icons/hicolor/64x64/apps/*.png"]
+"share/icons/hicolor/128x128/apps" = ["share/icons/hicolor/128x128/apps/*.png"]
+"share/icons/hicolor/256x256/apps" = ["share/icons/hicolor/256x256/apps/*.png"]
+
 [[tool.setuptools.ext-modules]]
 name = "bots5.infrastructure.native._rooted_sqlite_vfs"
 sources = ["src/bots5/infrastructure/native/rooted_sqlite_vfs.c"]

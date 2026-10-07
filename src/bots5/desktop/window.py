@@ -213,6 +213,8 @@ class MainWindow(QMainWindow):
         self._default_shortcut_by_action_id: dict[str, str] = {}
 
         self.setWindowTitle("B.O.T.S. 5")
+        from .application_icon import application_icon
+        self.setWindowIcon(application_icon())
         if self._developer_provider_test_mode:
             self.setWindowTitle("B.O.T.S. 5 — INEXACT / PROVIDER TEST MODE")
         self.resize(*MAIN_SIZE)

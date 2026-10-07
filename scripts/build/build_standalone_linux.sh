@@ -107,6 +107,7 @@ if __name__ == "__main__":
         from PySide6.QtSvg import QSvgRenderer
         from PySide6.QtWidgets import QApplication
         from bots5.desktop.icons import action_icon
+        from bots5.desktop.application_icon import application_icon, ICON_SIZES
         from bots5.desktop.theme import apply_draft1_theme
         from bots5.infrastructure import rooted_sqlite_vfs
         from bots5.infrastructure.persistence import migration_runner
@@ -129,6 +130,10 @@ if __name__ == "__main__":
                       and QSvgRenderer(f":/bots/icons/{name}.svg").isValid()
                       for name in icons},
             "action_icon_renders": not action_icon("send").pixmap(24, 24).isNull(),
+            "application_icon_sizes": {
+                str(size): not application_icon().pixmap(size, size).isNull()
+                for size in ICON_SIZES
+            },
             "stylesheet_bytes": len(application.styleSheet().encode()),
             "secret_service_backend": f"{type(backend).__module__}.{type(backend).__name__}",
         }))
@@ -244,6 +249,10 @@ ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 exec "$ROOT/bots5-desktop.dist/entry_desktop.bin" "$@"
 SH
 chmod 755 "$DIST_DIR/bots5" "$DIST_DIR/bots5-desktop"
+
+# Distribution resources only; this does not install a launcher or alter XDG settings.
+mkdir -p "$DIST_DIR/share"
+cp -R "$ROOT/share/." "$DIST_DIR/share/"
 
 if [[ "${BOTS5_BUILD_ONLY:-}" != "bots5-desktop" ]]; then
     test -x "$DIST_DIR/bots5.dist/entry_cli.bin"

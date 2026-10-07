@@ -1051,12 +1051,19 @@ def main(argv: list[str] | None = None) -> int:
         return _initiate_restore(
             args.restore_from, args.data_root, args.expected_backup_id
         )
+    from PySide6.QtCore import QCoreApplication
     from PySide6.QtWidgets import QApplication
     from qasync import QEventLoop
 
     from bots5.desktop.window import MainWindow
+    from bots5.desktop.application_icon import (
+        APPLICATION_NAME, DESKTOP_FILE_NAME, application_icon,
+    )
 
+    QCoreApplication.setApplicationName(APPLICATION_NAME)
     qt_application = QApplication.instance() or QApplication(sys.argv)
+    qt_application.setDesktopFileName(DESKTOP_FILE_NAME)
+    qt_application.setWindowIcon(application_icon())
     original_quit_on_last_window_closed = qt_application.quitOnLastWindowClosed()
     qt_application.setQuitOnLastWindowClosed(False)
 

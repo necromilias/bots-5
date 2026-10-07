@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+<defs><linearGradient id="steel" x2="0.28" y2="1"><stop stop-color="#e3e9ed"/><stop offset=".32" stop-color="#8897a1"/><stop offset=".55" stop-color="#c4ced5"/><stop offset="1" stop-color="#586570"/></linearGradient><linearGradient id="edge" x2="1" y2="1"><stop stop-color="#c3d0d9"/><stop offset=".3" stop-color="#445663"/><stop offset=".7" stop-color="#18242e"/><stop offset="1" stop-color="#8798a4"/></linearGradient></defs>
+<path d="M56 12H200L244 56V200L200 244H56L12 200V56Z" fill="url(#edge)" stroke="#aabac6" stroke-width="2"/>
+<path d="M60 30H196L226 60V196L196 226H60L30 196V60Z" fill="#060d13" stroke="#20394a" stroke-width="3"/>
+<path d="M48 70L83 38H113V57L63 95H48Z M143 38H173L208 70V95H193L143 57Z M48 161H63L113 199V218H83L48 186Z M193 161H208V186L173 218H143V199Z" fill="url(#steel)" stroke="#d2dce3" stroke-width="1.5"/>
+<path d="M88 88H151L165 102V118L155 128L165 138V155L152 168H88Z M110 107V119H145V107Z M110 138V150H145V138Z" fill="url(#steel)" fill-rule="evenodd" stroke="#b4c4d0" stroke-width="1.5"/>
+<path d="M43 103V153M213 103V153" stroke="#063459" stroke-width="13" stroke-linecap="round"/>
+<path d="M43 103V153M213 103V153" stroke="#058bea" stroke-width="7" stroke-linecap="round"/>
+<path d="M43 103V153M213 103V153" stroke="#91e3ff" stroke-width="3" stroke-linecap="round"/>
+<g fill="#08121b" stroke="#8195a3" stroke-width="1.5"><circle cx="38" cy="62" r="4"/><circle cx="218" cy="62" r="4"/><circle cx="38" cy="194" r="4"/><circle cx="218" cy="194" r="4"/></g>
+</svg>

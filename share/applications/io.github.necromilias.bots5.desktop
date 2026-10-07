@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=B.O.T.S. 5
+Comment=Local AI harness
+Exec=bots5-desktop
+Icon=io.github.necromilias.bots5
+Terminal=false
+Categories=Development;
+StartupWMClass=bots5-desktop
