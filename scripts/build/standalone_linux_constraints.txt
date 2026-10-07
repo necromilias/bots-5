@@ -21,7 +21,7 @@ markdown-it-py==3.0.0
 MarkupSafe==3.0.4
 mdurl==0.1.2
 more-itertools==11.1.0
-Nuitka==4.1.1
+Nuitka==4.2
 packaging==26.3
 patchelf==0.19.1.0
 platformdirs==4.12.2

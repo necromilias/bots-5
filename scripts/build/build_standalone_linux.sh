@@ -20,6 +20,9 @@ PYTHON_BIN_DIR="$(dirname -- "$BUILD_PYTHON")"
 export PATH="$PYTHON_BIN_DIR:$PATH"
 export NUITKA_CACHE_DIR="${BOTS5_NUITKA_CACHE_DIR:-$ROOT/build/m7-nuitka-cache}"
 export PYTHONPATH="$ROOT/src"
+# Nuitka freezes the build interpreter's UTF-8 mode. Its repaired directory
+# decoder alone is insufficient when the frozen Python starts in a C locale.
+export PYTHONUTF8=1
 
 "$BUILD_PYTHON" - <<'PY'
 import _sqlite3
@@ -28,6 +31,7 @@ import ctypes.util
 import sys
 
 assert (3, 12) <= sys.version_info[:2] < (3, 15), sys.version
+assert sys.flags.utf8_mode == 1, "standalone must freeze Python UTF-8 mode"
 assert getattr(_sqlite3, "__file__", None), "packaging Python must expose shared _sqlite3"
 shared_name = ctypes.util.find_library("sqlite3")
 assert shared_name, "shared SQLite is required"
@@ -46,10 +50,10 @@ print("\n".join(project["dependencies"] + project["optional-dependencies"]["dev"
 PY
 )
 "$BUILD_PYTHON" -m pip install --disable-pip-version-check -c "$CONSTRAINTS" \
-    "${requirements[@]}" 'Nuitka==4.1.1' 'patchelf==0.19.1.0'
+    "${requirements[@]}" 'Nuitka==4.2' 'patchelf==0.19.1.0'
 "$BUILD_PYTHON" - <<'PY'
 from importlib.metadata import version
-assert version("Nuitka") == "4.1.1", version("Nuitka")
+assert version("Nuitka") == "4.2", version("Nuitka")
 assert version("PySide6") == "6.11.2", version("PySide6")
 PY
 
@@ -69,6 +73,13 @@ mkdir -p "$DIST_DIR"
 cp "$ROOT/tests/_standalone_restore_probe.py" "$ENTRY_DIR/m7_restore_probe.py"
 
 cat > "$ENTRY_DIR/entry_cli.py" <<'PY'
+import os
+import sys
+
+# Frozen argv may retain locale-decoded surrogate escapes even in UTF-8 mode.
+# Decode filesystem bytes consistently before argparse or Qt consumes them.
+sys.argv = [os.fsencode(arg).decode("utf-8", "surrogateescape") for arg in sys.argv]
+
 from bots5.cli import main
 
 if __name__ == "__main__":
@@ -78,6 +89,10 @@ cat > "$ENTRY_DIR/entry_desktop.py" <<'PY'
 import json
 import os
 from pathlib import Path
+import sys
+
+# Keep Qt argv consistent with the frozen UTF-8 filesystem mode.
+sys.argv = [os.fsencode(arg).decode("utf-8", "surrogateescape") for arg in sys.argv]
 
 from bots5.bootstrap.desktop import main
 
@@ -166,7 +181,7 @@ icon =
 
 [python]
 python_path = {python}
-packages = Nuitka==4.1.1
+packages = Nuitka==4.2
 
 [qt]
 qml_files =
@@ -206,10 +221,10 @@ for app in "${apps[@]}"; do
     esac
     rm -rf "$DIST_DIR/$app.dist"
     write_spec "$app" "$entry"
-    echo "Building $app with Python $($BUILD_PYTHON --version 2>&1) and Nuitka 4.1.1"
+    echo "Building $app with Python $($BUILD_PYTHON --version 2>&1) and Nuitka 4.2"
     "$PYTHON_BIN_DIR/pyside6-deploy" "$entry" \
         --config-file "$SPEC_DIR/$app.spec" --mode standalone \
-        --nuitka-version 4.1.1 --force --keep-deployment-files
+        --nuitka-version 4.2 --force --keep-deployment-files
     test -x "$DIST_DIR/$app.dist/$executable" || {
         echo "pyside6-deploy did not produce $DIST_DIR/$app.dist/$executable" >&2
         exit 1

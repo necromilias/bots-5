@@ -100,6 +100,8 @@ run_targeted() {
 # consumers retain wave 4 evidence; the new artifact's resource proof runs above.
 run_targeted T0_RESTORE \
     tests/test_phase11_packaging_restore.py
+run_targeted T0_UNICODE_PATHS \
+    tests/test_standalone_unicode_paths.py
 run_targeted T1_RESTORE_CLOSE \
     tests/test_phase9_desktop_slice_e.py tests/test_phase10_desktop_lifecycle.py
 run_targeted T2_PERSISTENCE \

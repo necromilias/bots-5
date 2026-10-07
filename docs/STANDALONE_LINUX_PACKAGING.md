@@ -16,8 +16,9 @@ scripts/build/build_standalone_linux.sh
 
 The script creates an isolated virtual environment at `build/m7-venv` when one
 does not exist, installs the project's declared runtime/test dependencies
-using `scripts/build/standalone_linux_constraints.txt` plus `Nuitka==4.1.1`
-and `patchelf`, builds the rooted SQLite VFS, and writes the
+using `scripts/build/standalone_linux_constraints.txt` plus `Nuitka==4.2`
+and `patchelf`, freezes CPython UTF-8 mode via `PYTHONUTF8=1` during the
+build, builds the rooted SQLite VFS, and writes the
 standalone directory to `dist/bots5-linux-standalone/`. Set
 `BOTS5_PACKAGING_PYTHON`, `BOTS5_PACKAGING_ENV`, or `BOTS5_STANDALONE_OUT` to
 select the interpreter, isolated environment, or output directory.
@@ -25,6 +26,12 @@ The output override must remain a direct child of this checkout's `dist/`.
 The build rejects interpreters with embedded private SQLite. It uses a new
 entrypoint workspace for every build so stale generated modules cannot
 shadow the application package; build workspaces and Nuitka reports are retained.
+Nuitka captures the build interpreter's UTF-8 mode in the generated executable.
+The build asserts this mode rather than relying on the operator's runtime locale.
+The generated entrypoints also decode argv filesystem bytes as UTF-8 before
+argparse or Qt consumes them: frozen startup can otherwise leave locale-decoded
+surrogate escapes in argv under the `C` locale. The upstream directory repair,
+frozen UTF-8 mode, and argv normalization are qualified together.
 
 The output contains launchers `bots5` and `bots5-desktop`, with each Nuitka
 standalone payload in its corresponding `*.dist/` directory. The desktop
@@ -47,7 +54,11 @@ restore UI/close lifecycle, T2 restore/bootstrap, and T3 data-root lock and
 cross-cutting close contracts. The broader unchanged VFS/migration source
 coverage remains retained in the prior M7 evidence; resource loading is proved
 again against each rebuilt artifact.
-It does not run T4. The T0 desktop checks use an offscreen Qt platform,
+It does not run T4. It also runs `tests/test_standalone_unicode_paths.py` against
+relocated ASCII, accented and CJK/home-like payload paths, renamed executable
+files, `C.UTF-8` and `C` locales, and frozen restore re-entry under Unicode
+ancestors. These checks require successful resource loading and desktop
+initialization, not just a help response. The T0 desktop checks use an offscreen Qt platform,
 a disposable external `--data-root` and default XDG startup, clean XDG paths,
 and an environment without `PYTHONPATH`, `VIRTUAL_ENV`, provider variables, or
 credentials. Validation records are written under

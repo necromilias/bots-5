@@ -177,18 +177,20 @@ For a local-only schema-v2 campaign job, set `providers.local_openai.base_url`. 
 optional; when `api_key_env` is present, only that named environment variable is read. A local-only job
 does not require `OPENROUTER_API_KEY`.
 
-### Known standalone limitation
+### Standalone Unicode installation paths
 
-Known standalone limitation: the current Linux standalone build aborts during startup if any component
-of the full path to either executable contains non-ASCII characters. This includes non-ASCII ancestor
-directories such as a user's home directory. Source execution is unaffected. This is currently
-classified as a frozen/toolchain limitation; use an ASCII-only installation path. Broader path
-compatibility requires separate toolchain qualification.
+The accepted v0.1.0 Linux artifact built with Nuitka 4.1.1 retains DEP-01:
+non-ASCII ancestor directories can abort either frozen entrypoint during startup.
+Existing artifacts require an ASCII-only installation path.
 
-This affects the packaged `bots5` and `bots5-desktop` executables only, not the source installation
-described above. It is a fail-fast startup abort with no data-loss or security consequence. It is
-therefore accepted for current Mick/Forge use, but is **not** acceptable as an undocumented general
-Linux release property.
+The build recipe now pins Nuitka 4.2, freezes Python UTF-8 mode, and normalizes
+filesystem-byte argv in its generated entrypoints. The rebuilt candidate passes
+ASCII, accented, CJK/home-like ancestor, and Unicode executable-name checks on
+Forge, including real desktop startup and restore re-entry; the combined Unicode
+rename case also passes under the plain `C` locale. See
+[`docs/STANDALONE_LINUX_PACKAGING.md`](docs/STANDALONE_LINUX_PACKAGING.md) for
+build and regression instructions. This is scoped Forge qualification, not broad
+Linux/T4 qualification, and does not replace the accepted v0.1.0 artifact.
 
 ## Validate and run campaign jobs
 
