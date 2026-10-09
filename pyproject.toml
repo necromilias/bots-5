@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bots5"
-version = "0.1.0"
+version = "0.2.0"
 description = "Deterministic local harness for bounded multi-model jobs"
 readme = "README.md"
 requires-python = ">=3.12,<3.15"

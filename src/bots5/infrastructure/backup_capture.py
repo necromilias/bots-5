@@ -160,7 +160,7 @@ class RootedBackupCaptureAdapter:
                         package_source = BackupCaptureSource(
                             backup_id=str(uuid7()),
                             created_at=_utc_now_iso(),
-                            source_application_version="bots5-0.1.0",
+                            source_application_version="bots5-0.2.0",
                             source_db_migration_revision=revision,
                             facts=facts,
                             entries=tuple(source_entries),

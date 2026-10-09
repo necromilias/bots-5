@@ -1017,7 +1017,7 @@ class BotsApplication:
                 for item in values if item.payload is not None
             },
             attachment_policy=attachment_policy, chat_configuration=source.chat_configuration,
-            application_version="0.1.0", migration_revision=source.migration_revision,
+            application_version="0.2.0", migration_revision=source.migration_revision,
             context_plans=source.context_plans,
             **({
                 "object_provenance": source.object_provenance,
