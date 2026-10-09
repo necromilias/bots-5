@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Mapping
 from threading import Event
 from pathlib import Path
 from contextlib import asynccontextmanager, contextmanager, nullcontext
@@ -58,6 +59,13 @@ from .generation import (
 )
 from .context import ContextBuilder, ContextPlan, ContextSource
 from .inspection import InspectionProjection, build_inspection_projection
+from .tools import (
+    ToolDefinition,
+    ToolInvoker,
+    ToolRegistry,
+    ToolResult,
+    bind_workspace_read_tool,
+)
 from .export import (
     ArchiveProjection,
     AttachmentPolicy,
@@ -250,6 +258,8 @@ class BotsApplication:
         developer_provider_test_mode: bool = False,
         import_workers: OwnedImportWorkers | None = None,
         backup_service: BackupPort | None = None,
+        capability_authority=None,
+        workspace_root: Path | None = None,
     ) -> None:
         self._store = store
         self._events = events
@@ -261,6 +271,22 @@ class BotsApplication:
         # lifecycle, but share this application's store authority.
         self._import_workers = import_workers or OwnedImportWorkers(store)
         self._backup_service = backup_service
+        # Bounded tool invocation is opt-in: without an explicit
+        # CapabilityAuthority the application exposes no tools at all
+        # (deny-by-default, matching the control plane's no-ambient-grant
+        # rule).  The reference read-only workspace tool is only registered
+        # when both the authority and an explicit workspace root are bound.
+        self._capability_authority = capability_authority
+        self._tool_registry = ToolRegistry()
+        self._tool_invoker: ToolInvoker | None = None
+        if capability_authority is not None:
+            if workspace_root is not None:
+                bind_workspace_read_tool(self._tool_registry, root=workspace_root)
+            self._tool_invoker = ToolInvoker(
+                registry=self._tool_registry,
+                authority=capability_authority,
+                id_factory=self._ids.new,
+            )
         self._import_scheduler: asyncio.Task[None] | None = None
         self._backend_id = backend_id
         self._model = model
@@ -1198,6 +1224,56 @@ class BotsApplication:
         self._ensure_open()
         self._store.delete_attachment(attachment_id)
         await self._events.publish("attachment_removed", attachment_id=attachment_id)
+
+    # Bounded local tool invocation (v0.2 control plane consumer) -----------
+    async def list_tools(self) -> tuple[ToolDefinition, ...]:
+        """Return the registered tool declarations (visibility only).
+
+        Listing confers no execution permission: definitions are the
+        model-context visibility plane, while invocation still requires a
+        scoped capability grant at dispatch time (permission plane).
+        """
+        self._ensure_open()
+        return tuple(
+            self._tool_registry.definition(tool_id)
+            for tool_id in self._tool_registry.tool_ids()
+        )
+
+    async def invoke_tool(
+        self,
+        tool_id: str,
+        arguments: Mapping[str, object],
+        *,
+        grant,
+        workspace_root: Path | None = None,
+    ) -> ToolResult:
+        """Invoke one registered tool under an explicit capability grant.
+
+        Refusal happens before any filesystem effect and is returned as a
+        terminal ``ToolResult`` (never raised), so the caller always receives
+        an exact, journalable outcome.  ``UNKNOWN`` is preserved when an
+        executor cannot establish its outcome; it is never rewritten.
+        """
+        self._ensure_open()
+        if self._tool_invoker is None:
+            raise StateError("tool invocation is not configured for this application")
+        result = self._tool_invoker.invoke(
+            tool_id,
+            arguments,
+            grant=grant,
+            workspace_root=workspace_root,
+        )
+        await self._events.publish(
+            "tool_invoked",
+            invocation_id=result.invocation_id,
+            tool_id=result.tool_id,
+            state=result.state.value,
+            refusal_reason=(
+                result.refusal_reason.value if result.refusal_reason is not None else None
+            ),
+        )
+        self._ensure_open()
+        return result
 
     @_tracked_command
     async def build_context_plan(

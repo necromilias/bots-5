@@ -73,6 +73,7 @@ from .widgets import (
 )
 from .actions import ActionDefinition, ActionRegistry
 from .campaign_dock import CampaignDockWidget
+from .control_dock import ControlDockWidget
 from .model_selector import ModelSelectorEntry, ModelSelectorPopup, model_readiness, readiness_details
 from .icons import icon_action
 from .window_chrome import NativeWindowEdges
@@ -149,6 +150,7 @@ class MainWindow(QMainWindow):
         *,
         handoff=None,
         campaign_bridge_factory=None,
+        control_bridge_factory=None,
     ) -> None:
         super().__init__()
         self.setObjectName("botsMainWindow")
@@ -207,6 +209,9 @@ class MainWindow(QMainWindow):
         # Phase 10 M2.0b: optional campaign dock
         self._campaign_bridge_factory = campaign_bridge_factory
         self._campaign_dock: CampaignDockWidget | None = None
+        # v0.2: optional control plane dock
+        self._control_bridge_factory = control_bridge_factory
+        self._control_dock: ControlDockWidget | None = None
         # Phase 11 M4b/M6: workspace/settings plane wiring state.
         self._applying_dock_layout = False
         self._qaction_by_action_id: dict[str, QAction] = {}
@@ -541,6 +546,21 @@ class MainWindow(QMainWindow):
             self._campaign_dock.visibilityChanged.connect(self._sync_campaign_dock_button)
             self._campaign_dock.visibilityChanged.connect(self._on_dock_layout_changed)
 
+        # v0.2: optional control plane dock
+        if self._control_bridge_factory is not None:
+            self._control_dock = ControlDockWidget(
+                self, bridge_factory=self._control_bridge_factory
+            )
+            self._control_dock.setAllowedAreas(
+                Qt.DockWidgetArea.BottomDockWidgetArea
+                | Qt.DockWidgetArea.LeftDockWidgetArea
+                | Qt.DockWidgetArea.RightDockWidgetArea
+            )
+            self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._control_dock)
+            self._control_dock.hide()
+            self._control_dock.visibilityChanged.connect(self._sync_control_dock_button)
+            self._control_dock.visibilityChanged.connect(self._on_dock_layout_changed)
+
         self._build_phase9_menus()
         self._native_menu_bar = super().menuBar()
         def keep_shortcuts_reachable(actions):
@@ -760,6 +780,17 @@ class MainWindow(QMainWindow):
             )
         )
 
+        self._action_registry.register(
+            ActionDefinition(
+                action_id="view.toggle_control_dock",
+                title="Toggle Control Plane Dock",
+                category="view",
+                default_shortcut="",
+                handler=lambda checked=False: self._show_control_dock(not self._control_dock.isVisible() if self._control_dock else False),
+                is_enabled=lambda: self._control_dock is not None,
+            )
+        )
+
         # Palette action
         self._action_registry.register(
             ActionDefinition(
@@ -793,6 +824,13 @@ class MainWindow(QMainWindow):
                 self.campaign_dock_action.blockSignals(True)
                 self.campaign_dock_action.setChecked(visible)
                 self.campaign_dock_action.blockSignals(False)
+
+    def _sync_control_dock_button(self, visible: bool) -> None:
+        if self.top_bar is not None and hasattr(self, "control_dock_action"):
+            if self.control_dock_action.isChecked() != visible:
+                self.control_dock_action.blockSignals(True)
+                self.control_dock_action.setChecked(visible)
+                self.control_dock_action.blockSignals(False)
 
     def _build_phase9_menus(self) -> None:
         """Additive Phase 9 wiring: File/View menu entries and rail context actions.
@@ -836,6 +874,16 @@ class MainWindow(QMainWindow):
             self.campaign_dock_action.setCheckable(True)
             self.campaign_dock_action.triggered.connect(self._show_campaign_dock)
             view_menu.addAction(self.campaign_dock_action)
+
+        # v0.2: control plane dock toggle. Only present when a control
+        # bridge factory was supplied; without one the window keeps exactly
+        # its pre-v0.2 View menu (no inert entry is added).
+        if self._control_dock is not None:
+            self.control_dock_action = QAction("Control Plane", self)
+            self.control_dock_action.setObjectName("actionShowControlDock")
+            self.control_dock_action.setCheckable(True)
+            self.control_dock_action.triggered.connect(self._show_control_dock)
+            view_menu.addAction(self.control_dock_action)
 
         # Additive workflows 6/7 (M4): backup creation and independent
         # verification get their own Tools menu, deliberately separate from
@@ -900,6 +948,14 @@ class MainWindow(QMainWindow):
                 self._campaign_dock.raise_()
             else:
                 self._campaign_dock.hide()
+
+    def _show_control_dock(self, checked: bool = False) -> None:
+        if self._control_dock is not None:
+            if checked:
+                self._control_dock.show()
+                self._control_dock.raise_()
+            else:
+                self._control_dock.hide()
 
     def _show_import_queue(self, _checked: bool = False) -> None:
         self.import_queue_dock.show()
@@ -2997,6 +3053,9 @@ class MainWindow(QMainWindow):
         # Phase 10 M2.0b: drain the campaign dock if present
         if self._campaign_dock is not None:
             await self._campaign_dock.drain()
+        # v0.2: drain the control plane dock if present
+        if self._control_dock is not None:
+            await self._control_dock.drain()
         if self._owns_workspace:
             if self._window_id is not None:
                 await self._workspace.unregister_window(
@@ -3084,6 +3143,9 @@ class MainWindow(QMainWindow):
         # Phase 10 M2.0b: drain the campaign dock if present
         if self._campaign_dock is not None:
             await self._campaign_dock.drain()
+        # v0.2: drain the control plane dock if present
+        if self._control_dock is not None:
+            await self._control_dock.drain()
         if self._window_id is not None and not self._owns_workspace:
             final_window = self._workspace.is_last_window(self._window_id)
             await self._workspace.unregister_window(

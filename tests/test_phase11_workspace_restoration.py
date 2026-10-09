@@ -1024,10 +1024,14 @@ class TestDesktopRestorationWiring:
             try:
                 await rebuilt.initialize()
                 rebuilt.show()
-                await asyncio.sleep(0.01)
-                await _flush()
                 # FEATURE-POSITIVE restore: without the wiring the search dock
-                # stays hidden in the rebuilt window.
+                # stays hidden in the rebuilt window. Poll at a fine interval so a
+                # scheduling delay under load cannot masquerade as a failure; the
+                # assertion itself is unchanged.
+                for _ in range(500):
+                    if rebuilt.search_dock.isVisible():
+                        break
+                    await asyncio.sleep(0.005)
                 assert rebuilt.search_dock.isVisible(), (
                     "rebuilt window did not restore the dock layout from the blob"
                 )
@@ -1047,7 +1051,20 @@ class TestDesktopRestorationWiring:
                 # The very construction below must not raise.
                 await malformed.initialize()
                 malformed.show()
-                await asyncio.sleep(0.01)
+                # Wait deterministically for the fallback to be both applied and
+                # REPORTED. The status-bar message is shown with a 5s timeout, so
+                # this must poll at a FINE interval: using _flush() per iteration
+                # (80ms) would burn the whole 5s window and then read an expired
+                # message as empty. Poll on the condition directly instead, and
+                # no assertion is relaxed.
+                for _ in range(500):
+                    if (
+                        malformed.search_dock.isHidden()
+                        and "incompatible"
+                        in malformed.statusBar().currentMessage()
+                    ):
+                        break
+                    await asyncio.sleep(0.005)
                 assert malformed.search_dock.isHidden(), (
                     "malformed dock blob must fall back to the default layout"
                 )

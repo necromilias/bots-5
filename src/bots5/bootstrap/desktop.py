@@ -4,7 +4,9 @@ import argparse
 import asyncio
 import os
 import sys
+import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 from bots5.core.application import (
@@ -15,14 +17,25 @@ from bots5.core.application import (
     TerminalCloseResult,
 )
 from bots5.core.campaign import CampaignBridge
+from bots5.core.capabilities import CapabilityAuthority, DirectoryScope
+from bots5.core.egress import ControlledEgressConsumer
+from bots5.desktop.control_bridge import ControlBridge
 from bots5.core.errors import AuthorityError, BackupError, BackupUnclassifiedState, CoreError, StateError
 from bots5.core.events import EventBus
+from bots5.core.execution import ExecutionManager
 from bots5.core.provider_configuration import ProviderConfiguration
+from bots5.core.queue_persistence import QueuePersistenceStore
+from bots5.core.queue_state_machine import OwnedExecutionWorkers
 from bots5.domain.clock import SystemClock
 from bots5.domain.ids import Uuid7Factory
 from bots5.infrastructure.app_paths import AppPaths, resolve_app_paths
 from bots5.infrastructure.authority_lock import AuthorityLock
 from bots5.infrastructure.backup_capture import RootedBackupCaptureAdapter
+from bots5.infrastructure.git_authority import GitAuthorityManager
+from bots5.infrastructure.process_execution import (
+    BoundedProcessExecutor,
+    CodeExecutor,
+)
 from bots5.infrastructure.backup_package import (
     BackupFilePublicationAdapter,
     BackupZipPackageAdapter,
@@ -41,6 +54,13 @@ from bots5.providers.base import ReasoningEffort
 # (build_runtime).  The non-UI restore initiation path below must be able to
 # run with PySide6 entirely unavailable.
 from bots5.desktop.profile import DesktopSessionInfo
+
+# Plugin imports
+try:
+    from bots5.plugins import PluginHost
+except ImportError:
+    # Fallback for tests that don't have plugins
+    PluginHost = None  # type: ignore
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +220,525 @@ class RestoreHandoffCapability:
 _CAMPAIGN_CLOSE_TIMEOUT_SECONDS = 30.0
 
 
+class ControlPlaneState:
+    """The composition root's shared v0.2 control-plane state source.
+
+    One instance per ``build_runtime`` call, injected into every desktop
+    :class:`~bots5.desktop.control_bridge.ControlBridge`.  The bridge then
+    projects *this* object instead of private per-window dicts, so all
+    windows observe one common grant/execution/receipt view.
+
+    Truthfulness boundaries (BLK-04, deliberately blunt):
+
+    * ``grants()`` reads the LIVE shared :class:`CapabilityAuthority`
+      inventory — that half really is composed with the seam.
+    * The durable queue/receipt machinery IS attached: build_runtime opens
+      one :class:`~bots5.core.queue_persistence.QueuePersistenceStore` under
+      the state root and binds it to one
+      :class:`~bots5.core.queue_state_machine.OwnedExecutionWorkers` registry
+      via ``attach_queue_store``.  Queue items saved through
+      ``persist_execution`` are durable from that moment on.
+    * ``executions()`` / ``receipts()`` now read from the durable queue store
+      when one is attached.  The in-memory ``_executions`` / ``_receipts``
+      dicts are retained only for observations that have not yet been written
+      through; bridge-approved executions are recovered directly from the
+      database file.  Because the projection genuinely reads durable rows,
+      ``durable`` is ``True`` whenever a queue store is attached.
+    * The instance is thread-safe only in the sense the desktop needs: it is
+      touched from the qasync loop thread.
+    """
+
+    def __init__(
+        self,
+        *,
+        capability_authority: CapabilityAuthority,
+        queue_store_path: Path | None = None,
+    ) -> None:
+        self._capability_authority = capability_authority
+        self._queue_store_path = queue_store_path
+        self._queue_store: QueuePersistenceStore | None = None
+        self._execution_workers: OwnedExecutionWorkers | None = None
+        if queue_store_path is not None:
+            # BLK-06 durability seam: open the SQLite queue store once and
+            # bind it to the shared owned-workers registry.  Construction of
+            # the runtime therefore DOES create this control-plane database
+            # file in the classified data-root database directory (it is
+            # control-plane state, not data-root-authoritative content, and
+            # the state root must remain free of everything except logs so
+            # the desktop close contract can hold).
+            self._queue_store = QueuePersistenceStore(queue_store_path)
+            self._execution_workers = OwnedExecutionWorkers()
+            self._execution_workers.attach_queue_store(self._queue_store)
+        self._executions: dict[str, object] = {}
+        self._receipts: dict[str, object] = {}
+        self._warnings: list[str] = []
+
+    #: True whenever the shared state source is backed by a real SQLite queue
+    #: store, because executions()/receipts() then read from durable rows.
+    #: A ControlPlaneState with no store (legacy test construction) reports
+    #: False and falls back to the in-memory dicts.
+    @property
+    def durable(self) -> bool:
+        return self._queue_store is not None
+
+    @property
+    def capability_authority(self) -> CapabilityAuthority:
+        return self._capability_authority
+
+    @property
+    def queue_store_path(self) -> Path | None:
+        return self._queue_store_path
+
+    @property
+    def queue_store(self) -> QueuePersistenceStore | None:
+        """The attached durable queue-receipt store, or None."""
+        return self._queue_store
+
+    @property
+    def execution_workers(self) -> OwnedExecutionWorkers | None:
+        """The shared owned-execution-worker registry bound to the store."""
+        return self._execution_workers
+
+    def persist_execution(
+        self,
+        item,
+        *,
+        operation_id: str | None = None,
+        approval_id: str | None = None,
+        grant_id: str | None = None,
+        kind: str | None = None,
+        scope: str | None = None,
+        description: str | None = None,
+    ) -> None:
+        """DURABLY save one execution-queue item through the attached store.
+
+        When binding metadata is supplied, the queue item and its bridge
+        binding (approval → grant → operation) are persisted atomically in
+        one SQLite transaction.  Raises ``StateError`` when no queue store
+        was composed — persistence is never silently skipped.
+        """
+        if self._queue_store is None:
+            raise StateError("no durable queue store is attached to the control plane")
+        if operation_id is not None:
+            self._queue_store.save_item_with_binding(
+                item,
+                operation_id=operation_id,
+                approval_id=approval_id,
+                grant_id=grant_id,
+                kind=kind,
+                scope=scope,
+                description=description,
+            )
+        else:
+            self._execution_workers.persist_item(item)
+
+    def recover_in_flight(self) -> list:
+        """Crash-recover attached queue items (delegates to the store)."""
+        if self._execution_workers is None:
+            raise StateError("no durable queue store is attached to the control plane")
+        return self._execution_workers.recover_in_flight()
+
+    # -- durable-row projection helpers ----------------------------------
+
+    @staticmethod
+    def _iso_to_timestamp(iso: str | None) -> float | None:
+        if iso is None:
+            return None
+        return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+    def _durable_row_to_execution_projection(self, row) -> object:
+        """Map one durable :class:`~bots5.core.queue_persistence.ExecutionDurableRow`."""
+        from bots5.desktop.control_bridge import ExecutionProjection, ExecutionState
+        from bots5.core.queue_state_machine import ExecutionQueueState
+
+        item = row.item
+        receipt = item.receipt
+        state_map = {
+            ExecutionQueueState.PENDING: ExecutionState.PENDING,
+            ExecutionQueueState.QUEUED: ExecutionState.QUEUED,
+            ExecutionQueueState.RUNNING: ExecutionState.RUNNING,
+            ExecutionQueueState.SETTLING: ExecutionState.RUNNING,
+            ExecutionQueueState.COMPLETED: ExecutionState.SUCCEEDED,
+            ExecutionQueueState.FAILED: ExecutionState.FAILED,
+            ExecutionQueueState.CANCELLED: ExecutionState.CANCELLED,
+            ExecutionQueueState.UNKNOWN: ExecutionState.UNKNOWN,
+        }
+        state = state_map[item.state]
+
+        if receipt is not None:
+            started_at = self._iso_to_timestamp(receipt.started_at)
+            ended_at = self._iso_to_timestamp(receipt.ended_at)
+            duration_seconds = receipt.duration_seconds
+            error_type = receipt.error_type
+            error_message = receipt.error_message
+            provider_side_outcome_unknown = receipt.provider_side_outcome_unknown
+        else:
+            started_at = None
+            ended_at = None
+            duration_seconds = None
+            error_type = None
+            error_message = None
+            provider_side_outcome_unknown = True
+
+        return ExecutionProjection(
+            operation_id=row.operation_id,
+            kind=row.kind or item.operation_id or "",
+            state=state.value,
+            scope=row.scope,
+            description=row.description or "",
+            submitted_at=self._iso_to_timestamp(row.created_at),
+            started_at=started_at,
+            ended_at=ended_at,
+            duration_seconds=duration_seconds,
+            exit_code=None,
+            error_type=error_type,
+            error_message=error_message,
+            provider_side_outcome_unknown=provider_side_outcome_unknown,
+            grant_id=row.grant_id,
+            approval_id=row.approval_id,
+            output_path=None,
+        )
+
+    def _durable_row_to_receipt_projection(self, row) -> object:
+        """Map one durable queue receipt to a :class:`ReceiptProjection`."""
+        from bots5.desktop.control_bridge import ReceiptProjection, ReceiptState
+
+        item = row.item
+        receipt = item.receipt
+        if receipt is None:
+            return None
+
+        provider_unknown = receipt.provider_side_outcome_unknown
+        if item.state.value == "completed":
+            receipt_state = ReceiptState.SETTLED
+        elif item.state.value in ("failed", "cancelled") and not provider_unknown:
+            receipt_state = ReceiptState.SETTLED
+        elif item.state.value == "cancelled" and provider_unknown:
+            receipt_state = ReceiptState.UNKNOWN
+        else:
+            receipt_state = ReceiptState.UNKNOWN
+
+        return ReceiptProjection(
+            receipt_id=f"queue-{row.operation_id}",
+            operation_id=row.operation_id,
+            state=receipt_state.value,
+            settled_at=self._iso_to_timestamp(receipt.ended_at),
+            request_digest=None,
+            result_digest=None,
+            grant_id=row.grant_id,
+            unknown_reason=receipt.error_message if provider_unknown else None,
+        )
+
+    # -- reads consumed by ControlBridge.projection() --------------------
+
+    def grants(self) -> tuple:
+        from bots5.desktop.control_bridge import GrantProjection
+
+        issued_by = f"capability-authority:{id(self._capability_authority):x}"
+        projections: list[GrantProjection] = []
+        for grant in self._capability_authority.inventory():
+            subject = f"{grant.subject.kind}:{grant.subject.identity}"
+            scope = grant.scope
+            if isinstance(scope, DirectoryScope):
+                subject = str(scope.root)
+            projections.append(
+                GrantProjection(
+                    grant_id=grant.grant_id,
+                    scope=grant.kind,
+                    subject=subject,
+                    issued_at=grant.issued_at.timestamp(),
+                    expires_at=None,  # monotonic deadline; wall clock unknown
+                    issued_by=issued_by,
+                    request_digest=None,
+                    binding_scope=None,  # not available from capability-authority grants
+                    active=True,
+                )
+            )
+        return tuple(projections)
+
+    def executions(self) -> tuple:
+        """Execution projections: durable store rows merged with in-memory mirror."""
+        from bots5.desktop.control_bridge import ExecutionProjection
+
+        if self._queue_store is None:
+            return tuple(self._executions.values())
+
+        projections: dict[str, ExecutionProjection] = {}
+        for row in self._queue_store.load_durable_execution_state():
+            proj = self._durable_row_to_execution_projection(row)
+            projections[proj.operation_id] = proj
+
+        # Merge observations that have not been written through to the store
+        # (e.g. settle hooks that still add in-memory projections).
+        for proj in self._executions.values():
+            if isinstance(proj, ExecutionProjection) and proj.operation_id not in projections:
+                projections[proj.operation_id] = proj
+
+        return tuple(projections.values())
+
+    def receipts(self) -> tuple:
+        """Receipt projections: durable store rows merged with in-memory mirror."""
+        from bots5.desktop.control_bridge import ReceiptProjection
+
+        if self._queue_store is None:
+            return tuple(self._receipts.values())
+
+        projections: dict[str, ReceiptProjection] = {}
+        for row in self._queue_store.load_durable_execution_state():
+            proj = self._durable_row_to_receipt_projection(row)
+            if proj is not None:
+                projections[proj.receipt_id] = proj
+
+        for proj in self._receipts.values():
+            if isinstance(proj, ReceiptProjection) and proj.receipt_id not in projections:
+                projections[proj.receipt_id] = proj
+
+        return tuple(projections.values())
+
+    def warnings(self) -> tuple:
+        return tuple(self._warnings)
+
+    # -- item views + mutation surface used by the bridge ----------------
+
+    def grant_items(self) -> tuple:
+        return self.grants()
+
+    def execution_items(self) -> tuple:
+        return self.executions()
+
+    def receipt_items(self) -> tuple:
+        return self.receipts()
+
+    def add_grant(self, grant: object) -> None:
+        # Grants are minted only through the shared CapabilityAuthority;
+        # the bridge must never fabricate one through this surface.
+        raise StateError("control plane grants are minted by the capability authority only")
+
+    def add_execution(self, execution: object) -> None:
+        self._executions[execution.operation_id] = execution
+
+    def get_execution(self, operation_id: str):
+        if self._queue_store is not None:
+            for row in self._queue_store.load_durable_execution_state():
+                if row.operation_id == operation_id:
+                    return self._durable_row_to_execution_projection(row)
+        return self._executions.get(operation_id)
+
+    def cancel_execution(self, operation_id: str) -> None:
+        """Transition a durable queue item to CANCELLED.
+
+        No-op when no queue store is attached or the item is already terminal.
+        """
+        if self._queue_store is None:
+            return
+        from bots5.core.queue_state_machine import (
+            ExecutionQueueState,
+            transition,
+        )
+
+        item = self._queue_store.load_item(operation_id)
+        if item is None or item.state not in (
+            ExecutionQueueState.PENDING,
+            ExecutionQueueState.QUEUED,
+            ExecutionQueueState.RUNNING,
+        ):
+            return
+        cancelled = transition(item, item.revision, ExecutionQueueState.CANCELLED)
+        self._queue_store.save_item(cancelled)
+
+    def add_receipt(self, receipt: object) -> None:
+        self._receipts[receipt.receipt_id] = receipt
+
+    def add_warning(self, warning: str) -> None:
+        self._warnings.append(warning)
+
+    # -- observation hooks (where real consumers report their effects) ---
+
+    def observe_process_execution(self, receipt) -> None:
+        """Project one settled ``ProcessReceipt`` into the shared views.
+
+        The executor's own receipt is the evidence; state mapping is
+        conservative — a remote/process outcome that cannot be established
+        stays UNKNOWN and provider-side-unknown, never rewritten.
+        """
+        from bots5.desktop.control_bridge import (
+            ExecutionProjection,
+            ExecutionState,
+            ReceiptProjection,
+            ReceiptState,
+        )
+        from bots5.infrastructure.process_execution import ProcessState
+
+        result = receipt.result
+        if result.state is ProcessState.COMPLETED and result.exit_code == 0:
+            state = ExecutionState.SUCCEEDED
+            unknown = False
+        elif result.remote_outcome_unknown or result.state is ProcessState.UNKNOWN:
+            state = ExecutionState.UNKNOWN
+            unknown = True
+        elif result.state is ProcessState.CANCELLED:
+            state = ExecutionState.CANCELLED
+            unknown = True
+        elif result.state is ProcessState.TIMEOUT:
+            state = ExecutionState.TIMED_OUT
+            unknown = False
+        else:
+            state = ExecutionState.FAILED
+            unknown = False
+        self.add_execution(
+            ExecutionProjection(
+                operation_id=result.process_id,
+                kind="process",
+                state=state.value,
+                scope="process_execution",
+                description=f"bounded process {result.process_id}",
+                submitted_at=result.started_at,
+                started_at=result.started_at,
+                ended_at=result.ended_at,
+                duration_seconds=None,
+                exit_code=result.exit_code,
+                error_type=result.error_message.split(":", 1)[0] if result.error_message else None,
+                error_message=result.error_message,
+                provider_side_outcome_unknown=unknown,
+                grant_id=receipt.authority_grant_id,
+                approval_id=None,
+                output_path=None,
+            )
+        )
+        self.add_receipt(
+            ReceiptProjection(
+                receipt_id=f"proc-{result.process_id}",
+                operation_id=result.process_id,
+                state=(
+                    ReceiptState.SETTLED.value
+                    if not result.remote_outcome_unknown
+                    else ReceiptState.UNKNOWN.value
+                ),
+                settled_at=receipt.settled_at,
+                request_digest=receipt.request_digest,
+                result_digest=None,
+                grant_id=receipt.authority_grant_id,
+                unknown_reason=result.error_message if result.remote_outcome_unknown else None,
+            )
+        )
+
+    def observe_git_operation(self, result, *, grant=None) -> None:
+        """Project one settled Git operation through the shared views.
+
+        ``grant`` is the seam :class:`CapabilityGrant` the caller held when
+        authorizing the operation (the Git manager validates its OWN
+        GitAuthorityLevel grant internally; BLK-01/03 owns that wiring).
+        """
+        from bots5.desktop.control_bridge import (
+            ExecutionProjection,
+            ExecutionState,
+            ReceiptProjection,
+            ReceiptState,
+        )
+        from bots5.infrastructure.git_authority import GitOperationState
+
+        if result.state is GitOperationState.COMPLETED:
+            state = ExecutionState.SUCCEEDED
+            unknown = False
+        elif result.state is GitOperationState.REJECTED:
+            state = ExecutionState.FAILED
+            unknown = False
+        elif result.remote_outcome_unknown or result.state is GitOperationState.UNKNOWN:
+            state = ExecutionState.UNKNOWN
+            unknown = True
+        else:
+            state = ExecutionState.FAILED
+            unknown = False
+        self.add_execution(
+            ExecutionProjection(
+                operation_id=result.operation_id,
+                kind="git",
+                state=state.value,
+                scope=(
+                    "git_inspect"
+                    if result.authority_level is GitAuthorityLevel.INSPECT
+                    else "git_mutation"
+                ),
+                description=f"git {result.authority_level.value.lower()}",
+                submitted_at=result.started_at,
+                started_at=result.started_at,
+                ended_at=result.ended_at,
+                duration_seconds=None,
+                exit_code=result.exit_code,
+                error_type=None if result.error_message is None else "git_error",
+                error_message=result.error_message,
+                provider_side_outcome_unknown=unknown,
+                grant_id=grant.grant_id if grant is not None else result.grant_id,
+                approval_id=None,
+                output_path=None,
+            )
+        )
+        self.add_receipt(
+            ReceiptProjection(
+                receipt_id=f"git-{result.operation_id}",
+                operation_id=result.operation_id,
+                state=(
+                    ReceiptState.SETTLED.value
+                    if not unknown
+                    else ReceiptState.UNKNOWN.value
+                ),
+                settled_at=result.ended_at if result.ended_at is not None else time.time(),
+                request_digest=None,
+                result_digest=None,
+                grant_id=grant.grant_id if grant is not None else result.grant_id,
+                unknown_reason=result.error_message if unknown else None,
+            )
+        )
+
+    def observe_tool_invocation(self, result: object) -> None:
+        """Project one settled ``ToolResult`` into the shared execution view.
+
+        The tool invoker's journal is the evidence; this never invents a
+        state the journal does not show.  A REFUSED invocation counts as a
+        definite failure (zero-spend refusal); a SUCCEEDED one clears the
+        provider-side uncertainty; UNKNOWN keeps it.
+        """
+        from bots5.core.tools import ToolState
+        from bots5.desktop.control_bridge import ExecutionProjection, ExecutionState
+
+        state_map = {
+            ToolState.SUCCEEDED: ExecutionState.SUCCEEDED,
+            ToolState.FAILED: ExecutionState.FAILED,
+            ToolState.REFUSED: ExecutionState.FAILED,
+            ToolState.UNKNOWN: ExecutionState.UNKNOWN,
+        }
+        mapped = state_map[result.state]
+        now = time.time()
+        provider_unknown = result.state in (ToolState.UNKNOWN,)
+        error_type = None
+        if result.state in (ToolState.FAILED, ToolState.UNKNOWN):
+            error_type = "tool_error"
+        elif result.state is ToolState.REFUSED:
+            error_type = (
+                result.refusal_reason.value if result.refusal_reason is not None else "refused"
+            )
+        self.add_execution(
+            ExecutionProjection(
+                operation_id=result.invocation_id,
+                kind="tool",
+                state=mapped.value,
+                scope="tool_invocation",
+                description=f"tool {result.tool_id}",
+                submitted_at=now,
+                started_at=now,
+                ended_at=now,
+                duration_seconds=None,
+                exit_code=None,
+                error_type=error_type,
+                error_message=result.error,
+                provider_side_outcome_unknown=provider_unknown,
+                grant_id=None,
+                approval_id=None,
+                output_path=None,
+            )
+        )
+
+
 @dataclass(slots=True)
 class DesktopRuntime:
     paths: AppPaths
@@ -207,6 +746,26 @@ class DesktopRuntime:
     application: BotsApplication
     session: DesktopSessionInfo
     workspace: DesktopSessionController
+    # v0.2 BLK-04 shared composition (decision 9): ONE capability authority,
+    # one control-plane state source, and the controlled egress consumer are
+    # constructed by build_runtime and passed in here explicitly; every
+    # consumer — the application's tool invoker and every window's control
+    # bridge — receives these same instances, never a second copy.
+    capability_authority: CapabilityAuthority = field(default=None)
+    control_plane_state: "ControlPlaneState | None" = field(default=None)
+    egress_consumer: ControlledEgressConsumer = field(default=None)
+    # Plugin host wired to the shared capability authority (decision 9).
+    # None on legacy test constructions.
+    plugin_host: "PluginHost | None" = field(default=None)
+    # Shared queue/receipt machinery composed by build_runtime (see the
+    # close stages below); None on legacy test constructions.
+    _git_manager: GitAuthorityManager | None = field(
+        default=None, init=False, repr=False
+    )
+    _process_executor: BoundedProcessExecutor | None = field(
+        default=None, init=False, repr=False
+    )
+    _code_executor: CodeExecutor | None = field(default=None, init=False, repr=False)
     windows: list[object] = field(default_factory=list)
     _opening_windows: set[asyncio.Task[None]] = field(default_factory=set)
     _close_state: ApplicationCloseState = field(
@@ -232,15 +791,71 @@ class DesktopRuntime:
     _campaign_bridges: set[object] = field(
         default_factory=set, init=False, repr=False
     )
+    # v0.2: every ControlBridge the runtime hands to a window is tracked
+    # here so the bounded close stage can drain hosted control-plane work
+    # before the application and the data-root authority are released.
+    _control_bridges: set[object] = field(
+        default_factory=set, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         self._handoff_registry = RestoreHandoffRegistry()
         self.handoff = RestoreHandoffCapability(self)
 
+    # ------------------------------------------------------------------
+    # v0.2 shared control plane (BLK-04)
+    # ------------------------------------------------------------------
+
+    @property
+    def tool_invoker(self):
+        """The application's ToolInvoker, built on the ONE shared authority.
+
+        Returns ``None`` only for a runtime composed without the shared
+        seam (legacy test constructions); every ``build_runtime`` desktop
+        has one.
+        """
+        return getattr(self.application, "_tool_invoker", None)
+
+    @property
+    def git_authority_manager(self):
+        """The shared GitAuthorityManager this runtime composed, or None."""
+        return self._git_manager
+
+    @property
+    def process_executor(self):
+        """The shared BoundedProcessExecutor this runtime composed, or None."""
+        return self._process_executor
+
+    @property
+    def code_executor(self):
+        """The shared CodeExecutor this runtime composed, or None."""
+        return self._code_executor
+
     def _campaign_bridge_factory(self, runs_dir):
         """Compose and track a bridge for a window's campaign dock."""
         bridge = CampaignBridge(runs_dir)
         self._campaign_bridges.add(bridge)
+        return bridge
+
+    def _control_bridge_factory(self, state_dir):
+        """Compose and track a bridge for a window's control plane dock.
+
+        BLK-04: the bridge projects the runtime's shared control-plane state
+        source (which reads live grants from the ONE capability authority)
+        instead of private per-window dicts. When the shared source is used,
+        the bridge also receives the shared authority so operator approval
+        issues real, bounded grants. With no composed source the previous
+        in-memory default is used unchanged.
+        """
+        if self.control_plane_state is not None:
+            bridge = ControlBridge(
+                state_dir=state_dir,
+                state_source=self.control_plane_state,
+                capability_authority=self.capability_authority,
+            )
+        else:
+            bridge = ControlBridge(state_dir=state_dir)
+        self._control_bridges.add(bridge)
         return bridge
 
     async def _close_campaigns(self) -> None:
@@ -262,6 +877,42 @@ class DesktopRuntime:
                 )
             finally:
                 self._campaign_bridges.discard(bridge)
+
+    async def _close_control_bridges(self) -> None:
+        """Bounded v0.2 control plane close stage.
+
+        Cancels and drains hosted control-plane work, awaiting a durable
+        terminal record.  It never retries provider work and never converts
+        an uncertain outcome into success.  Runs before ``application.close()``
+        and before the data-root authority is released.
+        """
+        _CONTROL_CLOSE_TIMEOUT_SECONDS = 10
+        for bridge in tuple(self._control_bridges):
+            try:
+                await asyncio.wait_for(
+                    bridge.close_async(), _CONTROL_CLOSE_TIMEOUT_SECONDS
+                )
+            except Exception:
+                try:
+                    bridge.close()
+                except Exception:
+                    pass
+            finally:
+                self._control_bridges.discard(bridge)
+
+    async def _close_control_machinery(self) -> None:
+        """Bounded v0.2 close of the shared queue/receipt machinery.
+
+        The composed process executor drains/cancels any hosted process
+        before the application and the data-root authority are released.
+        With no composed machinery (legacy runtime construction) this is a
+        no-op, exactly as before BLK-04.
+        """
+        _CONTROL_CLOSE_TIMEOUT_SECONDS = 10
+        executor = self._process_executor
+        if executor is None:
+            return
+        await asyncio.wait_for(executor.shutdown(), _CONTROL_CLOSE_TIMEOUT_SECONDS)
 
     def _forget_window(self, window: object) -> None:
         if window in self.windows:
@@ -292,6 +943,11 @@ class DesktopRuntime:
             # stage below can drain hosted campaign work before authority
             # release.
             campaign_bridge_factory=self._campaign_bridge_factory,
+            # v0.2: control bridge factory for the control plane dock.
+            # The runtime tracks every bridge it composes so the bounded close
+            # stage can drain hosted control-plane work before authority
+            # release.
+            control_bridge_factory=self._control_bridge_factory,
         )
         self.windows.append(window)
         window.closed.connect(lambda window=window: self._forget_window(window))
@@ -348,6 +1004,22 @@ class DesktopRuntime:
         except BaseException:
             errors.append(self._runtime_error("campaign"))
 
+        # v0.2: bounded control-plane close stage.  Hosted control-plane work
+        # is drained BEFORE the application closes and BEFORE the data-root
+        # authority is released.
+        try:
+            await self._close_control_bridges()
+        except BaseException:
+            errors.append(self._runtime_error("control"))
+
+        # v0.2 BLK-04: the shared process/code/git machinery drains in the
+        # same rank as the bridges — before application close and authority
+        # release — so no composed consumer outlives the lease it acts under.
+        try:
+            await self._close_control_machinery()
+        except BaseException:
+            errors.append(self._runtime_error("control"))
+
         try:
             await self.application.close()
         except BaseException:
@@ -364,12 +1036,15 @@ class DesktopRuntime:
 
         # Phase 10 adds one key at the existing workspace rank; every
         # pre-existing stage keeps its original precedence.
+        # v0.2: control at the same rank as campaign (both drain before
+        # application close and authority release).
         precedence = {
             "store": 0,
             "outer_authority": 1,
             "application": 1,
             "workspace": 2,
             "campaign": 2,
+            "control": 2,
             "opening_windows": 2,
             "execution": 3,
             "reconciliation": 4,
@@ -578,6 +1253,8 @@ def build_runtime(
     reasoning_effort: ReasoningEffort | None = None,
     destructive_restore_override: bool = False,
     developer_provider_test_mode: bool = False,
+    workspace_root: Path | None = None,
+    egress_transport=None,
 ) -> DesktopRuntime:
     if type(developer_provider_test_mode) is not bool:
         raise ValueError("developer provider test mode requires an explicit boolean")
@@ -654,6 +1331,50 @@ def build_runtime(
             BackupFilePublicationAdapter(),
             ids,
         )
+        # v0.2 BLK-04 shared composition (decision 9 + decision 7).
+        # ONE CapabilityAuthority instance is constructed here at the
+        # application root and injected into every v0.2 consumer: the
+        # application's tool invoker, the control bridge's grant projection
+        # (through ControlPlaneState), and the controlled egress consumer.
+        # Seam grants themselves stay process-local by design — that is the
+        # seam's documented rule; what IS durable here is the queue/receipt
+        # store attached below (BLK-06 machinery).
+        capability_authority = CapabilityAuthority(clock=clock)
+        # Shared queue/receipt machinery: one execution manager, one bounded
+        # process executor (its public execute() is grant-gated by BLK-02),
+        # one code executor on top of it, one git authority manager sharing
+        # the same executor, and one durable QueuePersistenceStore in the
+        # classified data-root database directory bound to one
+        # OwnedExecutionWorkers registry.
+        execution_manager = ExecutionManager()
+        queue_store_path = paths.data_root / "database" / "execution-queue.db"
+        process_executor = BoundedProcessExecutor(
+            execution_manager=execution_manager, clock=clock, ids=ids
+        )
+        code_executor = CodeExecutor(process_executor=process_executor, clock=clock, ids=ids)
+        git_manager = GitAuthorityManager(
+            process_executor=process_executor,
+            execution_manager=execution_manager,
+            clock=clock,
+            ids=ids,
+        )
+        control_plane_state = ControlPlaneState(
+            capability_authority=capability_authority,
+            queue_store_path=queue_store_path,
+        )
+        # Decision 7: exactly ONE controlled egress consumer, bound to the
+        # same authority.  It performs no real network I/O by default; the
+        # transport is injectable (composition passes None unless given).
+        egress_consumer = ControlledEgressConsumer(
+            authority=capability_authority,
+            transport=egress_transport,
+        )
+        # Plugin host wired to the shared capability authority (decision 9).
+        # Plugins now use the same authority instance as tools and code execution.
+        plugin_host = PluginHost(capability_authority=capability_authority)
+        resolved_workspace_root = (
+            workspace_root if workspace_root is not None else paths.data_root / "workspace"
+        )
         application = BotsApplication(
             store,
             events,
@@ -669,6 +1390,8 @@ def build_runtime(
             generation_mode=generation_mode,
             developer_provider_test_mode=developer_provider_test_mode,
             backup_service=backup_service,
+            capability_authority=capability_authority,
+            workspace_root=resolved_workspace_root,
         )
         session = DesktopSessionInfo(
             backend_id=backend_id,
@@ -678,13 +1401,25 @@ def build_runtime(
             phase6_enabled=application.phase6_enabled,
             developer_provider_test_mode=application.developer_provider_test_mode,
         )
-        return DesktopRuntime(
+        runtime = DesktopRuntime(
             paths,
             authority,
             application,
             session,
             DesktopSessionController(application, session, ids=ids),
+            capability_authority=capability_authority,
+            control_plane_state=control_plane_state,
+            egress_consumer=egress_consumer,
+            plugin_host=plugin_host,
         )
+        # The composed machinery is owned by the runtime (init=False fields):
+        # one process executor / code executor / git authority manager built
+        # on the shared clock, ids and execution discipline, drained by the
+        # bounded close stage before application close and authority release.
+        runtime._process_executor = process_executor
+        runtime._code_executor = code_executor
+        runtime._git_manager = git_manager
+        return runtime
     except Exception:
         authority.release()
         raise
